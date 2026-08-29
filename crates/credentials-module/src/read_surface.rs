@@ -1231,24 +1231,44 @@ impl ReadSurface {
 
         match self.engine.store().resolve_handle(handle) {
             Ok(credential_id) => match self.engine.store().meta(&credential_id) {
-                Ok(meta) => StatusResult {
-                    // A fenced-out daemon is not ready even for an Active credential.
-                    ready: !fenced_out
-                        && matches!(meta.state, credentials_core::store::RecordState::Active),
-                    // Deliberately NOT folded into `ready`: a stale-marked record is
-                    // still usable, it is merely expensive on the next read.
-                    stale_pending: Some(meta.stale_pending),
-                    last_error_code: match meta.state {
-                        credentials_core::store::RecordState::NeedsReauth
-                        | credentials_core::store::RecordState::Retired => {
-                            Some(ReadError::NeedsReauth)
-                        }
-                        credentials_core::store::RecordState::Corrupt => Some(ReadError::Corrupt),
-                        credentials_core::store::RecordState::Active => None,
-                    },
-                    lease_held,
-                    record_version: Some(meta.record_version),
-                },
+                Ok(meta) => {
+                    // The field is a LATENCY PREDICTOR for the next get, and the
+                    // prediction only has meaning when the next get will actually run.
+                    // None of the seven `UPDATE credentials SET state = ...` paths in the
+                    // store clear `stale_pending`, so a record that was marked stale by a
+                    // consumer 401 and then latched to `needs_reauth` (or quarantined) by
+                    // a failed refresh still carries `stale_pending = 1` on the column.
+                    // Publishing that as the prediction would say "next get pays seconds"
+                    // for a call that fails fast without an upstream exchange -- measured
+                    // live on 2026-08-27, every four hours for ~five minutes, until the
+                    // re-seal writes state = 'active' and stale_pending = 0 together.
+                    //
+                    // Non-Active => the next get performs no upstream exchange => FALSE.
+                    // Absent stays reserved for "this path could not see the record" and
+                    // is unchanged on the resolve and meta-fail arms below.
+                    let is_active =
+                        matches!(meta.state, credentials_core::store::RecordState::Active);
+                    StatusResult {
+                        // A fenced-out daemon is not ready even for an Active credential.
+                        ready: !fenced_out && is_active,
+                        // Deliberately NOT folded into `ready`: a stale-marked record is
+                        // still usable, it is merely expensive on the next read. Published
+                        // only when Active; see the comment above for the bug this gates.
+                        stale_pending: Some(if is_active { meta.stale_pending } else { false }),
+                        last_error_code: match meta.state {
+                            credentials_core::store::RecordState::NeedsReauth
+                            | credentials_core::store::RecordState::Retired => {
+                                Some(ReadError::NeedsReauth)
+                            }
+                            credentials_core::store::RecordState::Corrupt => {
+                                Some(ReadError::Corrupt)
+                            }
+                            credentials_core::store::RecordState::Active => None,
+                        },
+                        lease_held,
+                        record_version: Some(meta.record_version),
+                    }
+                }
                 // Meta unreadable: absent, not false. Reporting "no repair pending" for
                 // a record we could not read would be an assertion with no basis.
                 Err(_) => StatusResult {
@@ -1505,53 +1525,84 @@ mod error_class_tests {
     /// Golden conformance for the FRAME SHAPE, which the class-string test above does
     /// not cover and cannot: it pins the four `class` values while saying nothing about
     /// the envelope they arrive in. Rename `class` to `error_class`, move the error a
-    /// level, or drop `class` from the body entirely, and that test stays green while
-    /// every consumer breaks.
+    /// level, drop `class` from the body, rename the outer `result` key, or wrap the
+    /// body in a second envelope, and the class-string test stays green while every
+    /// consumer breaks.
     ///
     /// WHY THIS EXISTS AT ALL: a consumer typed a decoder from the published contract,
     /// parsed a real error frame SUCCESSFULLY, and silently discarded `class` — serde
     /// drops unknown fields without complaint, so a decoder that ignores the field it
     /// was told to branch on looks identical to one that honours it. They then branched
     /// on `code` through a closed enum, which turns the first added code into a parse
-    /// failure rather than an unknown-code branch. Neither is reachable from this side;
-    /// what IS reachable is guaranteeing the bytes never move under them.
+    /// failure rather than an unknown-code branch. The outer `result` wrapper is the
+    /// field they actually depend on for routing their decoder to the body, and neither
+    /// their fixture nor this test pinned it before — it had two owners and no
+    /// assertion. Neither is reachable from this side; what IS reachable is guaranteeing
+    /// the bytes never move under them.
     ///
-    /// Serialized through the REAL producer type rather than a hand-built `json!`, so
-    /// this pins what the wire actually carries. A reconstruction would only pin the
-    /// reconstruction — the frame could drift and this would still pass.
+    /// Serialized through the REAL producer type rather than a hand-built `json!`, then
+    /// wrapped with the same `result` key `handle_read_request` puts around every route
+    /// reply — so this pins the full on-wire frame `{"result":{"error":{...}}}`, not just
+    /// the inner body. A reconstruction would only pin the reconstruction — the frame
+    /// could drift and this would still pass.
     ///
-    /// The literal is the exact frame captured from a live daemon and handed to that
-    /// consumer, who pinned it in their tree. Both directions now go red on drift.
+    /// The literal below is the on-wire frame captured from a live daemon and handed to
+    /// that consumer, who pinned it in their tree. Both directions now go red on drift.
+    /// Written as a single JSON literal so the byte sequence can be quoted verbatim into
+    /// the consumer's fixture rather than re-derived from a producer.
     #[test]
     fn error_frame_shape_is_pinned() {
-        let frame = GetOutcome::Err {
+        let inner = GetOutcome::Err {
             error: ErrorBody {
                 code: ReadError::NotFound,
                 class: ErrorClass::Permanent,
             },
         };
-        let got: serde_json::Value =
-            serde_json::to_value(&frame).expect("serialize the error outcome");
+        let inner_value = serde_json::to_value(&inner).expect("serialize the error outcome");
+        let got = serde_json::json!({ "result": inner_value });
 
         // ORDER IS LOAD-BEARING, and this is the second version. Written with the
-        // equality first, the specific check below never ran: `assert_eq!` panics on any
+        // equality first, the specific checks below never ran: `assert_eq!` panics on any
         // difference, so dropping `class` reported "the frame shape drifted" and left the
-        // reader to diff two blobs. The diagnostic existed only for the case it could not
-        // reach. A cheap, specific assertion must precede a broad one that subsumes it,
-        // or it is decoration.
+        // reader to diff two blobs. The diagnostics existed only for the cases they could
+        // not reach. Cheap, specific assertions must precede a broad one that subsumes
+        // them, or they are decoration.
         assert!(
-            got["error"].get("class").is_some(),
+            got.get("result").is_some(),
+            "the outer `result` wrapper vanished — every route reply in `handle_read_request` \
+             is wrapped in `{{\"result\": ...}}`, so a consumer that decodes straight into \
+             the inner shape would start receiving a different envelope than the one their \
+             fixture pinned"
+        );
+        assert!(
+            got["result"].get("error").is_some(),
+            "the `error` body vanished from inside the wrapper — consumers route on this key"
+        );
+        assert!(
+            got["result"]["error"].get("class").is_some(),
             "`class` vanished from the error body — the contract's branch-on-class rule \
              becomes unfollowable and consumers silently fall back to branching on `code`"
         );
 
+        // The full on-wire frame, written as a single JSON literal so it is quotable
+        // verbatim into a consumer's fixture. Keys and order are part of the contract —
+        // serde serializes structs in field-declaration order, so `error`/`code`/`class`
+        // appear in the order written here, and the route builder adds `result` last.
+        // Renaming any of these keys, reordering them, or nesting deeper than this is a
+        // contract change, not a refactor.
         let want = serde_json::json!({
-            "error": { "code": "not_found", "class": "permanent" }
+            "result": {
+                "error": {
+                    "code": "not_found",
+                    "class": "permanent"
+                }
+            }
         });
 
         assert_eq!(
             got, want,
-            "the error frame shape drifted — consumers branch on these exact keys"
+            "the error frame shape drifted — consumers route on the outer `result` key, \
+             branch on the inner `class`, and pin both. The whole frame is the contract."
         );
     }
 

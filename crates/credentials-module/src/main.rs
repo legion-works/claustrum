@@ -1466,8 +1466,9 @@ mod tests {
     use cortexkit_store::{Isolation, StorageBackend};
     use credentials_core::audit::{AuditCtx, AuditOp, AuditRecord};
     use credentials_core::key::{MasterKey, MASTER_KEY_LEN};
+    use credentials_core::oauth::OAuthCredential;
     use credentials_core::record::{CredentialKind, VaultRecord};
-    use credentials_core::store::GrantOperation;
+    use credentials_core::store::{GrantOperation, RecordState};
     use read_surface::ReadSurface;
 
     fn tmp_surface(seed: u8) -> Arc<ReadSurface> {
@@ -4165,17 +4166,44 @@ mod tests {
     /// exchange. A consumer sizing a startup bound cannot get that from `ready`, because
     /// `ready` is genuinely TRUE -- the mark exists so the next get refreshes rather than
     /// refusing.
+    ///
+    /// The fixture is `oauth:stub` -- refreshable per `default_refresh_adapter` -- and the
+    /// mark is driven through the PUBLIC `report_auth_failure` route, the only call that
+    /// can ever set the marker on a real handle. The previous version seeded
+    /// `apikey:active` and called `store.mark_stale_if_version_reported` directly, which
+    /// constructs a state (non-refreshable + Active + `stale_pending = 1`) the production
+    /// path cannot produce: the public route branches on refreshability and the
+    /// non-refreshable arm INVALIDATES rather than marks, so the test was passing against
+    /// a hand-staged copy of the mark with no assertion behind it.
     #[tokio::test]
     async fn status_publishes_the_stale_mark_without_calling_the_credential_unhealthy() {
         let (surface, store, _db) = tmp_surface_with_store(16);
+        store
+            .create(
+                "oauth:stub",
+                &VaultRecord::new_oauth(
+                    "test",
+                    "stub",
+                    OAuthCredential {
+                        access_token: "locally-valid".into(),
+                        refresh_token: "rt".into(),
+                        expires_at_ms: Some(i64::MAX),
+                        token_url: "https://example.invalid/token".into(),
+                        client_id: None,
+                        scopes: Vec::new(),
+                    },
+                    b"locally-valid".to_vec(),
+                ),
+            )
+            .expect("seed refreshable credential");
         let handle = credentials_core::store::mint_handle().expect("mint handle");
         store
             .put_handle_hash(
                 &handle.hash,
-                "apikey:active",
+                "oauth:stub",
                 AuditCtx::admin(AuditOp::MintHandle),
             )
-            .expect("put handle");
+            .expect("bind handle");
 
         let clean = surface
             .status(
@@ -4192,22 +4220,22 @@ mod tests {
         );
         assert!(clean.ready, "precondition: the record starts healthy");
 
-        // Exactly what a consumer's 401 report does, at the version it was served.
-        let served = clean
-            .record_version
-            .expect("resolved handle reports version");
-        store
-            .mark_stale_if_version_reported(
-                "apikey:active",
-                served,
-                AuditCtx::admin(AuditOp::ReportAuthFailure),
-                credentials_core::store::AuthObservation {
-                    kind: "consumer_report_stale",
-                    provider_status: Some(401),
-                    detail: None,
+        // Exactly what a consumer's 401 report does: the public route sees a refreshable
+        // id and chooses the stale arm, so the record stays Active and `stale_pending`
+        // flips to 1. Going through `report_auth_failure` rather than the store method is
+        // the point -- the version-gated invalidate arm on the non-refreshable path is the
+        // shape that has to be bypassed for a hand-staged mark to be possible.
+        surface
+            .report_auth_failure(
+                1,
+                &read_surface::ReportAuthFailureParams {
+                    handle: handle.raw.clone(),
+                    provider_status: 401,
+                    record_version: 1,
                 },
             )
-            .expect("mark stale");
+            .await
+            .expect("report accepted");
 
         let marked = surface
             .status(
@@ -4254,6 +4282,127 @@ mod tests {
         assert!(
             unknown.stale_pending.is_none(),
             "an unresolvable handle must not assert anything about a record"
+        );
+    }
+
+    /// The stale-pending mark must NOT advertise an upstream exchange on a record the
+    /// next `get` will refuse out of hand.
+    ///
+    /// Pins the second half of the field's contract: it is a LATENCY PREDICTOR, not a
+    /// claim that anything is happening. A consumer reading `stale_pending: true`
+    /// concludes the next get is going to spend seconds on a token exchange -- the very
+    /// reason this field exists -- and will SKIP the credential in a startup warm bound.
+    /// Skipping is the only safe behaviour when the mark is true, because the alternative
+    /// is paying the exchange that the mark warned about.
+    ///
+    /// The construction reproduces the live shape on this deployment every four hours,
+    /// measured 2026-08-27: a consumer 401 marks a refreshable record stale, the forced
+    /// refresh fails, the engine latches the record to `needs_reauth`, and `stale_pending`
+    /// is left at 1 because none of the seven `UPDATE credentials SET state = ...` paths
+    /// in `credentials-core::store` clear the column. The mark is then a five-minute lie:
+    /// `stale_pending: true` says "next get pays seconds" while the next get fails fast
+    /// with `needs_reauth` without touching the network.
+    ///
+    /// The state is constructed through the production paths (public `report_auth_failure`
+    /// sets the mark, the same `store.invalidate` the engine uses after a failed refresh
+    /// flips the state), so the test is a real reading of the buggy state rather than a
+    /// hand-staged copy of it. A pure store-level construction would pass without ever
+    /// proving the public route is part of the path that creates it.
+    #[tokio::test]
+    async fn status_does_not_publish_a_stale_pending_mark_on_a_non_active_record() {
+        let (surface, store, _db) = tmp_surface_with_store(17);
+        store
+            .create(
+                "oauth:needs_reauth_after_stale",
+                &VaultRecord::new_oauth(
+                    "test",
+                    "stub",
+                    OAuthCredential {
+                        access_token: "locally-valid".into(),
+                        refresh_token: "rt".into(),
+                        expires_at_ms: Some(i64::MAX),
+                        token_url: "https://example.invalid/token".into(),
+                        client_id: None,
+                        scopes: Vec::new(),
+                    },
+                    b"locally-valid".to_vec(),
+                ),
+            )
+            .expect("seed refreshable credential");
+        let raw = credentials_core::store::mint_handle().expect("mint handle");
+        store
+            .put_handle_hash(
+                &raw.hash,
+                "oauth:needs_reauth_after_stale",
+                AuditCtx::admin(AuditOp::MintHandle),
+            )
+            .expect("bind handle");
+
+        // Production step 1: a consumer reports a 401 on the served version. The public
+        // route is refreshable, so it MARKS STALE rather than invalidating; the record
+        // stays Active and `stale_pending` becomes 1.
+        surface
+            .report_auth_failure(
+                11,
+                &read_surface::ReportAuthFailureParams {
+                    handle: raw.raw.clone(),
+                    provider_status: 401,
+                    record_version: 1,
+                },
+            )
+            .await
+            .expect("report accepted");
+
+        // Production step 2: a forced refresh then fails and the engine latches the record
+        // to `needs_reauth`. The store call below is exactly what the engine reaches for
+        // at the failure site; the column `stale_pending` is deliberately not touched by
+        // any of the seven state-update paths, which is the bug we are pinning here.
+        store
+            .invalidate("oauth:needs_reauth_after_stale")
+            .expect("engine-style invalidate after failed refresh");
+
+        // Precondition checks: the construction actually reproduced the live shape, so a
+        // green fix can be trusted to mean the fix is real and not a different test
+        // passing for a different reason.
+        let meta = store.meta("oauth:needs_reauth_after_stale").expect("meta");
+        assert_eq!(
+            meta.state,
+            RecordState::NeedsReauth,
+            "precondition: the construction must leave the record latched"
+        );
+        assert!(
+            meta.stale_pending,
+            "precondition: the bug is exactly that stale_pending survives a state flip"
+        );
+
+        // The pin. Non-Active state => next get performs no upstream exchange, so the
+        // field is FALSE regardless of the column. Absent is reserved for "this path
+        // could not see the record" and must NOT be used here -- a defaulted false on a
+        // known record would be a defensible reading, an absent one would be a missing
+        // field that looks like a wire-drift to a consumer.
+        let got = surface
+            .status(
+                11,
+                &crate::read_surface::StatusParams {
+                    handle: Some(raw.raw),
+                },
+            )
+            .await;
+        assert_eq!(
+            got.stale_pending,
+            Some(false),
+            "non-Active state must publish the real (false) prediction, not the column's \
+             stale value -- a consumer skipping the credential on stale_pending=true \
+             would be skipping a credential whose next get refuses without an exchange"
+        );
+        assert!(
+            !got.ready,
+            "a latched record is not ready -- the rest of the contract is unchanged"
+        );
+        assert_eq!(
+            got.last_error_code,
+            Some(read_surface::ReadError::NeedsReauth),
+            "a needs_reauth record must name the reason"
         );
     }
 
