@@ -1593,8 +1593,8 @@ mod error_class_tests {
         let want = serde_json::json!({
             "result": {
                 "error": {
-                    "code": "not_found",
-                    "class": "permanent"
+                    "class": "permanent",
+                    "code": "not_found"
                 }
             }
         });
@@ -1603,6 +1603,37 @@ mod error_class_tests {
             got, want,
             "the error frame shape drifted — consumers route on the outer `result` key, \
              branch on the inner `class`, and pin both. The whole frame is the contract."
+        );
+
+        // THE BYTES, pinned separately, because the assertion above cannot see them.
+        //
+        // `Value` equality is order-independent, which is correct for a SHAPE pin — a key
+        // moving should not turn this red. But it means the test above is green for either
+        // field order, and a consumer holding a byte-string fixture is not covered by it.
+        //
+        // The wire order is NOT this struct's declaration order. `ErrorBody` declares
+        // `code` then `class`; the wire emits `class` then `code`, because the reply is
+        // built through a `serde_json::Value` and `serde_json::Map` is a `BTreeMap` unless
+        // the `preserve_order` feature is on — so keys ship alphabetically. Verified
+        // against the running daemon from both sides of the wire, and reproduced in
+        // isolation: the same struct serialized directly yields `code` first.
+        //
+        // That makes the current byte order ACCIDENTAL — it holds only while the reply
+        // goes through a `Value`. Serializing the struct straight to bytes would flip it
+        // with nothing to notice, so this assertion is what converts the accident into a
+        // decision someone has to make deliberately.
+        //
+        // WHY IT IS WORTH A TEST AT ALL: the first consumer of this surface was handed a
+        // literal transcribed from the struct declaration and told to quote it verbatim.
+        // It did not match production. Deserialization did not care; a byte-comparing
+        // fixture or a frame digest would have. The canonical bytes now live where someone
+        // reading this test will copy the right ones.
+        assert_eq!(
+            serde_json::to_string(&got).expect("serialize the pinned frame"),
+            r#"{"result":{"error":{"class":"permanent","code":"not_found"}}}"#,
+            "the on-wire BYTES changed. Deserializing consumers are unaffected; any \
+             consumer holding a byte-string fixture or hashing a frame is not. If this is \
+             intentional, the canonical literal published to consumers has to move with it."
         );
     }
 
