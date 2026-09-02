@@ -8,15 +8,15 @@
       "accounts": [
         {
           "label": "main",
-          "handle": "ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "handle": "ckh_xOHjn5GYlYiTcwEqIt0DDVGaZR3eTdcwzpOEXuTdvsw",
           "credential_id": "apikey:deepseek:main"
         },
         {
           "label": "backup",
-          "handle": "ckh_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "handle": "ckh_YqNbR4A7Xfess4_K9XE1_7eVSwdaWF3KhtPrijOyvWA",
           "credential_id": "apikey:deepseek:backup",
           "superseded": [
-            "ckh_ccccccccccccccccccccccccccccccccccccccccccc"
+            "ckh_MNZO_t_aIvzhQ19mAskh44KtKxJE5NbOm4ul6A1kqpY"
           ]
         }
       ]
@@ -28,7 +28,7 @@
       "accounts": [
         {
           "label": "work-alt",
-          "handle": "ckh_ddddddddddddddddddddddddddddddddddddddddddd",
+          "handle": "ckh_-KzxNKZFF4I_Tt4sb8hT9lsFHGlltKavBnjB11-gNxc",
           "credential_id": "oauth:anthropic:work-alt"
         }
       ]

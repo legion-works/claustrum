@@ -37,8 +37,20 @@ describe("custody wire contracts", () => {
     expect(parsed).toEqual(source);
     expect(parsed.providers.map((provider) => provider.provider)).toEqual(["deepseek", "anthropic"]);
     expect(parsed.providers[0]?.accounts.map((account) => account.label)).toEqual(["main", "backup"]);
-    expect(parsed.providers[0]?.accounts[0]?.handle).toBe(`ckh_${"a".repeat(43)}`);
-    expect(parsed.providers[0]?.accounts[1]?.superseded).toEqual([`ckh_${"c".repeat(43)}`]);
+    // The golden carries base64url-shaped handles (mixed case, `-`, `_`) on purpose: the vault
+    // mints 256 CSPRNG bits as base64url, and a reader that derives its charset from an
+    // all-lowercase fixture would reject real handles.
+    expect(parsed.providers[0]?.accounts[0]?.handle).toBe("ckh_xOHjn5GYlYiTcwEqIt0DDVGaZR3eTdcwzpOEXuTdvsw");
+    expect(parsed.providers[0]?.accounts[1]?.superseded).toEqual(["ckh_MNZO_t_aIvzhQ19mAskh44KtKxJE5NbOm4ul6A1kqpY"]);
+    for (const provider of parsed.providers) {
+      for (const account of provider.accounts) {
+        for (const handle of [account.handle, ...(account.superseded ?? [])]) {
+          expect(handle).toMatch(/^ckh_[A-Za-z0-9_-]{43}$/);
+        }
+      }
+    }
+    expect(goldenHandles.providers.flatMap((p) => p.accounts.map((a) => a.handle)).join("")).toMatch(/[A-Z]/);
+    expect(goldenHandles.providers.flatMap((p) => p.accounts.map((a) => a.handle)).join("")).toMatch(/[-_]/);
     expect(() =>
       parseHandleFile({
         version: 1,
