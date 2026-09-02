@@ -70,11 +70,17 @@ async function readAuth(path: string, reader: (path: string) => Promise<Record<s
   return reader(path);
 }
 
-const NATIVE_LLM_TRUE = new Set(["true", "yes", "on", "1"]);
+// Effect's Config.boolean (effect@4.0.0-beta.74 dist/Config.js:541-562, the parser behind
+// OpenCode's runtime-flags `bool()`) accepts exactly `true yes on 1 y` / `false no off 0 n`,
+// case-sensitive. Only the DISABLING spellings and absence are treated as "custody may serve";
+// anything else — an enabling spelling, a future spelling, or an unparseable value that may
+// make OpenCode error — refuses custody. Fail closed: a guard that under-fires here sends the
+// sentinel to the wire as the key.
+const NATIVE_LLM_FALSE = new Set(["false", "no", "off", "0", "n"]);
 
 export function nativeLlmEnabled(raw: string | undefined): boolean {
   if (raw === undefined) return false;
-  return NATIVE_LLM_TRUE.has(raw.trim().toLowerCase());
+  return !NATIVE_LLM_FALSE.has(raw);
 }
 
 function logError(log: CustodyLogger, error: Error, provider: string) {

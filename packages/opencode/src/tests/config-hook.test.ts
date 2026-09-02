@@ -431,12 +431,14 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(logs[0]).toContain("custody_disabled");
   });
 
-  // OpenCode parses the flag with Effect's Config.boolean (runtime-flags.ts:57), which accepts
-  // true/yes/on/1 case-insensitively; a guard that only fires on "1" would read as covered
-  // while `=true` sends the sentinel to the wire.
-  for (const value of ["1", "true", "TRUE", "yes", "on"]) {
+  // OpenCode reads the flag through Effect's Config.boolean (effect dist/Config.js:541-562):
+  // enabling spellings `true yes on 1 y`, disabling `false no off 0 n`, CASE-SENSITIVE. The guard
+  // fails closed: only the five disabling spellings (or absence) let custody serve. `TRUE` and
+  // `maybe` do not enable OpenCode's native runtime, but they are refused anyway rather than
+  // guessed at — an under-firing guard here sends the sentinel to the wire as the key.
+  for (const value of ["1", "true", "yes", "on", "y", "TRUE", "maybe", " 1"]) {
     test(`refuses observed tombstones when native LLM mode is enabled with ${JSON.stringify(value)}`, async () => {
-      const files = await fixture(`native-llm-${value.toLowerCase()}`);
+      const files = await fixture(`native-llm-${value.replace(/[^a-z0-9]/gi, "_")}-${value === value.toLowerCase() ? "l" : "u"}`);
       await writeHandles(files.handles, handles("deepseek"));
       await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
       useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", value);
@@ -451,9 +453,9 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     });
   }
 
-  for (const value of ["0", "false", "off", "no", ""]) {
+  for (const value of ["0", "false", "off", "no", "n"]) {
     test(`serves normally when native LLM mode is off with ${JSON.stringify(value)}`, async () => {
-      const files = await fixture(`native-llm-off-${value || "empty"}`);
+      const files = await fixture(`native-llm-off-${value}`);
       await writeHandles(files.handles, handles("deepseek"));
       await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
       useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", value);
