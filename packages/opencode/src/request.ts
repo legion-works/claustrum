@@ -26,12 +26,17 @@ export async function snapshotRequest(
       const encodedSentinel = encodeURIComponent(sentinel);
       const encodedMaterial = encodeURIComponent(material);
       const query = url.search.slice(1);
-      url.search = query
+      const substitutedQuery = query
         .split("&")
-        .map((part) => part.includes(sentinel)
-          ? replaceEvery(part, sentinel, encodedMaterial)
-          : replaceEvery(part, encodedSentinel, encodedMaterial))
+        .map((part) => {
+          const separator = part.indexOf("=");
+          if (separator === -1) return part;
+          const name = part.slice(0, separator);
+          const value = part.slice(separator + 1);
+          return `${name}=${replaceEvery(replaceEvery(value, sentinel, encodedMaterial), encodedSentinel, encodedMaterial)}`;
+        })
         .join("&");
+      url.search = substitutedQuery;
 
       const substitutedHeaders = new Headers();
       for (const [name, value] of headers) {
@@ -46,7 +51,11 @@ export async function snapshotRequest(
         substitutedHeaders.delete("content-language");
         substitutedHeaders.delete("content-location");
       }
-      if (url.toString().includes(sentinel) || [...substitutedHeaders.values()].some((value) => value.includes(sentinel))) {
+      if (
+        `${url.origin}${url.pathname}${url.hash}`.includes(sentinel) ||
+        substitutedQuery.split("&").some((part) => part.slice(part.indexOf("=") + 1).includes(sentinel)) ||
+        [...substitutedHeaders.values()].some((value) => value.includes(sentinel))
+      ) {
         throw new Error("custody sentinel remains in a forwarded request");
       }
 

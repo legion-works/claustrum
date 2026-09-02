@@ -1,8 +1,7 @@
 import { existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
 import { tmpdir, userInfo } from 'node:os'
 import { join } from 'node:path'
-import { ConnectionJsonParseError, parseSecretJson } from './secret-json'
+import { PROTOCOL_VERSION, readConnectionFile } from '@cortexkit/subc-client'
 
 export type ClaustrumEndpoint = {
   host: string
@@ -14,22 +13,6 @@ export type ClaustrumDetection =
   | { status: 'absent'; path: string }
   | { status: 'malformed'; path: string; reason: string }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function isEndpoint(value: unknown): value is ClaustrumEndpoint {
-  return (
-    isRecord(value) &&
-    typeof value.host === 'string' &&
-    value.host.length > 0 &&
-    typeof value.port === 'number' &&
-    Number.isInteger(value.port) &&
-    value.port > 0 &&
-    value.port <= 65_535
-  )
-}
-
 export function getDefaultClaustrumConnectionPath(): string {
   const uid = process.getuid?.() ?? userInfo().uid
   const runtime = process.env.XDG_RUNTIME_DIR?.trim()
@@ -39,7 +22,7 @@ export function getDefaultClaustrumConnectionPath(): string {
     join(tmpdir(), `subc-${uid}.connection.json`),
   ]
   // Keep the client aligned with `ck`: runtime, production data home, then temp fallback.
-  return candidates.find(existsSync) ?? candidates[0] ?? `/run/user/${uid}/subc-connection.json`
+  return candidates.find(existsSync) ?? candidates[0]!
 }
 
 export function resolveClaustrumConnectionPath(explicit?: string): string {
@@ -50,9 +33,9 @@ export async function detectClaustrumConnection(
   explicitPath?: string,
 ): Promise<ClaustrumDetection> {
   const path = resolveClaustrumConnectionPath(explicitPath)
-  let value: unknown
+  let value: Awaited<ReturnType<typeof readConnectionFile>>
   try {
-    value = parseSecretJson(await readFile(path, 'utf8'))
+    value = await readConnectionFile(path)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { status: 'absent', path }
@@ -60,33 +43,14 @@ export async function detectClaustrumConnection(
     return {
       status: 'malformed',
       path,
-      reason: error instanceof ConnectionJsonParseError
-        ? 'connection file is not valid JSON'
-        : 'connection file could not be read',
-    }
-  }
-
-  if (
-    !isRecord(value) ||
-    typeof value.schema !== 'number' ||
-    !Number.isSafeInteger(value.schema) || value.schema < 0 ||
-    typeof value.wire_version !== 'number' ||
-    !Number.isSafeInteger(value.wire_version) || value.wire_version < 0 ||
-    !Array.isArray(value.endpoints) ||
-    value.endpoints.length === 0 ||
-    !value.endpoints.every(isEndpoint)
-  ) {
-    return {
-      status: 'malformed',
-      path,
-      reason: 'connection file has an invalid schema, wire_version, or endpoints',
+      reason: 'connection file could not be read or validated',
     }
   }
 
   return {
     status: 'available',
     schema: value.schema,
-    wireVersion: value.wire_version,
+    wireVersion: PROTOCOL_VERSION,
     endpoints: value.endpoints,
   }
 }

@@ -36,7 +36,7 @@ function isAccount(value: unknown): value is HandleAccount {
 }
 
 function handleIsValid(handle: unknown): handle is string {
-  return typeof handle === "string" && handle.startsWith("ckh_") && handle.length === 47;
+  return typeof handle === "string" && /^ckh_[A-Za-z0-9_-]{43}$/.test(handle);
 }
 
 function identifierIsValid(value: unknown): value is string {
@@ -62,7 +62,7 @@ export function parseHandleFile(value: unknown): OpenCodeHandleFileV1 {
     providerIds.add(item.provider);
     if (item.shape !== "api" && item.shape !== "oauth") invalid(`provider ${index} has invalid shape`);
     if (typeof item.serve !== "string" || !item.serve) invalid(`provider ${index} requires serve`);
-    if (!Array.isArray(item.accounts) || !item.accounts.every(isAccount)) {
+    if (!Array.isArray(item.accounts) || item.accounts.length === 0 || !item.accounts.every(isAccount)) {
       invalid(`provider ${index} has invalid accounts`);
     }
     const labels = new Set<string>();

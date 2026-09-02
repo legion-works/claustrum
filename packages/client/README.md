@@ -5,10 +5,10 @@ credential caching, refresh, account scheduling, and retry policy.
 
 ## Wire contract callers depend on
 
-• The daemon applies a 64-fetches-per-60-seconds limiter per connection across
-  `credential.get`, `credential.status`, and `credential.report_auth_failure`.
-  Timed-out gets still count. Use one warm attempt per account per tick and apply
-  per-handle backoff after transient failures.
+• The daemon records a durable anomaly alarm after 64 fetches in 60 seconds or
+  16 distinct handles on one connection. It still serves those requests. Timed-out
+  gets count, and the detector resets on reconnect. Use one warm attempt per
+  account per tick and apply per-handle backoff after transient failures.
 • `credential.get` is bimodal: resident records return in microseconds, while an
   expiry-skew refresh can take seconds. Request paths should peek cached state,
   not call `get` speculatively.

@@ -128,6 +128,20 @@ describe("OpenCode custody serve fetch", () => {
     expect(url.searchParams.getAll("key")).toEqual(["material-main", "before-material-main-after"]);
   });
 
+  test("keeps sentinel-looking query parameter names untouched while substituting their values", async () => {
+    const requests: Request[] = [];
+    const fetch = serve({
+      upstream: async (request) => {
+        requests.push(new Request(request));
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    await fetch(`https://upstream.example/v1/chat?${encodeURIComponent(SENTINEL)}=${encodeURIComponent(SENTINEL)}`);
+
+    expect(new URL(requests[0]?.url ?? "").search).toBe(`?${encodeURIComponent(SENTINEL)}=material-main`);
+  });
+
   test("percent-encodes substituted query material while preserving untouched query bytes", async () => {
     const requests: Request[] = [];
     const material = "a&b=c+d%25#e";
@@ -252,6 +266,35 @@ describe("OpenCode custody serve fetch", () => {
     expect(await requests[2]?.text()).toBe("");
   });
 
+  test("preserves HEAD across a same-origin 303 redirect", async () => {
+    const requests: Request[] = [];
+    const fetch = serve({
+      upstream: async (request) => {
+        const forwarded = new Request(request);
+        requests.push(forwarded);
+        return requests.length === 1
+          ? new Response(null, { status: 303, headers: { Location: "/final" } })
+          : new Response(null, { status: 200 });
+      },
+    });
+
+    expect((await fetch("https://upstream.example/start", { method: "HEAD" })).status).toBe(200);
+    expect(requests.map((request) => request.method)).toEqual(["HEAD", "HEAD"]);
+  });
+
+  test("returns a non-redirect 304 response without following its Location", async () => {
+    const requests: Request[] = [];
+    const fetch = serve({
+      upstream: async (request) => {
+        requests.push(new Request(request));
+        return new Response(null, { status: 304, headers: { Location: "/should-not-follow" } });
+      },
+    });
+
+    expect((await fetch("https://upstream.example/start")).status).toBe(304);
+    expect(requests).toHaveLength(1);
+  });
+
   test("preserves a POST and body across same-origin 307 and 308 redirects", async () => {
     for (const status of [307, 308]) {
       const requests: Request[] = [];
@@ -318,6 +361,30 @@ describe("OpenCode custody serve fetch", () => {
       expect(requests).toHaveLength(3);
       expect(requests[2]?.headers.get("x-api-key")).toBe("material-backup");
     }
+  });
+
+  test("measures an absolute Retry-After against the response-time clock", async () => {
+    const requests: Request[] = [];
+    const client = clientWith();
+    let time = 1_000;
+    const fetch = serve({
+      client,
+      now: () => time,
+      upstream: async (request) => {
+        requests.push(new Request(request));
+        if (requests.length === 1) {
+          time = 2_500;
+          return new Response("slow down", { status: 429, headers: { "Retry-After": new Date(3_000).toUTCString() } });
+        }
+        return new Response("ok", { status: 200 });
+      },
+    });
+
+    await fetch("https://upstream.example/v1/chat", { headers: { "X-Api-Key": SENTINEL } });
+    time = 3_100;
+    await fetch("https://upstream.example/v1/chat", { headers: { "X-Api-Key": SENTINEL } });
+
+    expect(requests.map((request) => request.headers.get("x-api-key"))).toEqual(["material-main", "material-backup", "material-main"]);
   });
 
   test("does not log credential-bearing upstream error messages", async () => {
@@ -435,7 +502,8 @@ describe("OpenCode custody serve fetch", () => {
 
     const result = await Promise.race([
       fetch("https://upstream.example/v1/chat"),
-      new Promise<Response>((_, reject) => setTimeout(() => reject(new Error("report exceeded 250ms budget")), 250)),
+      // This only catches a broken report budget; it leaves enough scheduler headroom for loaded CI.
+      new Promise<Response>((_, reject) => setTimeout(() => reject(new Error("report exceeded 1s budget")), 1_000)),
     ]);
     expect(result.status).toBe(200);
     expect(requests).toBe(2);

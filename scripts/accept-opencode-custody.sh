@@ -3,7 +3,8 @@ set -euo pipefail
 
 WT="${WT:-$(cd "$(dirname "$0")/.." && pwd -P)}"
 CK_AUTH="$WT/target/release/ck-auth"
-ROOT=/tmp/opencode/oc-accept
+umask 077
+ROOT="$(mktemp -d)"
 PROVIDER=synthetic
 SUBC=/run/user/1000/subc-connection.json
 KEY_PATH=/etc/cortexkit/master.key
@@ -18,11 +19,10 @@ if [[ "$(opencode --version)" != "1.18.25" ]]; then
 fi
 
 cargo build --release --locked --offline -p credentials-module --bin ck-auth
+bun run build
 
 REAL_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 REAL_AUTH="$REAL_DATA_HOME/opencode/auth.json"
-umask 077
-rm -rf "$ROOT"
 mkdir -p "$ROOT/config/opencode" "$ROOT/data/opencode" "$ROOT/cache" "$ROOT/state"
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_DATA_HOME="$ROOT/data"

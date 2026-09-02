@@ -298,8 +298,8 @@ run_expect 1 "opencode tombstone reread crash cut" \
 run_expect 1 "opencode account handle-write crash cut" \
   cargo test --locked -p credentials-module --features opencode-test-seam \
     --test cli_opencode the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle
-# The preceding arm compiles the seam into the release target. Rebuild the shipped CLI
-# immediately so every later check and the caller inherit a production artifact.
+# Rebuild the shipped CLI with default features so every later check and the caller use
+# the production release artifact rather than a test-profile seam build.
 run_check "release ck-auth (default features)" \
   cargo build --release --locked --offline -p credentials-module --bin ck-auth
 # The migration tools are feature-gated, so clippy compiles them but nothing RAN them

@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join } from 'node:path'
 import { SubcCallError } from '@cortexkit/subc-client'
 import {
   ClaustrumClient,
@@ -126,6 +126,25 @@ describe('ClaustrumClient', () => {
     await new Promise<void>((resolve) => daemon.close(() => resolve()))
   })
 
+  test('accepts a legacy connection file that omits the additive wire version', async () => {
+    const path = await tempPath('legacy-connection.json')
+    await writeFile(path, JSON.stringify({
+      schema: 1,
+      endpoints: [{ host: '127.0.0.1', port: 8765 }],
+      key: Array.from({ length: 32 }, () => 1),
+      daemon_id: Array.from({ length: 16 }, () => 2),
+      pid: 1,
+      daemon_ver: 'legacy',
+    }))
+    await chmod(path, 0o600)
+
+    await expect(detectClaustrumConnection(path)).resolves.toMatchObject({
+      status: 'available',
+      schema: 1,
+      endpoints: [{ host: '127.0.0.1', port: 8765 }],
+    })
+  })
+
   test('never echoes connection-file key material from a JSON parse failure', async () => {
     const path = await tempPath('secret-parse.json')
     const key = 'k'.repeat(40)
@@ -133,7 +152,7 @@ describe('ClaustrumClient', () => {
 
     const result = await detectClaustrumConnection(path)
 
-    expect(result).toEqual(expect.objectContaining({ status: 'malformed', reason: 'connection file is not valid JSON' }))
+    expect(result).toEqual(expect.objectContaining({ status: 'malformed', reason: 'connection file could not be read or validated' }))
     expect(JSON.stringify(result)).not.toContain(key)
   })
 
@@ -141,19 +160,22 @@ describe('ClaustrumClient', () => {
     process.env.SUBC_MODULE_ID = 'inherited-module'
     process.env.SUBC_LAUNCH_NONCE = 'inherited-nonce'
     const storagePath = await tempPath('store.db')
+    const linkedStoragePath = join(dirname(storagePath), 'store-link.db')
+    await writeFile(storagePath, '')
+    await symlink(storagePath, linkedStoragePath)
     const daemon = new FakeDaemon([
       { result: { payload: [111, 107], record_version: 7 } },
     ])
     const client = await ClaustrumClient.connect({
       projectRoot: '/project/root',
-      storagePath,
+      storagePath: linkedStoragePath,
       connector: async () => daemon as never,
     })
 
     await client.getCredential('credential-handle')
 
     const expectedFingerprint = createHash('sha256')
-      .update(resolve(storagePath))
+      .update(await realpath(linkedStoragePath))
       .digest('hex')
       .slice(0, 12)
     expect(daemon.calls[0]).toMatchObject({
@@ -260,7 +282,7 @@ describe('ClaustrumClient', () => {
     const daemon = new FakeDaemon([
       { result: { payload: [111, 107], expires_at_ms: 1_000, record_version: 63 } },
       { result: { ready: true, last_error_code: null, lease_held: true, record_version: 63 } },
-      { result: {} },
+      { result: { accepted: true } },
     ])
     const client = await ClaustrumClient.connect({ connector: async () => daemon as never })
 
@@ -295,6 +317,20 @@ describe('ClaustrumClient', () => {
         },
       },
     ])
+    client.close()
+  })
+
+  test('rejects a report response that does not explicitly acknowledge acceptance', async () => {
+    const client = await ClaustrumClient.connect({
+      connector: async () => new FakeDaemon([{ result: { accepted: false } }]) as never,
+    })
+
+    await expect(client.reportAuthFailure({
+      handle: 'h_1',
+      providerStatus: 401,
+      recordVersion: 63,
+      reporterSource: 'direct',
+    })).rejects.toMatchObject({ code: 'invalid_response' })
     client.close()
   })
 })

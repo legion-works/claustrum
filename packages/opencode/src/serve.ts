@@ -138,7 +138,6 @@ export function createServeFetch(options: CreateServeFetchOptions) {
     }
 
     for (const { account } of accounts) {
-      const currentTime = now();
       const served = await freshness.resolve(account);
       if (!served) continue;
 
@@ -167,7 +166,7 @@ export function createServeFetch(options: CreateServeFetchOptions) {
           });
           throw new CustodyRequestError("upstream request failed");
         }
-        if (response.status < 300 || response.status >= 400) {
+        if (response.status < 300 || response.status >= 400 || ![301, 302, 303, 307, 308].includes(response.status)) {
           if (response.status === 401) {
             options.log?.warn({
               provider: options.provider,
@@ -199,7 +198,7 @@ export function createServeFetch(options: CreateServeFetchOptions) {
             break;
           }
           if (response.status === 429) {
-            freshness.cooldown(account, cooldownFromRetryAfter(response.headers.get("Retry-After"), currentTime));
+            freshness.cooldown(account, cooldownFromRetryAfter(response.headers.get("Retry-After"), now()));
             options.log?.warn({
               provider: options.provider,
               label: account.label,
@@ -230,6 +229,7 @@ export function createServeFetch(options: CreateServeFetchOptions) {
           fromOrigin = new URL(forwarded.url).origin;
           next = new URL(location, forwarded.url);
         } catch (error) {
+          await discard(response);
           const refusal = new CustodyRequestError(
             `could not validate custody redirect: ${error instanceof Error ? error.name : String(error)}`,
           );
@@ -250,7 +250,7 @@ export function createServeFetch(options: CreateServeFetchOptions) {
         }
         await discard(response);
         target = next;
-        methodOverride = response.status === 303 ||
+        methodOverride = (response.status === 303 && forwarded.method !== "GET" && forwarded.method !== "HEAD") ||
           ((response.status === 301 || response.status === 302) && forwarded.method === "POST")
           ? "GET"
           : methodOverride;

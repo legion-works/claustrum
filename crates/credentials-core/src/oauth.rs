@@ -366,7 +366,7 @@ impl std::fmt::Display for ImportError {
             }
             ImportError::CustodyTombstone => write!(
                 f,
-                "refusing Claustrum tombstone material; run ck auth migrate-opencode or migrate-opencode --restore"
+                "refusing Claustrum tombstone material; run ck auth migrate-opencode or ck auth migrate-opencode --restore"
             ),
         }
     }

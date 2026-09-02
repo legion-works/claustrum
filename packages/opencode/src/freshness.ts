@@ -143,7 +143,7 @@ export class FreshnessController {
 
   cooldown(account: FreshnessAccount, durationMs: number): number {
     const slot = this.#slot(account);
-    slot.cooldownUntil = this.#now() + durationMs;
+    slot.cooldownUntil = Math.max(slot.cooldownUntil ?? 0, this.#now() + durationMs);
     this.#log?.warn({
       provider: this.#provider,
       label: account.label,
@@ -209,12 +209,15 @@ export class FreshnessController {
     const deadline = new Promise<void>((resolve) => {
       timeout = this.#setTimeout(() => resolve(), WARM_BUDGET_MS);
     });
-    const result = await Promise.race([promise, deadline]);
+    const result = await Promise.race([
+      promise.then((served) => ({ kind: "completed" as const, served })),
+      deadline.then(() => ({ kind: "timeout" as const })),
+    ]);
     if (timeout !== undefined) this.#clearTimeout(timeout);
-    if (result === undefined) {
+    if (result.kind === "timeout") {
       this.#log?.warn({ provider: this.#provider, state: "transient", errorClass: "credential_warm", errorCode: "timeout" });
     }
-    return result ?? undefined;
+    return result.kind === "completed" ? result.served : undefined;
   }
 
   #markFailure(account: FreshnessAccount, slot: Slot, error: unknown): void {

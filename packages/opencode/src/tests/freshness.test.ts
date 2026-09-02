@@ -167,6 +167,34 @@ describe("custody freshness", () => {
     expect(client.gets).toHaveLength(2);
   });
 
+  test("keeps the longer account cooldown when a later response asks for less time", () => {
+    let now = 1_000;
+    const freshness = controller({ client: new FakeClient(async () => credential("unused")), now: () => now });
+
+    freshness.cooldown(apiAccounts[0]!, 60 * 60_000);
+    now += 1;
+    freshness.cooldown(apiAccounts[0]!, 1_000);
+    now += 2_000;
+
+    expect(freshness.state(apiAccounts[0]!)).toBe("cooldown");
+  });
+
+  test("does not mislabel an immediately failed warm as a timeout", async () => {
+    const entries: unknown[] = [];
+    const freshness = new FreshnessController({
+      provider: PROVIDER,
+      shape: "api",
+      accounts: [apiAccounts[0]!],
+      client: new FakeClient(async () => { throw new Error("daemon down"); }),
+      log: createLogger((entry) => entries.push(entry)),
+      setTimeout: () => ({}),
+    });
+
+    await freshness.resolve(apiAccounts[0]!);
+
+    expect(entries.some((entry) => (entry as { errorCode?: string }).errorCode === "timeout")).toBe(false);
+  });
+
   test("warns once when an oauth cache serves after a recent transport failure", async () => {
     const entries: unknown[] = [];
     let fail = false;

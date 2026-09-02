@@ -57,6 +57,7 @@ describe("exported OpenCode custody plugin lifecycle", () => {
         providers: [{ provider: PROVIDER, shape: "api", serve: "opencode-claustrum", accounts: [{ label: "main", handle: MAIN_HANDLE, credential_id: "id" }] }],
       }),
       authReader: async () => ({ [PROVIDER]: tombstoneFor("api", PROVIDER) }),
+      detect: async () => ({ status: "available", schema: 1, wireVersion: 1, endpoints: [] }),
       clientFactory: async () => ({
         getCredential: async () => credential("vault-material", 4),
         reportAuthFailure: async () => {},
@@ -92,6 +93,7 @@ describe("exported OpenCode custody plugin lifecycle", () => {
         }],
       }),
       authReader: async () => ({ [PROVIDER]: tombstoneFor("api", PROVIDER) }),
+      detect: async () => ({ status: "available", schema: 1, wireVersion: 1, endpoints: [] }),
       clientFactory: async () => ({
         getCredential: async (handle: string) => handle === MAIN_HANDLE ? credential("first", 7) : credential("second", 8),
         reportAuthFailure: async (report: unknown) => { reports.push(report); },

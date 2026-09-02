@@ -238,7 +238,7 @@ Load (config hook, once per OpenCode start): read the handle file AND `auth.json
 requires the CONJUNCTION of two independent signals — the tombstone is the sole source of
 truth for ABSENCE of a local credential, the handle file the sole source of truth for
 OWNERSHIP; neither is ever inferred from the other, and no slot is served on one signal.
-Four cells, all explicit:
+Six states, all explicit: four ownership cells plus the unowned-real and operator-disabled cases.
 
 | `auth.json` entry | handle file `serve` | action |
 |---|---|---|
@@ -249,7 +249,7 @@ Four cells, all explicit:
 | real credential | absent | not ours; untouched |
 | any | any, with `CLAUSTRUM_CUSTODY_DISABLE=1` | fail-open by operator instruction; the plugin warns that tombstones go to the wire and fail with 401 until restore or re-enable |
 
-The third cell is the hazard specific to the config hook: `1485`/`1646` merge unvalidated,
+The SplitCustody row is the hazard specific to the config hook: `1485`/`1646` merge unvalidated,
 so a stale `serve` entry after `--restore` (or a hand-restored key) would otherwise inject
 the sentinel over a real credential with no tombstone left to flag it. Dedicated-plugin
 owners implement the same table for their own `serve` value (anthropic-auth: trigger =

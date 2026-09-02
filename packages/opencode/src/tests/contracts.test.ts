@@ -59,8 +59,19 @@ describe("custody wire contracts", () => {
     expect(() =>
       parseHandleFile({
         version: 1,
-        providers: [{ provider: "deepseek", shape: "api", accounts: [] }],
+        providers: [{ provider: "deepseek", shape: "api", serve: "opencode-claustrum", accounts: [] }],
       }),
-    ).toThrow("serve");
+    ).toThrow("accounts");
+    expect(() =>
+      parseHandleFile({
+        version: 1,
+        providers: [{
+          provider: "deepseek",
+          shape: "api",
+          serve: "opencode-claustrum",
+          accounts: [{ label: "main", handle: `ckh_${"a".repeat(42)}!`, credential_id: "apikey:deepseek:main" }],
+        }],
+      }),
+    ).toThrow("invalid handle");
   });
 });

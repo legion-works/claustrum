@@ -1,5 +1,5 @@
 import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { open, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { ClaustrumClient, detectClaustrumConnection } from "@cortexkit/claustrum-client";
@@ -51,15 +51,18 @@ function defaultAuthPath(env: NodeJS.ProcessEnv = process.env): string {
 
 async function readAuthFile(path: string): Promise<Record<string, unknown>> {
   try {
-    if ((await stat(path)).size > AUTH_FILE_MAX_BYTES) {
-      throw new AuthFileValidationError("auth file exceeds 1 MiB");
-    }
+    const descriptor = await open(path, "r");
     let value: unknown;
     try {
-        value = parseSecretJson(await readFile(path, "utf8"), "auth file");
+      if ((await descriptor.stat()).size > AUTH_FILE_MAX_BYTES) {
+        throw new AuthFileValidationError("auth file exceeds 1 MiB");
+      }
+      value = parseSecretJson(await descriptor.readFile({ encoding: "utf8" }), "auth file");
     } catch (error) {
       if (error instanceof AuthFileValidationError) throw error;
       throw new AuthFileValidationError(`auth file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await descriptor.close();
     }
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new AuthFileValidationError("auth file must contain an object");

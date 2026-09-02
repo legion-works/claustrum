@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -19,6 +20,31 @@ use serde_json::{json, Value};
 
 mod common;
 use common::tmp_root;
+
+struct TestDaemon {
+    connection: PathBuf,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Deref for TestDaemon {
+    type Target = PathBuf;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl Drop for TestDaemon {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(join) = self.join.take() {
+            join.join().expect("fake daemon thread panicked");
+        }
+    }
+}
 
 fn cli() -> Command {
     match std::env::var_os("CRED_CLI_BIN") {
@@ -431,7 +457,11 @@ fn the_golden_handle_file_matches_the_rust_contract_byte_for_byte() {
     assert_eq!(rendered, bytes.trim_end());
 }
 
-fn spawn_route_daemon(root: &Path, observed: Arc<Mutex<Vec<String>>>, response: Value) -> PathBuf {
+fn spawn_route_daemon(
+    root: &Path,
+    observed: Arc<Mutex<Vec<String>>>,
+    response: Value,
+) -> TestDaemon {
     use subc_protocol::{Flags, Frame, FrameType, Priority};
     use subc_transport::{
         authenticate_server, connection_file, read_frame, write_frame, ConnectionInfo, Endpoint,
@@ -461,14 +491,18 @@ fn spawn_route_daemon(root: &Path, observed: Arc<Mutex<Vec<String>>>, response: 
     )
     .expect("connection file");
 
-    std::thread::spawn(move || {
+    let (shutdown, mut stopped) = tokio::sync::oneshot::channel();
+    let join = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         runtime.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
-            let (mut stream, _) = listener.accept().await.expect("accept");
+            let (mut stream, _) = tokio::select! {
+                _ = &mut stopped => return,
+                accepted = listener.accept() => accepted.expect("accept"),
+            };
             authenticate_server(
                 &mut stream,
                 &key,
@@ -528,7 +562,11 @@ fn spawn_route_daemon(root: &Path, observed: Arc<Mutex<Vec<String>>>, response: 
                 .expect("write get response");
         });
     });
-    conn
+    TestDaemon {
+        connection: conn,
+        shutdown: Some(shutdown),
+        join: Some(join),
+    }
 }
 
 struct MigrationRig {
@@ -736,7 +774,7 @@ fn spawn_migration_route_daemon(
     root: &Path,
     observed: Arc<Mutex<Vec<String>>>,
     responses: Arc<Mutex<Vec<Value>>>,
-) -> PathBuf {
+) -> TestDaemon {
     use subc_protocol::{Flags, Frame, FrameType, Priority};
     use subc_transport::{
         authenticate_server, connection_file, read_frame, write_frame, ConnectionInfo, Endpoint,
@@ -765,7 +803,8 @@ fn spawn_migration_route_daemon(
         },
     )
     .expect("connection file");
-    std::thread::spawn(move || {
+    let (shutdown, mut stopped) = tokio::sync::oneshot::channel();
+    let join = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -773,7 +812,10 @@ fn spawn_migration_route_daemon(
         runtime.block_on(async move {
             let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
             loop {
-                let (mut stream, _) = listener.accept().await.expect("accept");
+                let (mut stream, _) = tokio::select! {
+                    _ = &mut stopped => return,
+                    accepted = listener.accept() => accepted.expect("accept"),
+                };
                 authenticate_server(
                     &mut stream,
                     &key,
@@ -848,7 +890,11 @@ fn spawn_migration_route_daemon(
             }
         });
     });
-    conn
+    TestDaemon {
+        connection: conn,
+        shutdown: Some(shutdown),
+        join: Some(join),
+    }
 }
 
 #[test]

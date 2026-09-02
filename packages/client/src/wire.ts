@@ -189,6 +189,8 @@ export class ClaustrumClient {
       reporter_source: input.reporterSource,
     })
     if (hasCredentialError(response)) throw asCredentialError(response, 'invalid_response', this.#logger)
+    const result = isRecord(response) && isRecord(response.result) ? response.result : undefined
+    if (result?.accepted !== true) throw asCredentialError(response, 'invalid_response', this.#logger)
   }
 
   close(): void {
