@@ -357,7 +357,7 @@ mod tests {
     use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
     use credentials_core::audit::{AuditCtx, AuditOp};
     use credentials_core::key::{MasterKey, MASTER_KEY_LEN};
-    use credentials_core::record::{CredentialKind, VaultRecord};
+    use credentials_core::record::{CredentialKind, RecordIdentity, VaultRecord};
     use credentials_core::store::{mint_handle, EncryptedStore};
     use credentials_core::vault_id_for;
 
@@ -453,6 +453,154 @@ mod tests {
         let last = entries.last().expect("an entry");
         assert_eq!(last.actor, "route-admin");
         assert_eq!(last.op, "put");
+    }
+
+    #[tokio::test]
+    async fn direct_bind_set_identity_reseals_an_oauth_record_without_replacing_its_secret() {
+        let r = rig(11);
+        r.admin.record_bind(5, Principal::Direct);
+        let record = VaultRecord::new_oauth(
+            "test",
+            "anthropic",
+            credentials_core::oauth::OAuthCredential {
+                access_token: "opaque-access".to_string(),
+                refresh_token: "refresh-secret".to_string(),
+                expires_at_ms: Some(4_102_444_800_000),
+                token_url: "https://example.invalid/token".to_string(),
+                client_id: Some("identity-test-client".to_string()),
+                scopes: vec!["scope-a".to_string(), "scope-b".to_string()],
+            },
+            b"opaque-access".to_vec(),
+        );
+        r.store
+            .create("oauth:anthropic", &record)
+            .expect("seed OAuth record");
+        let before = r.store.get("oauth:anthropic").expect("before");
+        let op = AdminOpBody::SetIdentity {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: "oauth:anthropic".to_string(),
+            identity: RecordIdentity {
+                account_id: Some("acct-routed".to_string()),
+                email: Some("routed@example.com".to_string()),
+                org_name: None,
+            },
+        };
+        let body = String::from_utf8(op.to_bytes().expect("encode op")).expect("UTF-8 JSON");
+        let (tag, _) = challenge_and_sign(&r, 5, &body);
+
+        let outcome = r.admin.execute(5, body.as_bytes(), &tag).await;
+        assert!(
+            matches!(outcome, AdminOutcome::Ok(_)),
+            "set identity must route"
+        );
+        let after = r.store.get("oauth:anthropic").expect("after");
+        assert_eq!(
+            after.payload, before.payload,
+            "route op must preserve payload bytes"
+        );
+        assert_eq!(
+            after.oauth, before.oauth,
+            "route op must preserve OAuth material"
+        );
+        assert_eq!(after.identity.account_id.as_deref(), Some("acct-routed"));
+        assert_eq!(
+            r.store
+                .read_audit(None)
+                .expect("audit")
+                .last()
+                .expect("entry")
+                .op,
+            "set_identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_bind_set_identity_refuses_an_empty_account_id_at_the_store_sink() {
+        let r = rig(12);
+        r.admin.record_bind(5, Principal::Direct);
+        r.store
+            .create(
+                "oauth:anthropic",
+                &VaultRecord::new_oauth(
+                    "test",
+                    "anthropic",
+                    credentials_core::oauth::OAuthCredential {
+                        access_token: "opaque-access".to_string(),
+                        refresh_token: "refresh-secret".to_string(),
+                        expires_at_ms: Some(4_102_444_800_000),
+                        token_url: "https://example.invalid/token".to_string(),
+                        client_id: Some("identity-test-client".to_string()),
+                        scopes: vec!["scope-a".to_string(), "scope-b".to_string()],
+                    },
+                    b"opaque-access".to_vec(),
+                ),
+            )
+            .expect("seed OAuth record");
+        let op = AdminOpBody::SetIdentity {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: "oauth:anthropic".to_string(),
+            identity: RecordIdentity {
+                account_id: Some(String::new()),
+                email: None,
+                org_name: None,
+            },
+        };
+        let body = String::from_utf8(op.to_bytes().expect("encode op")).expect("UTF-8 JSON");
+        let (tag, _) = challenge_and_sign(&r, 5, &body);
+
+        let outcome = r.admin.execute(5, body.as_bytes(), &tag).await;
+        assert!(
+            matches!(outcome, AdminOutcome::Refused(ref message) if message.contains("account_id")),
+            "a MAC-authenticated op must still be refused for invalid identity"
+        );
+        assert!(
+            r.store
+                .get("oauth:anthropic")
+                .expect("record remains readable")
+                .identity
+                .is_empty(),
+            "the rejected operation must not persist any metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_bind_store_refuses_an_invalid_import_identity() {
+        let r = rig(13);
+        r.admin.record_bind(5, Principal::Direct);
+        let record = VaultRecord::new_oauth(
+            "import",
+            "anthropic",
+            credentials_core::oauth::OAuthCredential {
+                access_token: "opaque-access".to_string(),
+                refresh_token: "refresh-secret".to_string(),
+                expires_at_ms: Some(4_102_444_800_000),
+                token_url: "https://example.invalid/token".to_string(),
+                client_id: Some("identity-test-client".to_string()),
+                scopes: vec!["scope-a".to_string(), "scope-b".to_string()],
+            },
+            b"opaque-access".to_vec(),
+        )
+        .with_identity(RecordIdentity {
+            account_id: Some("acct-good".to_string()),
+            email: Some("invalid\u{0007}email@example.com".to_string()),
+            org_name: None,
+        });
+        let op = AdminOpBody::Store {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: "oauth:anthropic".to_string(),
+            record: Box::new(record),
+            audit_op: credentials_core::admin_ops::AdminAuditOp::Import,
+            mode: credentials_core::admin_ops::StoreMode::Create,
+        };
+        let body = String::from_utf8(op.to_bytes().expect("encode op")).expect("UTF-8 JSON");
+        let (tag, _) = challenge_and_sign(&r, 5, &body);
+
+        let outcome = r.admin.execute(5, body.as_bytes(), &tag).await;
+        assert!(
+            matches!(outcome, AdminOutcome::Refused(ref message) if message.contains("email")),
+            "authenticated imports must enforce the same store identity boundary"
+        );
+        assert!(r.store.get("oauth:anthropic").is_err());
     }
 
     #[tokio::test]

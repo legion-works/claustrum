@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditRecord;
 use crate::audit::{AuditCtx, AuditOp};
-use crate::record::VaultRecord;
+use crate::record::{RecordIdentity, VaultRecord};
 use crate::store::{mint_handle, EncryptedStore, GrantOperation, StoreOpError};
 
 /// The admin-op schema version. Bumped only on a breaking op-body change; the
@@ -37,6 +37,24 @@ pub enum AdminOpBody {
         record: Box<VaultRecord>,
         audit_op: AdminAuditOp,
         mode: StoreMode,
+    },
+    /// Identity-aware replacement has its own op discriminator so a daemon that predates
+    /// sticky identity rejects it instead of silently treating it as a legacy replace.
+    #[serde(rename = "admin.store_with_identity_policy")]
+    StoreWithIdentityPolicy {
+        v: u32,
+        id: String,
+        record: Box<VaultRecord>,
+        audit_op: AdminAuditOp,
+        clear_identity: bool,
+    },
+    /// Update only the non-secret identity attached to an existing record. The store
+    /// re-seals the unchanged credential material and keeps its lifecycle state.
+    #[serde(rename = "admin.set_identity")]
+    SetIdentity {
+        v: u32,
+        id: String,
+        identity: RecordIdentity,
     },
     #[serde(rename = "admin.invalidate")]
     Invalidate { v: u32, id: String },
@@ -152,6 +170,26 @@ impl std::fmt::Debug for AdminOpBody {
                 .field("audit_op", audit_op)
                 .field("mode", mode)
                 .finish(),
+            AdminOpBody::StoreWithIdentityPolicy {
+                v,
+                id,
+                record,
+                audit_op,
+                clear_identity,
+            } => f
+                .debug_struct("StoreWithIdentityPolicy")
+                .field("v", v)
+                .field("id", id)
+                .field("record", record)
+                .field("audit_op", audit_op)
+                .field("clear_identity", clear_identity)
+                .finish(),
+            AdminOpBody::SetIdentity { v, id, identity } => f
+                .debug_struct("SetIdentity")
+                .field("v", v)
+                .field("id", id)
+                .field("identity", identity)
+                .finish(),
             AdminOpBody::Invalidate { v, id } => f
                 .debug_struct("Invalidate")
                 .field("v", v)
@@ -234,6 +272,8 @@ impl AdminOpBody {
     pub fn schema_version(&self) -> u32 {
         match self {
             AdminOpBody::Store { v, .. }
+            | AdminOpBody::StoreWithIdentityPolicy { v, .. }
+            | AdminOpBody::SetIdentity { v, .. }
             | AdminOpBody::Invalidate { v, .. }
             | AdminOpBody::Logout { v, .. }
             | AdminOpBody::Reactivate { v, .. }
@@ -260,6 +300,8 @@ impl AdminOpBody {
                 credential_id: id, ..
             }
             | AdminOpBody::Store { id, .. }
+            | AdminOpBody::StoreWithIdentityPolicy { id, .. }
+            | AdminOpBody::SetIdentity { id, .. }
             | AdminOpBody::Invalidate { id, .. }
             | AdminOpBody::Logout { id, .. }
             | AdminOpBody::Reactivate { id, .. }
@@ -364,6 +406,29 @@ pub fn apply(
                 }
             }
             Ok(serde_json::json!({ "stored": true }))
+        }
+        AdminOpBody::StoreWithIdentityPolicy {
+            id,
+            record,
+            audit_op,
+            clear_identity,
+            ..
+        } => {
+            store.overwrite_unconditional_with_identity_policy_audited(
+                &id,
+                &record,
+                !clear_identity,
+                AuditCtx::route_admin(audit_op.to_audit_op(), actor),
+            )?;
+            Ok(serde_json::json!({ "stored": true }))
+        }
+        AdminOpBody::SetIdentity { id, identity, .. } => {
+            store.set_identity_audited(
+                &id,
+                identity,
+                AuditCtx::route_admin(AuditOp::SetIdentity, actor),
+            )?;
+            Ok(serde_json::json!({ "identity_updated": true }))
         }
         AdminOpBody::Invalidate { id, .. } => {
             let ctx = AuditCtx::route_admin(AuditOp::Invalidate, actor);
@@ -541,8 +606,8 @@ fn decode_hash32(s: &str) -> Option<[u8; 32]> {
 pub enum StoreMode {
     /// Create-only: fails if the id already exists.
     Create,
-    /// Unconditional overwrite (version-guarded internally): the re-login / re-import
-    /// replace that keeps the handle.
+    /// Legacy unconditional overwrite. Its serialized shape remains frozen for old
+    /// clients; identity-aware replacements use `admin.store_with_identity_policy`.
     ReplaceUnconditional,
     /// CAS overwrite gated on the current payload hash (lowercase hex).
     ReplaceCas { expected_hash_hex: String },
@@ -638,5 +703,32 @@ mod tests {
         };
         let s = String::from_utf8(op.to_bytes().unwrap()).unwrap();
         assert!(s.contains("\"op\":\"admin.invalidate\""));
+    }
+
+    #[test]
+    fn legacy_unconditional_store_bytes_remain_compatible() {
+        let op = AdminOpBody::Store {
+            v: 1,
+            id: "apikey:x".into(),
+            record: Box::new(VaultRecord::new_static(
+                CredentialKind::ApiKey,
+                "t",
+                b"k".to_vec(),
+                None,
+            )),
+            audit_op: AdminAuditOp::Put,
+            mode: StoreMode::ReplaceUnconditional,
+        };
+        assert_eq!(
+            String::from_utf8(op.to_bytes().unwrap()).unwrap(),
+            "{\"op\":\"admin.store\",\"v\":1,\"id\":\"apikey:x\",\"record\":{\"schema_version\":1,\"kind\":\"api_key\",\"source\":\"t\",\"record_version\":1,\"expires_at_ms\":null,\"refresh_adapter\":null,\"oauth\":null,\"payload\":[107]},\"audit_op\":\"put\",\"mode\":{\"kind\":\"replace_unconditional\"}}"
+        );
+    }
+
+    #[test]
+    fn identity_policy_store_op_round_trips() {
+        let raw = b"{\"op\":\"admin.store_with_identity_policy\",\"v\":1,\"id\":\"apikey:x\",\"record\":{\"schema_version\":1,\"kind\":\"api_key\",\"source\":\"t\",\"record_version\":1,\"expires_at_ms\":null,\"refresh_adapter\":null,\"oauth\":null,\"payload\":[107]},\"audit_op\":\"put\",\"clear_identity\":false}";
+        let op: AdminOpBody = serde_json::from_slice(raw).expect("new policy op decodes");
+        assert_eq!(op.to_bytes().unwrap(), raw);
     }
 }

@@ -121,6 +121,8 @@ pub struct RecordUsability {
     /// deserializes with the shape intact and serves it: `VaultRecord::decode` is plain
     /// serde and does not pass through the sink.
     pub unservable_identity: bool,
+    /// The non-secret account id operators use to distinguish OAuth credentials.
+    pub account_id: Option<String>,
 }
 
 /// Why a scan could not start. Distinguished from a per-record failure, which is
@@ -278,6 +280,7 @@ pub fn scan(conn: &Connection, key: &MasterKey) -> Result<Vec<RecordUsability>, 
                         why: format!("{e:?}"),
                     },
                     unservable_identity: false,
+                    account_id: None,
                 });
                 continue;
             }
@@ -292,6 +295,7 @@ pub fn scan(conn: &Connection, key: &MasterKey) -> Result<Vec<RecordUsability>, 
                         why: format!("undecodable: {e}"),
                     },
                     unservable_identity: false,
+                    account_id: None,
                 });
                 continue;
             }
@@ -318,14 +322,26 @@ pub fn scan(conn: &Connection, key: &MasterKey) -> Result<Vec<RecordUsability>, 
                 },
             }
         };
+        let unservable_identity = !record.identity.is_servable();
+        let (account_id, invalid_account_id) = account_id_for_output(record.identity.account_id);
         out.push(RecordUsability {
             credential_id: id,
             state,
             usability,
-            unservable_identity: !record.identity.is_servable(),
+            unservable_identity: unservable_identity || invalid_account_id,
+            account_id,
         });
     }
     Ok(out)
+}
+
+fn account_id_for_output(account_id: Option<String>) -> (Option<String>, bool) {
+    match account_id {
+        Some(account_id) if account_id.chars().any(char::is_control) => {
+            (Some("<invalid>".to_string()), true)
+        }
+        account_id => (account_id, false),
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +418,18 @@ mod declared_expiry_tests {
             },
             "a static record must report the expiry its operator declared"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_output_tests {
+    use super::*;
+
+    #[test]
+    fn account_id_controls_are_never_returned_for_cli_rendering() {
+        let (account_id, invalid) = account_id_for_output(Some("acct\ncontrol".to_string()));
+        assert_eq!(account_id.as_deref(), Some("<invalid>"));
+        assert!(invalid);
     }
 }
 

@@ -6267,6 +6267,62 @@ mod tests {
         assert_eq!(legacy_result.account_id, None);
     }
 
+    #[tokio::test]
+    async fn get_serves_identity_attached_after_an_oauth_record_was_created() {
+        use credentials_core::oauth::OAuthCredential;
+        use credentials_core::record::RecordIdentity;
+
+        let (surface, store, _db) = tmp_surface_with_store(31);
+        let oauth = OAuthCredential {
+            access_token: "opaque-access".to_string(),
+            refresh_token: "refresh-secret".to_string(),
+            expires_at_ms: Some(4_102_444_800_000),
+            token_url: "https://example.invalid/token".to_string(),
+            client_id: None,
+            scopes: Vec::new(),
+        };
+        store
+            .create(
+                "oauth:anthropic:late-labelled",
+                &VaultRecord::new_oauth("import", "anthropic", oauth, b"opaque-access".to_vec()),
+            )
+            .expect("create OAuth record");
+        let handle = credentials_core::store::mint_handle().expect("mint");
+        store
+            .put_handle_hash(
+                &handle.hash,
+                "oauth:anthropic:late-labelled",
+                AuditCtx::admin(AuditOp::MintHandle),
+            )
+            .expect("store handle");
+        store
+            .set_identity_audited(
+                "oauth:anthropic:late-labelled",
+                RecordIdentity {
+                    account_id: Some("acct-late".to_string()),
+                    email: None,
+                    org_name: None,
+                },
+                AuditCtx::admin(AuditOp::SetIdentity),
+            )
+            .expect("set identity");
+
+        let read_surface::GetOutcome::Ok(result) = surface
+            .get(
+                1,
+                &read_surface::GetParams {
+                    handle: handle.raw,
+                    min_ttl_ms: None,
+                    force_refresh: false,
+                },
+            )
+            .await
+        else {
+            panic!("expected a served OAuth record");
+        };
+        assert_eq!(result.account_id.as_deref(), Some("acct-late"));
+    }
+
     /// `wrap_result` is the single seam that produces the route reply envelope
     /// `{"result": ...}`. Every route op must go through it so a future envelope change
     /// moves every operation at once instead of silently leaving some ops on the old

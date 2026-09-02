@@ -949,6 +949,429 @@ fn an_antigravity_import_stores_a_resolvable_account_identity() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn antigravity_import_prefers_explicit_account_id_and_only_overrides_source_email_when_requested() {
+    use credentials_core::resolver::{KeySource, ResolverConfig};
+
+    let root = tmp_root("ag-import-explicit-identity");
+    let data_dir = root.join("vault");
+    let key_path = root.join("keys").join("master.key");
+    std::fs::create_dir_all(&data_dir).expect("vault dir");
+    std::fs::create_dir_all(key_path.parent().expect("key dir")).expect("key dir");
+    let source = root.join("antigravity-accounts.json");
+    std::fs::write(
+        &source,
+        br#"{"version":4,"activeIndex":0,"accounts":[{"email":"source@example.com","refreshToken":"1//0-source","projectId":"project"}]}"#,
+    )
+    .expect("write source");
+    let run = |args: &[&str]| -> std::process::Output {
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--key-path")
+            .arg(&key_path)
+            .output()
+            .expect("run ck-auth")
+    };
+    let open_store = || {
+        let key = credentials_core::resolver::resolve(
+            &ResolverConfig {
+                data_dir: data_dir.clone(),
+                source: KeySource::OperatorPath {
+                    path: key_path.clone(),
+                },
+            },
+            None,
+        )
+        .expect("resolve key");
+        let sqlite = open_sqlite(&StorageDescriptor {
+            module_id: credentials_core::contract::MODULE_ID.into(),
+            storage_namespace: credentials_core::contract::STORAGE_NAMESPACE.into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: data_dir.join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .expect("open store");
+        EncryptedStore::migrate(&sqlite).expect("migrate");
+        EncryptedStore::open(sqlite, key).expect("open vault")
+    };
+
+    assert!(run(&["bootstrap"]).status.success(), "bootstrap");
+    assert!(
+        run(&[
+            "import",
+            "--source",
+            "antigravity",
+            "--id",
+            "antigravity:google:source-email",
+            "--json",
+            source.to_str().expect("source path"),
+            "--account-id",
+            "acct-explicit",
+        ])
+        .status
+        .success(),
+        "explicit account import"
+    );
+    let store = open_store();
+    let source_email = store
+        .get("antigravity:google:source-email")
+        .expect("record");
+    assert_eq!(
+        source_email.identity.account_id.as_deref(),
+        Some("acct-explicit")
+    );
+    assert_eq!(
+        source_email.identity.email.as_deref(),
+        Some("source@example.com"),
+        "the source email remains useful display metadata unless an operator overrides it"
+    );
+    drop(store);
+
+    assert!(
+        run(&[
+            "import",
+            "--source",
+            "antigravity",
+            "--id",
+            "antigravity:google:operator-email",
+            "--json",
+            source.to_str().expect("source path"),
+            "--account-id",
+            "acct-operator",
+            "--email",
+            "operator@example.com",
+        ])
+        .status
+        .success(),
+        "operator email import"
+    );
+    let operator_email = open_store()
+        .get("antigravity:google:operator-email")
+        .expect("record");
+    assert_eq!(
+        operator_email.identity.account_id.as_deref(),
+        Some("acct-operator")
+    );
+    assert_eq!(
+        operator_email.identity.email.as_deref(),
+        Some("operator@example.com")
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn import_and_set_identity_attach_sticky_account_metadata_without_replacing_secret_material() {
+    use credentials_core::resolver::{KeySource, ResolverConfig};
+
+    let root = tmp_root("import-identity");
+    let data_dir = root.join("vault");
+    let key_path = root.join("keys").join("master.key");
+    std::fs::create_dir_all(&data_dir).expect("vault dir");
+    std::fs::create_dir_all(key_path.parent().expect("key dir")).expect("key dir");
+    let source = root.join("auth.json");
+    std::fs::write(
+        &source,
+        r#"{"refresh":"refresh-original","access":"opaque-original","expires":4102444800000}"#,
+    )
+    .expect("write source");
+
+    let run = |args: &[&str]| -> std::process::Output {
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .arg("--key-path")
+            .arg(&key_path)
+            .output()
+            .expect("run ck-auth")
+    };
+    let open_record = || {
+        let config = ResolverConfig {
+            data_dir: data_dir.clone(),
+            source: KeySource::OperatorPath {
+                path: key_path.clone(),
+            },
+        };
+        let key = credentials_core::resolver::resolve(&config, None).expect("resolve key");
+        let sqlite = open_sqlite(&StorageDescriptor {
+            module_id: credentials_core::contract::MODULE_ID.into(),
+            storage_namespace: credentials_core::contract::STORAGE_NAMESPACE.into(),
+            isolation: Isolation::Module,
+            backend: StorageBackend::Sqlite {
+                path: data_dir.join("store.db").to_string_lossy().into_owned(),
+            },
+        })
+        .expect("open store");
+        EncryptedStore::migrate(&sqlite).expect("migrate");
+        EncryptedStore::open(sqlite, key).expect("open vault")
+    };
+
+    assert!(run(&["bootstrap"]).status.success(), "bootstrap");
+    let imported = run(&[
+        "import",
+        "--source",
+        "opencode",
+        "--id",
+        "oauth:anthropic",
+        "--json",
+        source.to_str().expect("source path"),
+        "--account-id",
+        "acct-import",
+        "--email",
+        "import@example.com",
+        "--org-name",
+        "Import Organization",
+    ]);
+    assert!(
+        imported.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let store = open_record();
+    let imported_record = store.get("oauth:anthropic").expect("imported record");
+    assert_eq!(
+        imported_record.identity.account_id.as_deref(),
+        Some("acct-import"),
+        "the import flag must land in the identity field consumers resolve"
+    );
+    drop(store);
+
+    let mut legacy = imported_record;
+    legacy.identity.account_id = Some("acct\ncontrol".to_string());
+    let key = credentials_core::resolver::resolve(
+        &ResolverConfig {
+            data_dir: data_dir.clone(),
+            source: KeySource::OperatorPath {
+                path: key_path.clone(),
+            },
+        },
+        None,
+    )
+    .expect("resolve key for legacy envelope");
+    let envelope = credentials_core::envelope::seal(
+        &key,
+        &legacy.encode().expect("encode legacy record"),
+        &credentials_core::envelope::RecordBinding {
+            credential_id: "oauth:anthropic",
+            record_version: 1,
+        },
+    )
+    .expect("seal legacy record");
+    let conn = rusqlite::Connection::open(data_dir.join("store.db")).expect("open raw store");
+    conn.execute(
+        "UPDATE credentials SET envelope = ?1 WHERE credential_id = 'oauth:anthropic'",
+        rusqlite::params![envelope],
+    )
+    .expect("seed legacy identity");
+    let usable_legacy = run(&["usable"]);
+    let usable_legacy_stdout = String::from_utf8_lossy(&usable_legacy.stdout);
+    assert!(usable_legacy.status.success());
+    assert!(usable_legacy_stdout.contains("account=<invalid>"));
+    assert!(!usable_legacy_stdout.contains("acct\ncontrol"));
+    assert!(usable_legacy_stdout.contains("unservable identity: 1"));
+
+    let store = open_record();
+    let material_fixture = credentials_core::record::VaultRecord::new_oauth(
+        "fixture",
+        "anthropic",
+        credentials_core::oauth::OAuthCredential {
+            access_token: "opaque-fixture-access".to_string(),
+            refresh_token: "fixture-refresh-secret".to_string(),
+            expires_at_ms: Some(4_102_444_800_000),
+            token_url: "https://fixture.invalid/token".to_string(),
+            client_id: Some("fixture-client".to_string()),
+            scopes: vec!["scope-a".to_string(), "scope-b".to_string()],
+        },
+        b"opaque-fixture-access".to_vec(),
+    );
+    store
+        .overwrite_unconditional_audited(
+            "oauth:anthropic",
+            &material_fixture,
+            credentials_core::audit::AuditCtx::admin(credentials_core::audit::AuditOp::Import),
+        )
+        .expect("replace with field-complete OAuth fixture");
+    let before_set = store.get("oauth:anthropic").expect("before set");
+    drop(store);
+    let set = run(&[
+        "set-identity",
+        "oauth:anthropic",
+        "--account-id",
+        "acct-set",
+        "--email",
+        "set@example.com",
+    ]);
+    assert!(
+        set.status.success(),
+        "set-identity: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let store = open_record();
+    let after_set = store.get("oauth:anthropic").expect("after set");
+    assert_eq!(
+        after_set.payload, before_set.payload,
+        "set-identity must not rotate payload"
+    );
+    assert_eq!(
+        after_set.oauth, before_set.oauth,
+        "set-identity must not replace OAuth material"
+    );
+    assert_eq!(after_set.identity.account_id.as_deref(), Some("acct-set"));
+    assert!(
+        store
+            .read_audit(None)
+            .expect("audit")
+            .iter()
+            .any(|entry| entry.op == "set_identity"),
+        "identity-only writes must leave an audit entry"
+    );
+    drop(store);
+
+    let usable = run(&["usable"]);
+    let usable_stdout = String::from_utf8_lossy(&usable.stdout);
+    assert!(
+        usable.status.success(),
+        "usable: {}",
+        String::from_utf8_lossy(&usable.stderr)
+    );
+    assert!(
+        usable_stdout
+            .lines()
+            .any(|line| line.contains("oauth:anthropic") && line.contains("account=acct-set")),
+        "usable must show non-secret account identity presence: {usable_stdout}"
+    );
+
+    std::fs::write(
+        &source,
+        r#"{"refresh":"refresh-rotated","access":"opaque-rotated","expires":4102444800000}"#,
+    )
+    .expect("rotate source");
+    let replacement = run(&[
+        "import",
+        "--source",
+        "opencode",
+        "--id",
+        "oauth:anthropic",
+        "--json",
+        source.to_str().expect("source path"),
+        "--replace",
+    ]);
+    assert!(
+        replacement.status.success(),
+        "replace: {}",
+        String::from_utf8_lossy(&replacement.stderr)
+    );
+    let sticky = open_record()
+        .get("oauth:anthropic")
+        .expect("sticky identity");
+    assert_eq!(sticky.identity.account_id.as_deref(), Some("acct-set"));
+    assert_eq!(
+        sticky.oauth.as_ref().expect("OAuth").refresh_token,
+        "refresh-rotated"
+    );
+    assert_eq!(
+        sticky.oauth.as_ref().expect("OAuth").access_token,
+        "opaque-rotated"
+    );
+
+    let cleared = run(&[
+        "import",
+        "--source",
+        "opencode",
+        "--id",
+        "oauth:anthropic",
+        "--json",
+        source.to_str().expect("source path"),
+        "--replace",
+        "--clear-identity",
+    ]);
+    assert!(
+        cleared.status.success(),
+        "clear identity: {}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let cleared_record = open_record()
+        .get("oauth:anthropic")
+        .expect("cleared identity");
+    assert!(
+        cleared_record.identity.is_empty(),
+        "--clear-identity must override sticky preservation"
+    );
+    assert_eq!(
+        cleared_record.oauth.as_ref().expect("OAuth").refresh_token,
+        "refresh-rotated"
+    );
+    assert_eq!(
+        cleared_record.oauth.as_ref().expect("OAuth").access_token,
+        "opaque-rotated"
+    );
+
+    assert!(
+        run(&[
+            "set-identity",
+            "oauth:anthropic",
+            "--account-id",
+            "acct-to-clear",
+        ])
+        .status
+        .success(),
+        "set identity before clear"
+    );
+    assert!(
+        run(&["set-identity", "oauth:anthropic", "--clear"])
+            .status
+            .success(),
+        "set-identity --clear"
+    );
+    assert!(
+        open_record()
+            .get("oauth:anthropic")
+            .expect("cleared by set-identity")
+            .identity
+            .is_empty(),
+        "set-identity --clear must drop metadata without a source re-import"
+    );
+
+    let email_only = run(&[
+        "import",
+        "--source",
+        "opencode",
+        "--id",
+        "oauth:other",
+        "--json",
+        source.to_str().expect("source path"),
+        "--email",
+        "missing-account@example.com",
+    ]);
+    assert!(
+        !email_only.status.success(),
+        "email without account_id must refuse"
+    );
+    assert!(
+        String::from_utf8_lossy(&email_only.stderr).contains("--account-id is required"),
+        "email-only refusal must name the missing field"
+    );
+
+    for invalid_value in ["", "account\ncontrol", &"x".repeat(257)] {
+        let invalid_output = run(&[
+            "set-identity",
+            "oauth:anthropic",
+            "--account-id",
+            invalid_value,
+        ]);
+        assert!(
+            !invalid_output.status.success(),
+            "invalid account id {invalid_value:?} must refuse"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `events` separates three outcomes an operator must not confuse.
 ///
 /// "no events" and "this store cannot record events" would otherwise render the same,

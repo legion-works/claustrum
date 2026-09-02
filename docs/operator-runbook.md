@@ -220,7 +220,15 @@ Source-specific notes:
 - `--replace` overwrites an existing id unconditionally (re-seal at version+1,
   reset to active), for fixing a credential imported from the wrong source. Existing
   handles keep resolving to the id — **no re-mint needed**. Without `--replace`,
-  `import` is create-only and an existing id is refused.
+  `import` is create-only and an existing id is refused. `--account-id <id>` attaches
+  non-secret account metadata; `--email` and `--org-name` require it, while
+  `--clear-identity` is mutually exclusive with all three. A token-only
+  `import --replace` preserves the existing identity; explicit identity flags override
+  it and `--clear-identity` drops it. To label a vault-custodied credential without
+  replacing its token family from a source file, use `ck auth set-identity
+  <credential-id> --account-id <id> [--email <email>] [--org-name <name>]` (or
+  `--clear`): it re-seals unchanged material, keeps lifecycle state, and bumps
+  `record_version`.
 
 **Put a static credential** (API key / DSN / opaque). Use `--payload-file <path>`
 for a secret so it never appears in the process list or shell history; `--payload
@@ -607,6 +615,7 @@ These values come from the closed `AuditOp` enum and name the mutation or chain 
 | `import` | Import a credential from an external source format. |
 | `login` | Mint a vault-native first-party OAuth credential. |
 | `overwrite` | Replace a credential under an unconditional or compare-and-set write path. |
+| `set_identity` | Re-seal unchanged credential material with updated non-secret account identity. |
 | `invalidate` | Mark a credential as needing re-authentication. |
 | `rotate_master_key` | Re-wrap the vault under a new master key. |
 | `refresh_commit` | Commit new tokens from a vault-owned refresh. |

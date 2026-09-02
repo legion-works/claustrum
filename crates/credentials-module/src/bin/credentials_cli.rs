@@ -24,6 +24,7 @@
 //!             `--payload-file` bytes exactly, and do not accept `--expires-ms`.
 //!   mint-signing-key --id signing:<provider>[:<generation>] [--replace]
 //!   import    --source opencode|pi|antigravity --id <id> --json <file>
+//!   set-identity <id> --account-id <id> [--email <email>] [--org-name <name>] | --clear
 //!   invalidate --id <id>
 //!   rotate-master-key
 //!   mint-handle --id <id>                      print a fresh handle (once)
@@ -57,7 +58,7 @@ use credentials_core::admin_ops::{AdminAuditOp, AdminOpBody, StoreMode, ADMIN_OP
 use credentials_core::contract::{MODULE_ID, STORAGE_NAMESPACE};
 use credentials_core::credential_id::{default_refresh_adapter, parse_credential_id, AuthMethod};
 use credentials_core::key::MasterKey;
-use credentials_core::record::{CredentialKind, VaultRecord};
+use credentials_core::record::{CredentialKind, RecordIdentity, VaultRecord};
 use credentials_core::resolver::{self, KeySource, MasterKeyError, ResolverConfig};
 use credentials_core::store::{EncryptedStore, GrantOperation, StoreOpError};
 use ring::rand::SystemRandom;
@@ -247,6 +248,7 @@ fn run() -> Result<(), CliError> {
         "put" => cmd_put(&global, &args),
         "mint-signing-key" => cmd_mint_signing_key(&global, &args),
         "import" => cmd_import(&global, &args),
+        "set-identity" => cmd_set_identity(&global, &args),
         "login" => cmd_login(&global, &args),
         "invalidate" => cmd_invalidate(&global, &args),
         "reactivate" => cmd_reactivate(&global, &args),
@@ -321,7 +323,17 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
             "--client-id",
         ],
         "mint-signing-key" => &["--id"],
-        "import" => &["--source", "--provider", "--id", "--json", "--adapter"],
+        "import" => &[
+            "--source",
+            "--provider",
+            "--id",
+            "--json",
+            "--adapter",
+            "--account-id",
+            "--email",
+            "--org-name",
+        ],
+        "set-identity" => &["--account-id", "--email", "--org-name"],
         "login" => &["--provider", "--id", "--payload-file", "--account"],
         "invalidate" | "reactivate" | "mint-handle" | "revoke-all-handles" | "remove" => &["--id"],
         "logout" => &["--provider", "--id"],
@@ -337,11 +349,17 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
     let bool_flags: &[&str] = match command {
         "put" => &["--replace"],
         "mint-signing-key" => &["--replace"],
-        "import" => &["--replace"],
+        "import" => &["--replace", "--clear-identity"],
+        "set-identity" => &["--clear"],
         "login" => &["--replace", "--no-listener", "--device"],
         _ => &[],
     };
-    let mut i = 0;
+    let mut i =
+        if command == "set-identity" && args.first().is_some_and(|arg| !arg.starts_with("--")) {
+            1
+        } else {
+            0
+        };
     while i < args.len() {
         let arg = &args[i];
         if bool_flags.contains(&arg.as_str()) {
@@ -380,6 +398,7 @@ fn usage_short() -> String {
         put                 ingest an api key, session cookie, or opaque secret\n\
         mint-signing-key    generate and custody a new Ed25519 signing key\n\
         import              import from opencode/pi/gemini-cli/antigravity\n\
+        set-identity        attach non-secret account metadata to one credential\n\
        mint-handle         mint a capability handle for a credential\n\
        revoke-handle       revoke one capability handle\n\
        revoke-all-handles  revoke every handle for a credential\n\
@@ -495,14 +514,27 @@ fn help_verb(verb: &str) -> String {
             "ck auth import --source <opencode|pi|gemini-cli|antigravity> --id <id> \
              --json <file>\n\
              \x20             [--provider <key>] [--adapter <name>] [--replace]\n\
+             \x20             [--account-id <id> [--email <email>] [--org-name <name>] | --clear-identity]\n\
              \n\
              opencode/pi read auth.json (--provider selects one entry; an apikey:<p> id\n\
                imports a {type:api,key} entry as a static key, an oauth id imports tokens);\n\
              gemini-cli reads ~/.gemini/oauth_creds.json (single credential, no --provider);\n\
              antigravity reads ~/.config/opencode/antigravity-accounts.json (accounts array;\n\
                --provider selects an account by email/index, default activeIndex);\n\
-             --adapter overrides the method-derived refresh adapter;\n\
-             --replace overwrites an existing id (fix a wrong-source import; keeps handles)."
+              --adapter overrides the method-derived refresh adapter;\n\
+              --account-id attaches non-secret account metadata (required with --email or\n\
+                --org-name); --clear-identity removes it;\n\
+              --replace overwrites an existing id (fix a wrong-source import; keeps handles)\n\
+                and preserves prior identity unless explicit identity flags override or clear it."
+        }
+        "set-identity" => {
+            "ck auth set-identity <credential-id> --account-id <id> [--email <email>] \
+             [--org-name <name>] | --clear\n\
+             \n\
+             Update only non-secret account metadata. The vault decrypts and re-seals the\n\
+             existing record without replacing token material, keeps its lifecycle state,\n\
+             and bumps record_version because the encrypted envelope changed. Works for any\n\
+             decryptable record, including needs-reauth or retired records."
         }
         "mint-handle" => {
             "ck auth mint-handle --id <id>\n\
@@ -977,14 +1009,24 @@ fn cmd_put(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Build an `admin.store` op body.
+/// Build an admin store op, upgrading unconditional replacement to the identity-policy
+/// discriminator so an older daemon refuses semantics it cannot preserve.
 fn store_op(id: &str, record: VaultRecord, audit_op: AdminAuditOp, mode: StoreMode) -> AdminOpBody {
-    AdminOpBody::Store {
-        v: ADMIN_OP_SCHEMA_V1,
-        id: id.to_string(),
-        record: Box::new(record),
-        audit_op,
-        mode,
+    match mode {
+        StoreMode::ReplaceUnconditional => AdminOpBody::StoreWithIdentityPolicy {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: id.to_string(),
+            record: Box::new(record),
+            audit_op,
+            clear_identity: false,
+        },
+        mode => AdminOpBody::Store {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: id.to_string(),
+            record: Box::new(record),
+            audit_op,
+            mode,
+        },
     }
 }
 
@@ -997,10 +1039,66 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
+#[derive(Default)]
+struct IdentityFlags {
+    clear: bool,
+    account_id: Option<String>,
+    email: Option<String>,
+    org_name: Option<String>,
+}
+
+fn identity_flags(
+    args: &[String],
+    clear_flag: &str,
+    require_account_id: bool,
+) -> Result<IdentityFlags, CliError> {
+    let flags = IdentityFlags {
+        clear: has_flag(args, clear_flag),
+        account_id: optional(args, "--account-id"),
+        email: optional(args, "--email"),
+        org_name: optional(args, "--org-name"),
+    };
+    let has_identity_fields =
+        flags.account_id.is_some() || flags.email.is_some() || flags.org_name.is_some();
+    if flags.clear && has_identity_fields {
+        return Err(CliError::Usage(format!(
+            "{clear_flag} is mutually exclusive with --account-id, --email, and --org-name"
+        )));
+    }
+    if flags.clear {
+        return Ok(flags);
+    }
+    let Some(account_id) = flags.account_id.as_deref() else {
+        if has_identity_fields || require_account_id {
+            return Err(CliError::Usage(
+                "--account-id is required when setting identity metadata".to_string(),
+            ));
+        }
+        return Ok(flags);
+    };
+    if account_id.trim().is_empty() {
+        return Err(CliError::Usage(
+            "--account-id must not be empty".to_string(),
+        ));
+    }
+    if account_id.chars().any(char::is_control) {
+        return Err(CliError::Usage(
+            "--account-id must not contain control characters".to_string(),
+        ));
+    }
+    if account_id.len() > 256 {
+        return Err(CliError::Usage(
+            "--account-id must be at most 256 bytes".to_string(),
+        ));
+    }
+    Ok(flags)
+}
+
 fn cmd_import(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     let source = required(args, "--source")?;
     let id = required(args, "--id")?;
     let json_path = required(args, "--json")?;
+    let requested_identity = identity_flags(args, "--clear-identity", false)?;
     let raw =
         std::fs::read(&json_path).map_err(|e| CliError::Io(format!("reading {json_path}: {e}")))?;
     let provider_sel = optional(args, "--provider");
@@ -1015,7 +1113,8 @@ fn cmd_import(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
             "signing keys must be generated with mint-signing-key, not imported".to_string(),
         ));
     }
-    let record = if matches!(parsed.method, Some(AuthMethod::ApiKey)) {
+    let mut imported_email = None;
+    let mut record = if matches!(parsed.method, Some(AuthMethod::ApiKey)) {
         // API key → a static record (no adapter, no refresh). `--provider` selects the
         // entry from a multi-provider auth.json; default to the parsed provider.
         let provider = provider_sel
@@ -1030,14 +1129,13 @@ fn cmd_import(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
         // Antigravity carries an identity the other import sources do not: its access
         // tokens are opaque, so the email in the plugin store is the only thing that
         // can distinguish two accounts downstream.
-        let mut identity_email: Option<String> = None;
         let oauth = if source == "antigravity" {
             // For antigravity the credentials live in the plugin's accounts-array
             // store instead of the normal provider auth.json file — read the selected
             // account and pack its refresh.
             credentials_core::oauth::import_antigravity_account(&raw, provider_sel.as_deref()).map(
                 |imported| {
-                    identity_email = imported.email;
+                    imported_email = imported.email;
                     imported.oauth
                 },
             )
@@ -1058,31 +1156,26 @@ fn cmd_import(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
                 ))
             })?;
         let payload = oauth.access_token.clone().into_bytes();
-        let record = VaultRecord::new_oauth(source, adapter, oauth, payload);
-        match identity_email {
-            // Only attach an identity when one was actually read. An unconditional
-            // `with_identity` would stamp an all-None identity onto every other import
-            // source, which reads as "captured, and empty" rather than "never captured".
-            //
-            // THE EMAIL GOES IN BOTH FIELDS, and `account_id` is the load-bearing one.
-            // The read surface serves `account_id` as the identity consumers join on,
-            // and treats `email` as display metadata; a record carrying only `email`
-            // renders a value while still resolving no identity, so a consumer
-            // labelling per account keeps collapsing and the wire looks unchanged.
-            // The read surface already states this as an invariant -- email never
-            // ships without account_id -- and populating one field alone breaks it.
-            //
-            // An email is a legitimate account_id here: consumers treat it as an opaque
-            // stable string, and antigravity has no other per-account identifier,
-            // since its access tokens are opaque rather than JWTs.
-            Some(email) => record.with_identity(credentials_core::record::RecordIdentity {
-                account_id: Some(email.clone()),
-                email: Some(email),
-                org_name: None,
-            }),
-            None => record,
-        }
+        VaultRecord::new_oauth(source, adapter, oauth, payload)
     };
+
+    if !requested_identity.clear {
+        record = match requested_identity.account_id {
+            Some(account_id) => record.with_identity(RecordIdentity {
+                account_id: Some(account_id),
+                email: requested_identity.email.or(imported_email),
+                org_name: requested_identity.org_name,
+            }),
+            None => match imported_email {
+                Some(email) => record.with_identity(RecordIdentity {
+                    account_id: Some(email.clone()),
+                    email: Some(email),
+                    org_name: None,
+                }),
+                None => record,
+            },
+        };
+    }
 
     // `--replace` overwrites an existing credential UNCONDITIONALLY (re-seal at
     // version+1, reset to active, keep the handle), for fixing a credential imported
@@ -1091,12 +1184,13 @@ fn cmd_import(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     if has_flag(args, "--replace") {
         commit_admin(
             global,
-            store_op(
-                &id,
-                record,
-                AdminAuditOp::Import,
-                StoreMode::ReplaceUnconditional,
-            ),
+            AdminOpBody::StoreWithIdentityPolicy {
+                v: ADMIN_OP_SCHEMA_V1,
+                id: id.clone(),
+                record: Box::new(record),
+                audit_op: AdminAuditOp::Import,
+                clear_identity: requested_identity.clear,
+            },
         )?;
         println!("replaced {id}");
     } else {
@@ -1106,6 +1200,36 @@ fn cmd_import(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
         )?;
         println!("imported {id}");
     }
+    Ok(())
+}
+
+fn cmd_set_identity(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
+    let id = args
+        .first()
+        .filter(|arg| !arg.starts_with("--"))
+        .cloned()
+        .ok_or_else(|| {
+            CliError::Usage("set-identity requires a positional <credential-id>".to_string())
+        })?;
+    let requested = identity_flags(args, "--clear", true)?;
+    let identity = if requested.clear {
+        RecordIdentity::default()
+    } else {
+        RecordIdentity {
+            account_id: requested.account_id,
+            email: requested.email,
+            org_name: requested.org_name,
+        }
+    };
+    commit_admin(
+        global,
+        AdminOpBody::SetIdentity {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: id.clone(),
+            identity,
+        },
+    )?;
+    println!("updated identity for {id}");
     Ok(())
 }
 
@@ -3111,8 +3235,9 @@ fn cmd_usable(global: &GlobalArgs) -> Result<(), CliError> {
             }
             Usability::Stranded => {
                 println!(
-                    "  {id:34} oauth   {}  STRANDED: no access token and no refresh token",
-                    row.state
+                    "  {id:34} oauth   {}  account={}  STRANDED: no access token and no refresh token",
+                    row.state,
+                    row.account_id.as_deref().unwrap_or("none")
                 );
                 stranded += 1;
             }
@@ -3193,7 +3318,11 @@ fn cmd_usable(global: &GlobalArgs) -> Result<(), CliError> {
                     }
                     None => "no expiry recorded".to_string(),
                 };
-                println!("  {id:34} oauth   {}  {ttl}", row.state);
+                println!(
+                    "  {id:34} oauth   {}  account={}  {ttl}",
+                    row.state,
+                    row.account_id.as_deref().unwrap_or("none")
+                );
                 serviceable += 1;
             }
         }
