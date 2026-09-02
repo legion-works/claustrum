@@ -525,7 +525,8 @@ fn help_verb(verb: &str) -> String {
               --account-id attaches non-secret account metadata (required with --email or\n\
                 --org-name); --clear-identity removes it;\n\
               --replace overwrites an existing id (fix a wrong-source import; keeps handles)\n\
-                and preserves prior identity unless explicit identity flags override or clear it."
+                and preserves prior identity only when the incoming token belongs to the same\n\
+                account; a detectable mismatch requires explicit identity flags to override or clear it."
         }
         "set-identity" => {
             "ck auth set-identity <credential-id> --account-id <id> [--email <email>] \

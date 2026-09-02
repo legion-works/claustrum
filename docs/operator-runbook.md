@@ -224,7 +224,9 @@ Source-specific notes:
   non-secret account metadata; `--email` and `--org-name` require it, while
   `--clear-identity` is mutually exclusive with all three. A token-only
   `import --replace` preserves the existing identity; explicit identity flags override
-  it and `--clear-identity` drops it. To label a vault-custodied credential without
+  it and `--clear-identity` drops it. Preservation assumes the replacement token belongs
+  to the same account; after a re-login into a different account, run `ck auth set-identity <id> --account-id <uuid>`.
+  To label a vault-custodied credential without
   replacing its token family from a source file, use `ck auth set-identity
   <credential-id> --account-id <id> [--email <email>] [--org-name <name>]` (or
   `--clear`): it re-seals unchanged material, keeps lifecycle state, and bumps

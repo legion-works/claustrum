@@ -386,6 +386,12 @@ pub enum StoreOpError {
     AlreadyExists,
     /// A CAS overwrite's `expected_payload_hash` did not match the current record.
     CasMismatch,
+    /// Identity preservation would attach an existing account label to incoming material
+    /// whose provider claim names a different account.
+    AccountIdentityMismatch {
+        retained_account_id: String,
+        incoming_account_id: String,
+    },
     /// The record is quarantined (`corrupt`) and cannot be served.
     Quarantined,
     /// The record is `needs_reauth` and must not be served until re-authenticated.
@@ -409,6 +415,15 @@ pub enum StoreOpError {
     Store(String),
 }
 
+enum IdentityPolicyOverwriteOutcome {
+    NotFound,
+    AccountMismatch {
+        retained_account_id: String,
+        incoming_account_id: String,
+    },
+    Updated(usize),
+}
+
 impl std::fmt::Display for StoreOpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -419,6 +434,13 @@ impl std::fmt::Display for StoreOpError {
             StoreOpError::CasMismatch => {
                 f.write_str("compare-and-set failed: expected payload hash did not match")
             }
+            StoreOpError::AccountIdentityMismatch {
+                retained_account_id,
+                incoming_account_id,
+            } => write!(
+                f,
+                "incoming material names account '{incoming_account_id}', but identity preservation would retain account '{retained_account_id}'; pass `--account-id <new>` with '{incoming_account_id}' or `--clear-identity`"
+            ),
             StoreOpError::Quarantined => f.write_str("credential is quarantined (corrupt)"),
             StoreOpError::NeedsReauth => f.write_str("credential needs re-authentication"),
             StoreOpError::Decrypt(e) => write!(f, "envelope decrypt failed: {e}"),
@@ -1082,6 +1104,8 @@ impl EncryptedStore {
     /// When `preserve_existing_identity` is true and `record` has no identity, carries
     /// the existing identity into the replacement. Identity describes the account rather
     /// than the token, so re-importing rotated tokens must not erase account labelling.
+    /// This preservation assumes the incoming token belongs to the SAME ACCOUNT as the
+    /// retained label; when the adapter can derive both account ids, a mismatch is refused.
     /// An undecryptable existing envelope is treated as no identity so repair still
     /// replaces corrupted material. Passing false makes an empty incoming identity an
     /// explicit clear.
@@ -1102,6 +1126,14 @@ impl EncryptedStore {
         ctx: AuditCtx<'_>,
     ) -> Result<(), StoreOpError> {
         let incoming = normalize_and_validate_record_identity(record.clone())?;
+        let incoming_account_id = preserve_existing_identity
+            .then_some(())
+            .filter(|_| incoming.identity.is_empty())
+            .and_then(|_| {
+                let adapter = incoming.refresh_adapter.as_deref()?;
+                let access_token = incoming.oauth.as_ref()?.access_token.as_str();
+                crate::oauth_login::account_id_for_adapter(adapter, access_token)
+            });
         let key_id_hex = self.key_id.to_hex();
         let now = now_ms();
         let audit_key = self.audit_key.clone();
@@ -1127,7 +1159,7 @@ impl EncryptedStore {
                 )
                 .optional()?;
             let Some((current_version, existing_envelope)) = existing else {
-                return Ok(None); // NotFound: signalled to the caller below.
+                return Ok(IdentityPolicyOverwriteOutcome::NotFound);
             };
             let next_version = (current_version as u64).saturating_add(1);
 
@@ -1147,7 +1179,18 @@ impl EncryptedStore {
                 if let Some(identity) =
                     existing_identity.filter(|identity| identity.validate().is_ok())
                 {
-                    sealed.identity = identity.normalized();
+                    let identity = identity.normalized();
+                    if let (Some(retained_account_id), Some(incoming_account_id)) =
+                        (identity.account_id.as_ref(), incoming_account_id.as_ref())
+                    {
+                        if retained_account_id != incoming_account_id {
+                            return Ok(IdentityPolicyOverwriteOutcome::AccountMismatch {
+                                retained_account_id: retained_account_id.clone(),
+                                incoming_account_id: incoming_account_id.clone(),
+                            });
+                        }
+                    }
+                    sealed.identity = identity;
                 }
             }
             sealed.record_version = next_version;
@@ -1184,12 +1227,19 @@ impl EncryptedStore {
                     },
                 )?;
             }
-            Ok(Some(n))
+            Ok(IdentityPolicyOverwriteOutcome::Updated(n))
         })?;
         match outcome {
-            None => Err(StoreOpError::NotFound),
-            Some(0) => Err(StoreOpError::CasMismatch),
-            Some(_) => Ok(()),
+            IdentityPolicyOverwriteOutcome::NotFound => Err(StoreOpError::NotFound),
+            IdentityPolicyOverwriteOutcome::AccountMismatch {
+                retained_account_id,
+                incoming_account_id,
+            } => Err(StoreOpError::AccountIdentityMismatch {
+                retained_account_id,
+                incoming_account_id,
+            }),
+            IdentityPolicyOverwriteOutcome::Updated(0) => Err(StoreOpError::CasMismatch),
+            IdentityPolicyOverwriteOutcome::Updated(_) => Ok(()),
         }
     }
 
@@ -3713,6 +3763,32 @@ mod tests {
         )
     }
 
+    fn openai_record(account_id: &str, payload: &[u8]) -> VaultRecord {
+        use base64::Engine as _;
+
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": account_id },
+        });
+        let claims =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        let access_token = format!("{header}.{claims}.sig");
+        VaultRecord::new_oauth(
+            "opencode",
+            "openai",
+            OAuthCredential {
+                access_token,
+                refresh_token: format!("refresh-{account_id}"),
+                expires_at_ms: Some(9_999),
+                token_url: "https://t.test/token".into(),
+                client_id: Some("c".into()),
+                scopes: vec!["scope-a".into(), "scope-b".into()],
+            },
+            payload.to_vec(),
+        )
+    }
+
     /// The usable-scan reads a REAL sealed store and reaches its stranded arm.
     ///
     /// `is_serviceable` is unit-tested on hand-built credentials, which proves the
@@ -4048,14 +4124,90 @@ mod tests {
     }
 
     #[test]
-    fn unconditional_overwrite_preserves_existing_identity_when_incoming_has_none() {
+    fn unconditional_overwrite_preserves_existing_identity_when_openai_claim_agrees() {
         use crate::record::RecordIdentity;
 
         let (root, store) = tmp_store(24);
-        let existing = oauth_record().with_identity(RecordIdentity {
+        let existing = openai_record("acct-original", b"old-token").with_identity(RecordIdentity {
             account_id: Some("acct-original".to_string()),
             email: Some("original@example.com".to_string()),
             org_name: Some("Original Organization".to_string()),
+        });
+        store.create("oauth:openai", &existing).expect("create");
+
+        store
+            .overwrite_unconditional_audited(
+                "oauth:openai",
+                &openai_record("acct-original", b"rotated-token"),
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("replace");
+
+        assert_eq!(
+            store.get("oauth:openai").expect("read").identity,
+            existing.identity,
+            "a token-only re-import must retain the account identity already attached to the id"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_refuses_to_preserve_identity_for_a_different_openai_account() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(57);
+        let existing = openai_record("acct-retained", b"old-token").with_identity(RecordIdentity {
+            account_id: Some("acct-retained".to_string()),
+            email: Some("retained@example.com".to_string()),
+            org_name: Some("Retained Organization".to_string()),
+        });
+        store.create("oauth:openai", &existing).expect("create");
+        let before = store.get("oauth:openai").expect("read before replace");
+
+        let err = store
+            .overwrite_unconditional_audited(
+                "oauth:openai",
+                &openai_record("acct-incoming", b"new-token"),
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect_err("a different incoming account must be refused");
+
+        let message = err.to_string();
+        assert!(message.contains("acct-retained"), "{message}");
+        assert!(message.contains("acct-incoming"), "{message}");
+        assert!(message.contains("--account-id <new>"), "{message}");
+        assert!(message.contains("--clear-identity"), "{message}");
+
+        match err {
+            StoreOpError::AccountIdentityMismatch {
+                retained_account_id,
+                incoming_account_id,
+            } => {
+                assert_eq!(retained_account_id, "acct-retained");
+                assert_eq!(incoming_account_id, "acct-incoming");
+            }
+            other => panic!("expected typed account mismatch, got {other}"),
+        }
+        let after = store.get("oauth:openai").expect("read after refusal");
+        assert_eq!(
+            after.record_version, before.record_version,
+            "version changed"
+        );
+        assert_eq!(after.payload, before.payload, "token bytes changed");
+        assert_eq!(after.oauth, before.oauth, "OAuth material changed");
+        assert_eq!(after.identity, before.identity, "identity changed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_preserves_identity_when_adapter_cannot_derive_an_account() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(58);
+        let existing = oauth_record().with_identity(RecordIdentity {
+            account_id: Some("acct-retained".to_string()),
+            email: Some("retained@example.com".to_string()),
+            org_name: None,
         });
         store.create("oauth:anthropic", &existing).expect("create");
 
@@ -4065,43 +4217,43 @@ mod tests {
                 &oauth_record(),
                 AuditCtx::admin(AuditOp::Import),
             )
-            .expect("replace");
+            .expect("an adapter without a live account claim keeps prior behavior");
 
         assert_eq!(
             store.get("oauth:anthropic").expect("read").identity,
-            existing.identity,
-            "a token-only re-import must retain the account identity already attached to the id"
+            existing.identity
         );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn unconditional_overwrite_uses_an_incoming_identity_in_preference_to_existing() {
+    fn unconditional_overwrite_uses_explicit_identity_for_a_different_openai_account() {
         use crate::record::RecordIdentity;
 
         let (root, store) = tmp_store(25);
-        let existing = oauth_record().with_identity(RecordIdentity {
+        let existing = openai_record("acct-original", b"old-token").with_identity(RecordIdentity {
             account_id: Some("acct-original".to_string()),
             email: Some("original@example.com".to_string()),
             org_name: None,
         });
-        let incoming = oauth_record().with_identity(RecordIdentity {
-            account_id: Some("acct-replacement".to_string()),
-            email: Some("replacement@example.com".to_string()),
-            org_name: Some("Replacement Organization".to_string()),
-        });
-        store.create("oauth:anthropic", &existing).expect("create");
+        let incoming =
+            openai_record("acct-replacement", b"new-token").with_identity(RecordIdentity {
+                account_id: Some("acct-replacement".to_string()),
+                email: Some("replacement@example.com".to_string()),
+                org_name: Some("Replacement Organization".to_string()),
+            });
+        store.create("oauth:openai", &existing).expect("create");
 
         store
             .overwrite_unconditional_audited(
-                "oauth:anthropic",
+                "oauth:openai",
                 &incoming,
                 AuditCtx::admin(AuditOp::Import),
             )
             .expect("replace");
 
         assert_eq!(
-            store.get("oauth:anthropic").expect("read").identity,
+            store.get("oauth:openai").expect("read").identity,
             incoming.identity,
             "explicit import identity must replace stale account metadata"
         );
@@ -4135,32 +4287,28 @@ mod tests {
     }
 
     #[test]
-    fn unconditional_overwrite_can_explicitly_clear_existing_identity() {
+    fn unconditional_overwrite_can_clear_identity_for_a_different_openai_account() {
         use crate::record::RecordIdentity;
 
         let (root, store) = tmp_store(27);
-        let existing = oauth_record().with_identity(RecordIdentity {
+        let existing = openai_record("acct-original", b"old-token").with_identity(RecordIdentity {
             account_id: Some("acct-original".to_string()),
             email: Some("original@example.com".to_string()),
             org_name: None,
         });
-        store.create("oauth:anthropic", &existing).expect("create");
+        store.create("oauth:openai", &existing).expect("create");
 
         store
             .overwrite_unconditional_with_identity_policy_audited(
-                "oauth:anthropic",
-                &oauth_record(),
+                "oauth:openai",
+                &openai_record("acct-replacement", b"new-token"),
                 false,
                 AuditCtx::admin(AuditOp::Import),
             )
             .expect("replace with clear");
 
         assert!(
-            store
-                .get("oauth:anthropic")
-                .expect("read")
-                .identity
-                .is_empty(),
+            store.get("oauth:openai").expect("read").identity.is_empty(),
             "an explicit clear must not be mistaken for token-only replace preservation"
         );
         let _ = std::fs::remove_dir_all(&root);
