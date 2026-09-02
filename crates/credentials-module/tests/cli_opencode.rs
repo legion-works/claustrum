@@ -610,6 +610,18 @@ impl MigrationRig {
             .expect("run ck-auth with test seam")
     }
 
+    fn run_with_envs(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut command = cli();
+        command
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .envs(env.iter().copied());
+        command.output().expect("run ck-auth with test seams")
+    }
+
     fn migrate(&self, extra: &[&str]) -> Output {
         let mut args = vec![
             "migrate-opencode",
@@ -678,6 +690,42 @@ fn open_vault(rig: &MigrationRig) -> EncryptedStore {
     .expect("open scratch vault");
     EncryptedStore::migrate(&sqlite).expect("migrate scratch vault");
     EncryptedStore::open(sqlite, key).expect("open scratch vault")
+}
+
+#[cfg(feature = "opencode-test-seam")]
+fn assert_minted_handle_was_revoked(rig: &MigrationRig, credential_id: &str) {
+    let conn = rusqlite::Connection::open(rig.vault.join("store.db")).expect("open scratch vault");
+    let live_handles: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM handles WHERE credential_id = ?1 AND revoked = 0",
+            rusqlite::params![credential_id],
+            |row| row.get(0),
+        )
+        .expect("count live handles");
+    assert_eq!(
+        live_handles, 0,
+        "failed persistence must not strand a live handle"
+    );
+
+    let audit = conn
+        .prepare(
+            "SELECT op FROM audit_log \
+             WHERE credential_id = ?1 AND op IN ('mint_handle', 'revoke_handle') \
+             ORDER BY seq",
+        )
+        .expect("prepare handle audit query")
+        .query_map(rusqlite::params![credential_id], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("query handle audit")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read handle audit");
+    assert!(
+        audit
+            .windows(2)
+            .any(|ops| ops == ["mint_handle", "revoke_handle"]),
+        "mint must be followed by revoke after persistence fails: {audit:?}"
+    );
 }
 
 fn route_response(payload: &[u8]) -> Value {
@@ -1141,6 +1189,138 @@ fn the_migrate_opencode_handle_write_failure_leaves_the_real_auth_entry_untouche
 
 #[cfg(feature = "opencode-test-seam")]
 #[test]
+fn the_migrate_opencode_revokes_a_mint_when_the_first_handle_persist_fails() {
+    let rig = MigrationRig::new(
+        "mint-guard-first-persist",
+        json!({"deepseek": {"type": "api", "key": "first-secret"}}),
+    );
+    let out = rig.migrate_with_env(&[], "CK_OPENCODE_TEST_FAIL_HANDLE_WRITE", "1");
+    assert!(!out.status.success(), "the seam must stop the handle write");
+    assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_migrate_opencode_revokes_a_mint_when_a_missing_handle_persist_fails() {
+    let rig = MigrationRig::new(
+        "mint-guard-missing-handle",
+        json!({"deepseek": {"type": "api", "key": "missing-secret"}}),
+    );
+    assert!(rig
+        .run(&[
+            "put",
+            "--id",
+            "apikey:deepseek:main",
+            "--payload",
+            "missing-secret",
+        ])
+        .status
+        .success());
+
+    let out = rig.migrate_with_env(&[], "CK_OPENCODE_TEST_FAIL_HANDLE_WRITE", "1");
+    assert!(!out.status.success(), "the seam must stop the handle write");
+    assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_migrate_opencode_revokes_a_remint_when_lost_handle_persist_fails() {
+    let rig = MigrationRig::new(
+        "mint-guard-lost-handle",
+        json!({"deepseek": {"type": "api", "key": "lost-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    assert!(rig
+        .run(&["revoke-all-handles", "--id", "apikey:deepseek:main"])
+        .status
+        .success());
+    rig.set_auth(json!({"deepseek": {"type": "api", "key": "lost-secret"}}));
+    let mut handles = opencode_files::read_handle_file(&rig.handles).expect("handles");
+    handles.providers[0].accounts[0].handle = format!("ckh_{}", "l".repeat(43));
+    opencode_files::write_handle_file(&rig.handles, &handles).expect("write lost handle");
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![
+            json!({"result":{"error":{"code":"not_found"}}}),
+        ])),
+    );
+
+    let out = rig.migrate_with_env(
+        &["--subc", conn.to_str().expect("connection path")],
+        "CK_OPENCODE_TEST_FAIL_HANDLE_WRITE",
+        "1",
+    );
+    assert!(!out.status.success(), "the seam must stop the handle write");
+    assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_migrate_opencode_restore_revokes_a_remint_when_handle_persist_fails() {
+    let rig = MigrationRig::new(
+        "mint-guard-restore",
+        json!({"deepseek": {"type": "api", "key": "restore-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    assert!(rig
+        .run(&["revoke-all-handles", "--id", "apikey:deepseek:main"])
+        .status
+        .success());
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![
+            json!({"result":{"error":{"code":"not_found"}}}),
+        ])),
+    );
+
+    let out = rig.migrate_with_env(
+        &[
+            "--restore",
+            "deepseek",
+            "--subc",
+            conn.to_str().expect("connection path"),
+        ],
+        "CK_OPENCODE_TEST_FAIL_HANDLE_WRITE",
+        "1",
+    );
+    assert!(!out.status.success(), "the seam must stop the handle write");
+    assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_migrate_opencode_names_the_audit_and_revoke_remedies_when_cleanup_fails() {
+    let rig = MigrationRig::new(
+        "mint-guard-revoke-failure",
+        json!({"deepseek": {"type": "api", "key": "revoke-secret"}}),
+    );
+    let out = rig.run_with_envs(
+        &[
+            "migrate-opencode",
+            "--auth-file",
+            rig.auth.to_str().expect("auth path"),
+            "--handle-file",
+            rig.handles.to_str().expect("handle path"),
+        ],
+        &[
+            ("CK_OPENCODE_TEST_FAIL_HANDLE_WRITE", "1"),
+            ("CK_OPENCODE_TEST_FAIL_REVOKE", "1"),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "the seams must stop persistence and cleanup"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("apikey:deepseek:main"));
+    assert!(stderr.contains("ck auth audit"));
+    assert!(stderr.contains("ck auth revoke-all-handles apikey:deepseek:main"));
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
 fn the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun() {
     let rig = MigrationRig::new(
         "migration-tombstone-seam",
@@ -1454,6 +1634,7 @@ fn the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_ha
         !interrupted.status.success(),
         "the seam must stop before the handle file write"
     );
+    assert_minted_handle_was_revoked(&rig, "apikey:deepseek:alt");
 
     let observed = Arc::new(Mutex::new(Vec::new()));
     let connection = spawn_migration_route_daemon(

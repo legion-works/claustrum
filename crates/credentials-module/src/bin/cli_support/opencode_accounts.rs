@@ -113,7 +113,7 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     let exists = super::parse_inventory(&super::request_admin_status(global)?)?
         .iter()
         .any(|(_, _, candidate)| candidate == &id);
-    let handle = if exists {
+    if exists {
         let verification_handle = opencode_migration::mint_handle(global, &id)?;
         let existing = opencode_migration::get_material(global, &verification_handle)?
             .ok_or_else(|| CliError::Io("fresh capability was revoked before comparison".into()))?;
@@ -123,7 +123,6 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
             )));
         }
         opencode_migration::revoke_all_handles(global, &id)?;
-        opencode_migration::mint_handle(global, &id)?
     } else {
         commit_admin(
             global,
@@ -134,36 +133,26 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
                 StoreMode::Create,
             ),
         )?;
-        opencode_migration::mint_handle(global, &id)?
-    };
-
-    #[cfg(feature = "opencode-test-seam")]
-    if std::env::var("CK_OPENCODE_TEST_FAIL_HANDLE_WRITE").as_deref() == Ok("1") {
-        return Err(CliError::Io(
-            "OpenCode files: handle file write interrupted; re-run converges from the stored credential".into(),
-        ));
     }
-
-    let provider_entry = handles
-        .providers
-        .iter_mut()
-        .find(|entry| entry.provider == provider)
-        .expect("provider validated before store");
-    let account = opencode_files::HandleAccount {
-        label: label.clone(),
-        handle: handle.clone(),
-        credential_id: id.clone(),
-        superseded: Vec::new(),
-    };
-    if let Some(index) = insert_at {
-        provider_entry.accounts.insert(index, account);
-    } else {
-        provider_entry.accounts.push(account);
-    }
-    if let Err(error) = opencode_migration::write_and_verify_handles(&handle_path, &handles) {
-        let _ = opencode_migration::revoke_handle(global, &handle);
-        return Err(error);
-    }
+    opencode_migration::mint_then_persist(global, &id, |handle| {
+        let provider_entry = handles
+            .providers
+            .iter_mut()
+            .find(|entry| entry.provider == provider)
+            .expect("provider validated before store");
+        let account = opencode_files::HandleAccount {
+            label: label.clone(),
+            handle: handle.into(),
+            credential_id: id.clone(),
+            superseded: Vec::new(),
+        };
+        if let Some(index) = insert_at {
+            provider_entry.accounts.insert(index, account);
+        } else {
+            provider_entry.accounts.push(account);
+        }
+        opencode_migration::write_and_verify_handles(&handle_path, &handles)
+    })?;
     opencode_migration::finalize_superseded(global, &mut handles, &provider, &handle_path)?;
     println!(
         "provider={provider} label={label} credential_id={id} added handle_file={}",

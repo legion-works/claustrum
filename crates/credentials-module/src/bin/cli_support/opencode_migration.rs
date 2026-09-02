@@ -311,26 +311,31 @@ fn migrate_one(
     if exists {
         let handle = match old_handle.as_deref() {
             Some(handle) => handle.to_owned(),
-            None => mint_handle(global, &id)?,
+            None => {
+                let handle = mint_then_persist(global, &id, |handle| {
+                    update_handle(&mut handles, provider, &args.serve_by, &id, handle, false)?;
+                    write_and_verify_handles(&args.handle_file, &handles)?;
+                    Ok(handle.to_owned())
+                })?;
+                old_handle = Some(handle.clone());
+                handle
+            }
         };
-        if old_handle.is_none() {
-            update_handle(&mut handles, provider, &args.serve_by, &id, &handle, false)?;
-            write_and_verify_handles(&args.handle_file, &handles)?;
-            old_handle = Some(handle.clone());
-        }
         match get_material(global, &handle)? {
             Some(existing) => same = existing == material,
             None => {
-                let replacement = mint_handle(global, &id)?;
-                update_handle(
-                    &mut handles,
-                    provider,
-                    &args.serve_by,
-                    &id,
-                    &replacement,
-                    false,
-                )?;
-                write_and_verify_handles(&args.handle_file, &handles)?;
+                let replacement = mint_then_persist(global, &id, |replacement| {
+                    update_handle(
+                        &mut handles,
+                        provider,
+                        &args.serve_by,
+                        &id,
+                        replacement,
+                        false,
+                    )?;
+                    write_and_verify_handles(&args.handle_file, &handles)?;
+                    Ok(replacement.to_owned())
+                })?;
                 old_handle = Some(replacement.clone());
                 same = get_material(global, &replacement)?.ok_or_else(|| {
                     CliError::Io("a freshly minted capability was revoked".into())
@@ -383,23 +388,21 @@ fn migrate_one(
     };
 
     let replacement_required = !exists || outcome == "replaced";
-    let current_handle = if replacement_required {
-        mint_handle(global, &id)?
+    if replacement_required {
+        mint_then_persist(global, &id, |handle| {
+            update_handle(&mut handles, provider, &args.serve_by, &id, handle, true)?;
+            write_and_verify_handles(&args.handle_file, &handles)?;
+            Ok(())
+        })?
     } else {
-        old_handle
+        let handle = old_handle
             .clone()
-            .ok_or_else(|| CliError::Io("missing current handle after comparison".into()))?
-    };
-    let superseded = update_handle(
-        &mut handles,
-        provider,
-        &args.serve_by,
-        &id,
-        &current_handle,
-        replacement_required,
-    )?;
-    if replacement_required || superseded.as_deref() != Some(current_handle.as_str()) {
-        write_and_verify_handles(&args.handle_file, &handles)?;
+            .ok_or_else(|| CliError::Io("missing current handle after comparison".into()))?;
+        let superseded =
+            update_handle(&mut handles, provider, &args.serve_by, &id, &handle, false)?;
+        if superseded.as_deref() != Some(handle.as_str()) {
+            write_and_verify_handles(&args.handle_file, &handles)?;
+        }
     }
 
     let tombstone = api_tombstone(provider);
@@ -447,9 +450,11 @@ fn restore_provider(
         let material = match get_material(global, &handle) {
             Ok(Some(material)) => material,
             Ok(None) => {
-                handle = mint_handle(global, &account.credential_id)?;
-                update_specific_handle(&mut handles, provider, &account.label, &handle)?;
-                write_and_verify_handles(&args.handle_file, &handles)?;
+                handle = mint_then_persist(global, &account.credential_id, |handle| {
+                    update_specific_handle(&mut handles, provider, &account.label, handle)?;
+                    write_and_verify_handles(&args.handle_file, &handles)?;
+                    Ok(handle.to_owned())
+                })?;
                 get_material(global, &handle)?
                     .ok_or_else(|| CliError::Io("a freshly minted capability was revoked".into()))?
             }
@@ -717,6 +722,13 @@ pub(crate) fn write_and_verify_handles(
     path: &Path,
     handles: &opencode_files::HandleFile,
 ) -> Result<(), CliError> {
+    #[cfg(feature = "opencode-test-seam")]
+    if std::env::var("CK_OPENCODE_TEST_FAIL_HANDLE_WRITE").as_deref() == Ok("1") {
+        return Err(CliError::Io(
+            "OpenCode files: handle file write interrupted; re-run converges from the stored credential"
+                .into(),
+        ));
+    }
     opencode_files::write_handle_file(path, handles).map_err(files_error)?;
     opencode_files::verify_handle_written(path, handles).map_err(files_error)
 }
@@ -736,7 +748,36 @@ pub(crate) fn mint_handle(global: &GlobalArgs, id: &str) -> Result<String, CliEr
     .ok_or_else(|| CliError::Io("mint did not return a handle".into()))
 }
 
+/// Mints a handle for `id` and runs `persist` with it. If `persist` fails, the handle is
+/// revoked before the error propagates, so a failed file write never strands a live bearer
+/// capability. If the revoke also fails, the returned error names the credential id and the
+/// two commands that close the window (`ck auth audit` shows the mint; `ck auth
+/// revoke-all-handles <id>` revokes it). The `superseded` journal covers the replace-then-crash
+/// case; this covers mint-then-crash, whose journal precondition is what failed.
+pub(crate) fn mint_then_persist<T>(
+    global: &GlobalArgs,
+    id: &str,
+    persist: impl FnOnce(&str) -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let handle = mint_handle(global, id)?;
+    match persist(&handle) {
+        Ok(value) => Ok(value),
+        Err(persist_error) => match revoke_handle(global, &handle) {
+            Ok(()) => Err(persist_error),
+            Err(revoke_error) => Err(CliError::Io(format!(
+                "failed to persist minted handle for credential {id}: {persist_error}; cleanup also failed: {revoke_error}; run `ck auth audit` to find the mint, then `ck auth revoke-all-handles {id}` to revoke it"
+            ))),
+        },
+    }
+}
+
 pub(crate) fn revoke_handle(global: &GlobalArgs, handle: &str) -> Result<(), CliError> {
+    #[cfg(feature = "opencode-test-seam")]
+    if std::env::var("CK_OPENCODE_TEST_FAIL_REVOKE").as_deref() == Ok("1") {
+        return Err(CliError::Io(
+            "OpenCode test seam: handle revoke interrupted".into(),
+        ));
+    }
     commit_admin(
         global,
         AdminOpBody::RevokeHandle {
