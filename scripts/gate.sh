@@ -234,7 +234,7 @@ stream and pass the arm without ever seeing it skip."
 # follows it), and any gap between the floor and the real count is how many can go
 # before anyone is told. Measured 402 across the workspace's suites at the time of
 # writing; an earlier floor of 200 left a third of them free to disappear.
-# The current measured total is 514 (debug profile, the same `cargo test --locked --workspace`
+# The current measured total is 525 (debug profile, the same `cargo test --locked --workspace`
 # this arm runs): the redacted-Debug pins for VaultRecord and AdminOpBody on top of the
 # provider-shape refusal checks, the default opencode custody suites, and the cli_opencode
 # fake-daemon response diagnostic that fails at the offending request rather than at
@@ -244,7 +244,7 @@ stream and pass the arm without ever seeing it skip."
 #
 # Raise this when tests are added. A failure here is normally that, not a defect --
 # but it should be a deliberate edit rather than a number nobody revisits.
-run_expect 514 "workspace unit + integration" \
+run_expect 525 "workspace unit + integration" \
   cargo test --locked --workspace
 
 # Two independent defences, because each catches what the other misses:
