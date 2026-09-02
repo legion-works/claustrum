@@ -8,7 +8,7 @@ import {
 } from "../plugin";
 import { CustodySplitError, HandleFileValidationError } from "../errors";
 import { handleFileRevision, parseHandleFile, readHandleFile } from "../handles";
-import { sentinel, tombstoneFor } from "../tombstone";
+import { sentinel, tombstoneFor, TOMBSTONE_PREFIX } from "../tombstone";
 
 const ROOT = "/tmp/opencode/custody-t6";
 const HANDLE = `ckh_${"a".repeat(43)}`;
@@ -82,8 +82,13 @@ function config(...providers: string[]): TestConfig {
 type AuthSource = { env?: string; disk?: string };
 
 // Mirror provenance: Auth.all/Auth.read in packages/opencode/src/auth/index.ts and the API-key
-// loop in provider/provider.ts:1592-1600 at sst/opencode@dc4449df0d. Maintained by delta per
-// OpenCode base update alongside opencode-provider-shapes.json.
+// loop in provider/provider.ts:1592-1600 at anomalyco/opencode@dc4449df0d. Probe:
+// Schema.decodeUnknownOption(Api) accepts base, metadata, and extra-key entries but rejects a
+// numeric key; decode strips excess properties before the host retains the entry. Disk therefore
+// walks decoded fields only, while raw env reads only the fixed-depth fields host providers read.
+// This is deliberate precision, not a refusal carve-out. Maintained by delta per OpenCode base
+// update alongside opencode-provider-shapes.json.
+// The two-sided mutation proves this model is host-derived, not a reused plugin predicate.
 function opencodeWouldLoad(source: AuthSource): Set<string> {
   const parse = (content: string | undefined): unknown => {
     if (content === undefined) return {};
@@ -93,17 +98,41 @@ function opencodeWouldLoad(source: AuthSource): Set<string> {
       return {};
     }
   };
-  const validDiskEntry = (entry: unknown) => {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const decodeDiskEntry = (entry: unknown): Record<string, unknown> | undefined => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
     const candidate = entry as Record<string, unknown>;
-    if (candidate.type === "api") return Object.keys(candidate).length === 2 && typeof candidate.key === "string";
-    return candidate.type === "oauth" && Object.keys(candidate).length === 4 &&
-      typeof candidate.refresh === "string" && typeof candidate.access === "string" && typeof candidate.expires === "number";
+    const stringRecord = (value: unknown) => !!value && typeof value === "object" && !Array.isArray(value) &&
+      Object.values(value as Record<string, unknown>).every((item) => typeof item === "string");
+    if (candidate.type === "api") {
+      if (typeof candidate.key !== "string" || candidate.metadata !== undefined && !stringRecord(candidate.metadata)) return undefined;
+      return candidate.metadata === undefined
+        ? { type: "api", key: candidate.key }
+        : { type: "api", key: candidate.key, metadata: candidate.metadata };
+    }
+    if (candidate.type === "wellknown") {
+      return typeof candidate.key === "string" && typeof candidate.token === "string"
+        ? { type: "wellknown", key: candidate.key, token: candidate.token }
+        : undefined;
+    }
+    if (candidate.type !== "oauth" || typeof candidate.refresh !== "string" || typeof candidate.access !== "string" || typeof candidate.expires !== "number" ||
+      candidate.accountId !== undefined && typeof candidate.accountId !== "string" ||
+      candidate.enterpriseUrl !== undefined && typeof candidate.enterpriseUrl !== "string") return undefined;
+    return {
+      type: "oauth",
+      refresh: candidate.refresh,
+      access: candidate.access,
+      expires: candidate.expires,
+      ...(candidate.accountId === undefined ? {} : { accountId: candidate.accountId }),
+      ...(candidate.enterpriseUrl === undefined ? {} : { enterpriseUrl: candidate.enterpriseUrl }),
+    };
   };
   const diskEntries = () => {
     const disk = parse(source.disk);
     if (!disk || typeof disk !== "object" || Array.isArray(disk)) return [];
-    return Object.entries(disk).filter(([, entry]) => validDiskEntry(entry));
+    return Object.entries(disk).flatMap(([provider, entry]) => {
+      const decoded = decodeDiskEntry(entry);
+      return decoded ? [[provider, decoded] as [string, unknown]] : [];
+    });
   };
   let entries: [string, unknown][];
   if (source.env) {
@@ -117,12 +146,23 @@ function opencodeWouldLoad(source: AuthSource): Set<string> {
   } else {
     entries = diskEntries();
   }
+  const hasSentinel = (value: unknown) => typeof value === "string" && value.startsWith(TOMBSTONE_PREFIX);
+  const carriesSentinel = (entry: unknown): boolean => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const candidate = entry as Record<string, unknown>;
+    if (candidate.type === "api") {
+      return hasSentinel(candidate.key) || !!candidate.metadata && typeof candidate.metadata === "object" &&
+        !Array.isArray(candidate.metadata) && Object.values(candidate.metadata).some(hasSentinel);
+    }
+    if (candidate.type === "oauth") {
+      return hasSentinel(candidate.access) || hasSentinel(candidate.refresh) ||
+        hasSentinel(candidate.accountId) || hasSentinel(candidate.enterpriseUrl);
+    }
+    return false;
+  };
   return new Set(
     entries.flatMap(([provider, entry]) =>
-      (entry as { type?: unknown; key?: unknown; access?: unknown; refresh?: unknown } | null)?.type === "api" &&
-        (entry as { key?: unknown }).key === sentinel(provider) ||
-      (entry as { type?: unknown; access?: unknown; refresh?: unknown } | null)?.type === "oauth" &&
-        ((entry as { access?: unknown }).access === sentinel(provider) || (entry as { refresh?: unknown }).refresh === sentinel(provider))
+      ((entry as { type?: unknown } | null)?.type === "api" || (entry as { type?: unknown } | null)?.type === "oauth") && carriesSentinel(entry)
         ? [provider]
         : [],
     ),
@@ -607,20 +647,41 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     const diskTombstone = JSON.stringify({ deepseek: tombstoneFor("api", "deepseek") });
     const oversized = tombstoneSource("oversized", 10_000);
     const manyHits = tombstoneSource("many-hit", 10_000, 257);
-    const malformedEntry = JSON.stringify({ deepseek: { type: "api", key: sentinel("deepseek"), extra: true } });
+    const extraKeyTombstone = JSON.stringify({ deepseek: { type: "api", key: sentinel("deepseek"), extra: true } });
+    const metadataTombstone = JSON.stringify({ deepseek: { type: "api", key: sentinel("deepseek"), metadata: { a: "b" } } });
+    const metadataLeafTombstone = JSON.stringify({ azure: { type: "api", key: "real-key", metadata: { resourceName: sentinel("deepseek") } } });
+    const oauthAccountTombstone = JSON.stringify({ azure: { ...tombstoneFor("oauth", "azure"), accountId: "account" } });
+    const wrongTypedKey = JSON.stringify({ deepseek: { type: "api", key: 5 } });
+    const miskeyedTombstone = JSON.stringify({ deepseek: { type: "api", key: sentinel("xai") } });
+    const wellKnownTombstone = JSON.stringify({ "https://auth.example": { type: "wellknown", key: "https://auth.example", token: sentinel("deepseek") } });
+    const strippedExcessSentinel = JSON.stringify({ deepseek: { type: "api", key: "real-key", extra: { nested: sentinel("deepseek") } } });
+    const deeplyNestedEnv = `{"deepseek":{"type":"api","key":"real-key","extra":${"{\"next\":".repeat(12_000)}null${"}".repeat(12_000)}}}`;
     const sources: Array<{ name: string; source: AuthSource }> = [
       { name: "disk tombstone", source: { disk: diskTombstone } },
       { name: "malformed env", source: { env: "{", disk: diskTombstone } },
       { name: "non-object env", source: { env: "[]", disk: diskTombstone } },
       { name: "null env", source: { env: "null", disk: diskTombstone } },
-      { name: "malformed disk entry", source: { disk: malformedEntry } },
-      { name: "malformed env entry", source: { env: malformedEntry, disk: diskTombstone } },
+      { name: "extra-key tombstone", source: { disk: extraKeyTombstone } },
+      { name: "extra-key env tombstone", source: { env: extraKeyTombstone, disk: diskTombstone } },
+      { name: "metadata tombstone", source: { disk: metadataTombstone } },
+      { name: "metadata leaf tombstone", source: { disk: metadataLeafTombstone } },
+      { name: "oauth account tombstone", source: { disk: oauthAccountTombstone } },
+      { name: "wrong-typed key", source: { disk: wrongTypedKey } },
+      { name: "mis-keyed tombstone", source: { disk: miskeyedTombstone } },
+      { name: "wellknown tombstone", source: { disk: wellKnownTombstone } },
+      { name: "stripped excess disk sentinel", source: { disk: strippedExcessSentinel } },
+      { name: "deeply nested env", source: { env: deeplyNestedEnv, disk: diskTombstone } },
       { name: "oversized auth", source: { disk: oversized } },
       { name: "many-hit auth with deepseek after 257 tombstones", source: { disk: manyHits } },
     ];
     const handleStates = ["present", "absent", "unreadable"] as const;
-    expect(opencodeWouldLoad({ disk: malformedEntry }).has("deepseek")).toBe(false);
-    expect(opencodeWouldLoad({ env: malformedEntry, disk: diskTombstone }).has("deepseek")).toBe(true);
+    expect(opencodeWouldLoad({ disk: extraKeyTombstone }).has("deepseek")).toBe(true);
+    expect(opencodeWouldLoad({ env: extraKeyTombstone, disk: diskTombstone }).has("deepseek")).toBe(true);
+    expect(opencodeWouldLoad({ disk: wrongTypedKey }).has("deepseek")).toBe(false);
+    expect(opencodeWouldLoad({ disk: miskeyedTombstone }).has("deepseek")).toBe(true);
+    expect(opencodeWouldLoad({ disk: metadataLeafTombstone }).has("azure")).toBe(true);
+    expect(opencodeWouldLoad({ disk: wellKnownTombstone }).size).toBe(0);
+    expect(opencodeWouldLoad({ disk: strippedExcessSentinel }).size).toBe(0);
 
     for (const { name, source } of sources) {
       for (const handleState of handleStates) {
@@ -655,6 +716,36 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await hook(cfg, { log: () => {} });
 
     expect(await refusalSet(cfg)).toEqual(new Set(Array.from({ length: 300 }, (_, index) => `provider-${index}`)));
+  });
+
+  test("refuses host-loadable sentinel shape drift without logging the sentinel", async () => {
+    const files = await fixture("metadata-sentinel-drift");
+    await writeHandles(files.handles, { version: 1, providers: [] });
+    await writeAuth(files.auth, { azure: { type: "api", key: "real-key", metadata: { resourceName: sentinel("deepseek") } } });
+    const logs: string[] = [];
+    const cfg = config("azure");
+    prepareRefusalProbe(cfg, "azure");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("tombstone_shape_drift");
+    expect(logs.join("\n")).toContain("metadata");
+    expect(logs.join("\n")).not.toContain(sentinel("deepseek"));
+    await expectRefusal(cfg, "azure", /tombstone_shape_drift/);
+  });
+
+  test("ignores a sentinel in an excess disk field the host decode strips", async () => {
+    const files = await fixture("stripped-excess-sentinel");
+    await writeHandles(files.handles, { version: 1, providers: [] });
+    await writeAuth(files.auth, { deepseek: { type: "api", key: "real-key", extra: { nested: sentinel("deepseek") } } });
+    const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
+    const originalFetch = cfg.provider.deepseek.options?.fetch;
+
+    await hook(cfg);
+
+    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(cfg.provider.deepseek.options?.fetch).toBe(originalFetch);
   });
 
   test("refuses exactly the three observed providers when a malformed scan stays below the cap", async () => {

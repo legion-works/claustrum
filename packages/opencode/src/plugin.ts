@@ -18,7 +18,7 @@ import { FreshnessController } from "./freshness";
 import { defaultHandleFilePath, handleFileRevision, OUR_PLUGIN_ID, readHandleFile, type OpenCodeHandleFileV1 } from "./handles";
 import { createLogger, serializedLogSink, type CustodyLogger, type LogSink } from "./log";
 import { createServeFetch, type ServeClient } from "./serve";
-import { isProviderTombstone, sentinel, TOMBSTONE_PREFIX } from "./tombstone";
+import { carriesSentinel, decodeHostAuthEntry, isProviderTombstone, sentinel, sentinelShapeDrift, TOMBSTONE_PREFIX } from "./tombstone";
 
 type ConfigProvider = { options?: Record<string, unknown> };
 type MutableConfig = { provider?: Record<string, ConfigProvider> };
@@ -63,7 +63,10 @@ async function readAuthFile(path: string): Promise<Record<string, unknown>> {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new AuthFileValidationError("auth file must contain an object");
     }
-    return value as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).flatMap(([provider, entry]) => {
+      const decoded = decodeHostAuthEntry(entry);
+      return decoded ? [[provider, decoded]] : [];
+    }));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     if (error instanceof AuthFileValidationError) throw error;
@@ -133,14 +136,6 @@ async function scanAuthSource(path: string, onHit: (provider: string) => void): 
     return;
   }
   return scanAuthTombstones(path, onHit);
-}
-
-function carriesTombstoneKey(entry: unknown, provider: string): boolean {
-  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
-  const candidate = entry as Record<string, unknown>;
-  const value = sentinel(provider);
-  return candidate.type === "api" && candidate.key === value ||
-    candidate.type === "oauth" && (candidate.access === value || candidate.refresh === value);
 }
 
 // Effect's Config.boolean (effect@4.0.0-beta.74 dist/Config.js:541-562, the parser behind
@@ -282,9 +277,10 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             return;
           }
           for (const [provider, entry] of Object.entries(auth)) {
-            if (!carriesTombstoneKey(entry, provider)) continue;
+            if (!carriesSentinel(entry)) continue;
+            const drift = isProviderTombstone(entry, provider) ? "" : `${sentinelShapeDrift(entry, provider)}; `;
             const refusal = new CustodyOrphanError(
-              `handle file unavailable: ${typed.message}; tombstone ownership cannot be proven; run ck auth migrate-opencode`,
+              `${drift}handle file unavailable: ${typed.message}; tombstone ownership cannot be proven; run ck auth migrate-opencode`,
             );
             logError(log, refusal, provider);
             configureRefusal(provider, refusal);
@@ -305,19 +301,19 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         const byProvider = new Map(handles.providers.map((provider) => [provider.provider, provider]));
         const providers = [...byProvider.keys()];
         for (const provider of Object.keys(auth)) {
-          if (!byProvider.has(provider) && carriesTombstoneKey(auth[provider], provider)) providers.push(provider);
+          if (!byProvider.has(provider) && carriesSentinel(auth[provider])) providers.push(provider);
         }
 
         for (const provider of providers) {
           const handle = byProvider.get(provider);
           const entry = Object.hasOwn(auth, provider) ? auth[provider] : undefined;
           const tombstone = isProviderTombstone(entry, provider);
-          const consumesTombstone = carriesTombstoneKey(entry, provider);
+          const consumesTombstone = carriesSentinel(entry);
           const owner = handle?.serve;
 
           if (!tombstone) {
             if (consumesTombstone) {
-              const refusal = new CustodyOrphanError("tombstone key is not a canonical custody entry; refusing before OpenCode can load it");
+              const refusal = new CustodyOrphanError(`${sentinelShapeDrift(entry, provider)}; refusing before OpenCode can load it`);
               logError(log, refusal, provider);
               configureRefusal(provider, refusal);
               continue;
