@@ -73,6 +73,8 @@ pub struct HandleAccount {
     pub label: String,
     pub handle: String,
     pub credential_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<String>,
 }
 
 pub fn default_auth_path() -> PathBuf {

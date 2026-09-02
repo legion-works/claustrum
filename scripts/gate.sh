@@ -115,7 +115,7 @@ run_check "clippy" \
   cargo clippy --locked --workspace --all-targets -- -D warnings
 run_check "clippy (seam features)" \
   cargo clippy --locked --workspace --all-targets \
-    --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools -- -D warnings
+    --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools,opencode-test-seam -- -D warnings
 
 # Run a cargo invocation and require at least `min` tests to have PASSED, and that
 # no arm announced a skip.
@@ -279,6 +279,12 @@ run_expect 5 "master-key rotation crash cuts" \
   cargo test --locked -p credentials-core --features rotate-test-seam --test rotate_crash_cut
 run_expect 2 "login crash cut" \
   cargo test --locked -p credentials-core --features login-test-seam --test login_crash_cut
+# The migration seam proves a durable file transaction does not revoke a prior
+# capability until the tombstone itself has been reread. It is feature-gated so a
+# normal `cli_opencode` run cannot silently pass without compiling the interruption.
+run_expect 1 "opencode tombstone reread crash cut" \
+  cargo test --locked -p credentials-module --features opencode-test-seam \
+    --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
 # The migration tools are feature-gated, so clippy compiles them but nothing RAN them
 # until this arm existed. Compiling proves they build; the property that matters -- the
 # key-identity diagnostic works while the daemon holds the lease -- is a runtime fact.

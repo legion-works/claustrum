@@ -1,66 +1,44 @@
 import { describe, expect, test } from "bun:test";
 import { goldenTombstone } from "../contracts";
-import { isProviderTombstone, tombstoneFor } from "../tombstone";
-import { parseHandleFile, type OpenCodeHandleFileV1 } from "../handles";
+import { isProviderTombstone, TOMBSTONE_PREFIX, tombstoneFor } from "../tombstone";
+import { parseHandleFile } from "../handles";
+import goldenHandles from "../../golden/handles.json";
 
 describe("custody wire contracts", () => {
   test("api golden stays a valid OpenCode ApiAuth entry", () => {
     const fixture = goldenTombstone.fixtures.api;
-    expect(fixture.entry).toEqual({
-      type: "api",
-      key: "claustrum-tombstone:v1:deepseek",
-    });
+    expect(fixture.entry.type).toBe("api");
     expect(isProviderTombstone(fixture.entry, fixture.provider)).toBe(true);
   });
 
   test("oauth golden stays a valid OpenCode OAuth entry", () => {
     const fixture = goldenTombstone.fixtures.oauth;
-    expect(fixture.entry).toEqual({
-      type: "oauth",
-      refresh: "claustrum-tombstone:v1:anthropic",
-      access: "claustrum-tombstone:v1:anthropic",
-      expires: 0,
-    });
+    expect(fixture.entry.type).toBe("oauth");
     expect(isProviderTombstone(fixture.entry, fixture.provider)).toBe(true);
   });
 
   test("tombstone rendering is byte-stable for a provider", () => {
-    expect(tombstoneFor("api", "deepseek")).toEqual({
-      type: "api",
-      key: "claustrum-tombstone:v1:deepseek",
-    });
-    expect(tombstoneFor("oauth", "anthropic")).toEqual({
-      type: "oauth",
-      refresh: "claustrum-tombstone:v1:anthropic",
-      access: "claustrum-tombstone:v1:anthropic",
-      expires: 0,
-    });
+    const api = goldenTombstone.fixtures.api;
+    const oauth = goldenTombstone.fixtures.oauth;
+    expect(tombstoneFor("api", api.provider)).toEqual(api.entry);
+    expect(tombstoneFor("oauth", oauth.provider)).toEqual(oauth.entry);
     expect(isProviderTombstone(tombstoneFor("api", "deepseek"), "anthropic")).toBe(false);
   });
 
+  test("tombstone prefix remains pinned to the golden provider key", () => {
+    const fixture = goldenTombstone.fixtures.api;
+    if (fixture.entry.type !== "api") throw new Error("api golden changed shape");
+    expect(TOMBSTONE_PREFIX + fixture.provider).toBe(fixture.entry.key);
+  });
+
   test("handle schema preserves declared provider and account order", () => {
-    const source: OpenCodeHandleFileV1 = {
-      version: 1,
-      providers: [
-        {
-          provider: "deepseek",
-          shape: "api",
-          serve: "opencode-claustrum",
-          accounts: [
-            { label: "primary", handle: "h-1", credential_id: "c-1" },
-            { label: "backup", handle: "h-2", credential_id: "c-2" },
-          ],
-        },
-        {
-          provider: "anthropic",
-          shape: "oauth",
-          serve: "other-plugin",
-          accounts: [{ label: "only", handle: "h-3", credential_id: "c-3" }],
-        },
-      ],
-    };
+    const source = parseHandleFile(goldenHandles);
     const parsed = parseHandleFile(JSON.parse(JSON.stringify(source)));
     expect(parsed).toEqual(source);
+    expect(parsed.providers.map((provider) => provider.provider)).toEqual(["deepseek", "anthropic"]);
+    expect(parsed.providers[0]?.accounts.map((account) => account.label)).toEqual(["main", "backup"]);
+    expect(parsed.providers[0]?.accounts[0]?.handle).toBe("ckh_deepseek_main");
+    expect(parsed.providers[0]?.accounts[1]?.superseded).toEqual(["ckh_deepseek_prior"]);
     expect(() =>
       parseHandleFile({
         version: 1,

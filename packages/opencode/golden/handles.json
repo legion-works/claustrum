@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "provider": "deepseek",
+      "shape": "api",
+      "serve": "opencode-claustrum",
+      "accounts": [
+        {
+          "label": "main",
+          "handle": "ckh_deepseek_main",
+          "credential_id": "apikey:deepseek:main"
+        },
+        {
+          "label": "backup",
+          "handle": "ckh_deepseek_backup",
+          "credential_id": "apikey:deepseek:backup",
+          "superseded": [
+            "ckh_deepseek_prior"
+          ]
+        }
+      ]
+    },
+    {
+      "provider": "anthropic",
+      "shape": "oauth",
+      "serve": "anthropic-auth",
+      "accounts": [
+        {
+          "label": "work-alt",
+          "handle": "ckh_anthropic_work_alt",
+          "credential_id": "oauth:anthropic:work-alt"
+        }
+      ]
+    }
+  ]
+}

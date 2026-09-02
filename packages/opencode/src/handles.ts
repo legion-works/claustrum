@@ -1,6 +1,11 @@
 export const OUR_PLUGIN_ID = "opencode-claustrum";
 
-export type HandleAccount = { label: string; handle: string; credential_id: string };
+export type HandleAccount = {
+  label: string;
+  handle: string;
+  credential_id: string;
+  superseded?: string[];
+};
 export type HandleProvider = {
   provider: string;
   shape: "api" | "oauth";
@@ -13,7 +18,9 @@ function isAccount(value: unknown): value is HandleAccount {
   if (!value || typeof value !== "object") return false;
   const account = value as Record<string, unknown>;
   return typeof account.label === "string" && typeof account.handle === "string" &&
-    typeof account.credential_id === "string";
+    typeof account.credential_id === "string" &&
+    (account.superseded === undefined ||
+      (Array.isArray(account.superseded) && account.superseded.every((handle) => typeof handle === "string")));
 }
 
 export function parseHandleFile(value: unknown): OpenCodeHandleFileV1 {
@@ -35,7 +42,10 @@ export function parseHandleFile(value: unknown): OpenCodeHandleFileV1 {
       provider: item.provider,
       shape: item.shape,
       serve: item.serve,
-      accounts: item.accounts,
+      accounts: item.accounts.map((account) => ({
+        ...account,
+        ...(account.superseded === undefined ? {} : { superseded: account.superseded }),
+      })),
     };
   });
   return { version: 1, providers };

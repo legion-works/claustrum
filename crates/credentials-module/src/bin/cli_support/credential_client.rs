@@ -25,7 +25,7 @@ impl fmt::Debug for ServedCredential {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialReadError {
     NeedsReauth,
     NotFound,
@@ -35,7 +35,7 @@ pub enum CredentialReadError {
     Corrupt,
     TtlUnsatisfiable,
     Refused,
-    Transport,
+    Transport(String),
 }
 
 impl fmt::Display for CredentialReadError {
@@ -49,7 +49,7 @@ impl fmt::Display for CredentialReadError {
             Self::Corrupt => "credential record is corrupt",
             Self::TtlUnsatisfiable => "credential cannot meet the requested lifetime",
             Self::Refused => "credential read was refused",
-            Self::Transport => "credential route is unavailable",
+            Self::Transport(cause) => return write!(f, "credential route is unavailable: {cause}"),
         };
         f.write_str(message)
     }
@@ -67,7 +67,7 @@ pub fn get_online(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_| CredentialReadError::Transport)?;
+        .map_err(|e| CredentialReadError::Transport(format!("runtime: {e}")))?;
     runtime.block_on(get_online_async(connection_file, project_root, handle))
 }
 
@@ -78,10 +78,10 @@ async fn get_online_async(
 ) -> Result<ServedCredential, CredentialReadError> {
     let stream = route_client::connect(connection_file)
         .await
-        .map_err(|_| CredentialReadError::Transport)?;
+        .map_err(|e| CredentialReadError::Transport(format!("connect: {e}")))?;
     let mut route = route_client::open_route(stream, project_root, "ck-auth", "opencode-read")
         .await
-        .map_err(|_| CredentialReadError::Transport)?;
+        .map_err(|e| CredentialReadError::Transport(format!("route.open: {e}")))?;
     let frame = route_client::route_request(
         route.channel,
         route.epoch,
@@ -93,10 +93,10 @@ async fn get_online_async(
     );
     write_frame(&mut route.stream, &frame)
         .await
-        .map_err(|_| CredentialReadError::Transport)?;
+        .map_err(|e| CredentialReadError::Transport(format!("write credential.get: {e}")))?;
     let response = route_client::read_route_response(&mut route.stream, 10)
         .await
-        .map_err(|_| CredentialReadError::Transport)?;
+        .map_err(|e| CredentialReadError::Transport(format!("read credential.get: {e}")))?;
     if response.header.ty == FrameType::Error {
         return Err(CredentialReadError::Refused);
     }
@@ -104,27 +104,33 @@ async fn get_online_async(
 }
 
 fn decode_response(body: &[u8]) -> Result<ServedCredential, CredentialReadError> {
-    let value: Value = serde_json::from_slice(body).map_err(|_| CredentialReadError::Transport)?;
-    let result = value.get("result").ok_or(CredentialReadError::Transport)?;
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|e| CredentialReadError::Transport(format!("decode response: {e}")))?;
+    let result = value
+        .get("result")
+        .ok_or_else(|| CredentialReadError::Transport("response omitted result".into()))?;
     if let Some(error) = result.get("error") {
         return Err(map_error(error));
     }
     let payload = result
         .get("payload")
         .and_then(Value::as_array)
-        .ok_or(CredentialReadError::Transport)?
+        .ok_or_else(|| CredentialReadError::Transport("response omitted payload".into()))?
         .iter()
         .map(|byte| byte.as_u64().and_then(|byte| u8::try_from(byte).ok()))
         .collect::<Option<Vec<_>>>()
-        .ok_or(CredentialReadError::Transport)?;
+        .ok_or_else(|| CredentialReadError::Transport("response payload was invalid".into()))?;
     let record_version = result
         .get("record_version")
         .and_then(Value::as_u64)
-        .ok_or(CredentialReadError::Transport)?;
-    let expires_at_ms = match result.get("expires_at_ms") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(value.as_i64().ok_or(CredentialReadError::Transport)?),
-    };
+        .ok_or_else(|| CredentialReadError::Transport("response omitted record version".into()))?;
+    let expires_at_ms =
+        match result.get("expires_at_ms") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_i64().ok_or_else(|| {
+                CredentialReadError::Transport("response expiry was invalid".into())
+            })?),
+        };
     Ok(ServedCredential {
         payload,
         record_version,

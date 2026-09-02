@@ -19,6 +19,14 @@ Authorization value reached the wire. The xAI fixture has an expired OAuth entry
 success through the local stub in the network namespace is the offline proof that
 the shipped refresh path did not own the request.
 
+The offline namespace matters independently for xAI's `shipped_refresh=0` line. If
+xai.ts had run its own fetch, it would have attempted to refresh the sentinel refresh
+token; a failed refresh throws before the local stub receives a request. The sentinel
+arriving at the stub is therefore evidence that the shipped fetch did not run, while
+the namespace separately guarantees no vendor endpoint was reachable. In some
+environments the offline form can hang after the models.dev fetch failure; run it with
+`timeout` when that happens.
+
 The mutation arm disables only the custom-fetch installation:
 
 ```sh

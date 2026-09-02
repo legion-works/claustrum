@@ -10,8 +10,8 @@
 //! `open_sqlite`: if the daemon is running it holds the lease, so the CLI's acquire
 //! fails and the operator is told to stop the daemon, making "while the daemon is
 //! stopped" a structural precondition rather than an honor-system one. A plain route
-//! consumer (transport key only, no master key, no lease) cannot reach this path at
-//! all — there is no running-vault admin surface.
+//! consumer (transport key only, no master key, no lease) cannot reach these writes;
+//! secret reads remain capability-gated on the consumer route.
 //!
 //! Every write goes through the epoch-fenced path and appends an audit-chain entry
 //! (flagged as an admin write) atomically with the mutation. Bootstrap (first run)
@@ -24,6 +24,7 @@
 //!             `--payload-file` bytes exactly, and do not accept `--expires-ms`.
 //!   mint-signing-key --id signing:<provider>[:<generation>] [--replace]
 //!   import    --source opencode|pi|antigravity --id <id> --json <file>
+//!   migrate-opencode [--dry-run] [--replace] [--restore <provider>]
 //!   invalidate --id <id>
 //!   rotate-master-key
 //!   mint-handle --id <id>                      print a fresh handle (once)
@@ -54,6 +55,8 @@ mod login_listener;
 #[allow(dead_code)]
 #[path = "cli_support/opencode_files.rs"]
 mod opencode_files;
+#[path = "cli_support/opencode_migration.rs"]
+mod opencode_migration;
 #[path = "cli_support/provider_login.rs"]
 mod provider_login;
 #[path = "cli_support/route_client.rs"]
@@ -255,6 +258,7 @@ fn run() -> Result<(), CliError> {
         "put" => cmd_put(&global, &args),
         "mint-signing-key" => cmd_mint_signing_key(&global, &args),
         "import" => cmd_import(&global, &args),
+        "migrate-opencode" => opencode_migration::cmd_migrate_opencode(&global, &args),
         "login" => cmd_login(&global, &args),
         "invalidate" => cmd_invalidate(&global, &args),
         "reactivate" => cmd_reactivate(&global, &args),
@@ -330,6 +334,13 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
         ],
         "mint-signing-key" => &["--id"],
         "import" => &["--source", "--provider", "--id", "--json", "--adapter"],
+        "migrate-opencode" => &[
+            "--restore",
+            "--auth-file",
+            "--handle-file",
+            "--provider",
+            "--serve-by",
+        ],
         "login" => &["--provider", "--id", "--payload-file", "--account"],
         "invalidate" | "reactivate" | "mint-handle" | "revoke-all-handles" | "remove" => &["--id"],
         "logout" => &["--provider", "--id"],
@@ -347,6 +358,7 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
         "mint-signing-key" => &["--replace"],
         "import" => &["--replace"],
         "login" => &["--replace", "--no-listener", "--device"],
+        "migrate-opencode" => &["--dry-run", "--replace"],
         _ => &[],
     };
     let mut i = 0;
@@ -388,6 +400,7 @@ fn usage_short() -> String {
         put                 ingest an api key, session cookie, or opaque secret\n\
         mint-signing-key    generate and custody a new Ed25519 signing key\n\
         import              import from opencode/pi/gemini-cli/antigravity\n\
+        migrate-opencode    custody OpenCode api auth entries idempotently\n\
        mint-handle         mint a capability handle for a credential\n\
        revoke-handle       revoke one capability handle\n\
        revoke-all-handles  revoke every handle for a credential\n\
@@ -511,6 +524,22 @@ fn help_verb(verb: &str) -> String {
                --provider selects an account by email/index, default activeIndex);\n\
              --adapter overrides the method-derived refresh adapter;\n\
              --replace overwrites an existing id (fix a wrong-source import; keeps handles)."
+        }
+        "migrate-opencode" => {
+            "ck auth migrate-opencode [--dry-run] [--replace] [--restore <provider>]\n\
+             \x20                     [--auth-file <path>] [--handle-file <path>] [--provider <id>]...\n\
+             \x20                     [--serve-by <plugin-id>]\n\
+             \n\
+             Move OpenCode api entries into the vault as apikey:<provider>:main, write a\n\
+             capability handle file, then replace the auth entry with a provider tombstone.\n\
+             Re-running identical material is a no-op; different material refuses unless\n\
+             --replace is explicit. --provider is repeatable and preserves the requested\n\
+             provider order. OAuth and wellknown entries are skipped by default.\n\
+             \n\
+             --dry-run prints non-secret compare verdicts and stops before every write.\n\
+             --restore <provider> safely writes an api entry back, revokes recorded handles,\n\
+             and removes that provider from the handle file. --restore cannot combine with\n\
+             --dry-run or --replace. The default --serve-by is opencode-claustrum."
         }
         "mint-handle" => {
             "ck auth mint-handle --id <id>\n\

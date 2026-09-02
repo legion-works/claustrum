@@ -2,8 +2,11 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
+use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
+use credentials_core::store::EncryptedStore;
 #[path = "../src/bin/cli_support/credential_client.rs"]
 mod credential_client;
 #[path = "../src/bin/cli_support/opencode_files.rs"]
@@ -13,6 +16,14 @@ mod route_client;
 
 use serde_json::{json, Value};
 
+fn cli() -> Command {
+    match std::env::var_os("CRED_CLI_BIN") {
+        Some(path) => Command::new(path),
+        None => Command::new(env!("CARGO_BIN_EXE_ck-auth")),
+    }
+}
+
+/// See `cli_admin.rs::tmp_root` for the collision refusal rationale this mirrors.
 fn tmp_root(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,7 +38,12 @@ fn tmp_root(tag: &str) -> PathBuf {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir(&root).expect("fresh test root");
+    std::fs::create_dir(&root).unwrap_or_else(|e| {
+        panic!(
+            "temp root {} could not be created fresh ({e}); refusing to reuse a stale vault",
+            root.display()
+        )
+    });
     root
 }
 
@@ -41,7 +57,7 @@ fn mode(path: &Path) -> u32 {
 }
 
 #[test]
-fn opencode_files_golden_tombstone_matches_rust_contract() {
+fn the_golden_tombstone_matches_the_rust_contract() {
     let golden: Value = serde_json::from_str(include_str!(
         "../../../packages/opencode/golden/tombstone.json"
     ))
@@ -58,7 +74,7 @@ fn opencode_files_golden_tombstone_matches_rust_contract() {
 }
 
 #[test]
-fn opencode_files_reject_auth_mode_other_than_0600() {
+fn an_auth_file_with_a_mode_other_than_0600_is_refused() {
     let root = tmp_root("auth-mode");
     let auth = root.join("auth.json");
     std::fs::write(&auth, r#"{"deepseek":{"type":"api","key":"x"}}"#).expect("auth");
@@ -71,7 +87,7 @@ fn opencode_files_reject_auth_mode_other_than_0600() {
 }
 
 #[test]
-fn opencode_files_reject_unknown_auth_shape() {
+fn an_unknown_opencode_auth_shape_is_refused() {
     let root = tmp_root("unknown-shape");
     let auth = root.join("auth.json");
     std::fs::write(&auth, r#"{"deepseek":{"type":"mystery","token":"x"}}"#).expect("auth");
@@ -87,7 +103,7 @@ fn opencode_files_reject_unknown_auth_shape() {
 }
 
 #[test]
-fn opencode_files_atomic_write_preserves_unrelated_entries_and_mode() {
+fn an_auth_entry_write_preserves_unrelated_entries_and_mode() {
     let root = tmp_root("atomic-auth");
     let auth = root.join("auth.json");
     let unrelated =
@@ -111,7 +127,7 @@ fn opencode_files_atomic_write_preserves_unrelated_entries_and_mode() {
 }
 
 #[test]
-fn opencode_files_handle_round_trip_preserves_order_and_0600() {
+fn a_handle_file_round_trip_preserves_order_and_0600() {
     let root = tmp_root("handle-order");
     let handles = root.join("nested").join("opencode-handles.json");
     let file = opencode_files::HandleFile {
@@ -126,11 +142,13 @@ fn opencode_files_handle_round_trip_preserves_order_and_0600() {
                         label: "first".into(),
                         handle: "ckh_first".into(),
                         credential_id: "apikey:deepseek:first".into(),
+                        superseded: Vec::new(),
                     },
                     opencode_files::HandleAccount {
                         label: "second".into(),
                         handle: "ckh_second".into(),
                         credential_id: "apikey:deepseek:second".into(),
+                        superseded: Vec::new(),
                     },
                 ],
             },
@@ -142,6 +160,7 @@ fn opencode_files_handle_round_trip_preserves_order_and_0600() {
                     label: "work".into(),
                     handle: "ckh_work".into(),
                     credential_id: "oauth:anthropic:work".into(),
+                    superseded: Vec::new(),
                 }],
             },
         ],
@@ -170,7 +189,7 @@ fn opencode_files_handle_round_trip_preserves_order_and_0600() {
 }
 
 #[test]
-fn opencode_files_online_get_uses_owned_capability_without_admin_read() {
+fn an_online_get_uses_an_owned_capability_without_an_admin_read() {
     let root = tmp_root("online-get");
     let observed = Arc::new(Mutex::new(Vec::new()));
     let conn = spawn_route_daemon(
@@ -192,7 +211,7 @@ fn opencode_files_online_get_uses_owned_capability_without_admin_read() {
 }
 
 #[test]
-fn opencode_files_get_maps_needs_reauth_without_returning_material() {
+fn an_online_get_maps_needs_reauth_without_returning_material() {
     let root = tmp_root("needs-reauth");
     let observed = Arc::new(Mutex::new(Vec::new()));
     let conn = spawn_route_daemon(
@@ -216,6 +235,15 @@ fn opencode_files_get_maps_needs_reauth_without_returning_material() {
     );
     assert!(!text.contains("secret"), "payload leaked: {text}");
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_golden_handle_file_matches_the_rust_contract_byte_for_byte() {
+    let bytes = include_str!("../../../packages/opencode/golden/handles.json");
+    let file: opencode_files::HandleFile =
+        serde_json::from_str(bytes).expect("golden handles json");
+    let rendered = serde_json::to_string_pretty(&file).expect("render golden handles");
+    assert_eq!(rendered, bytes.trim_end());
 }
 
 fn spawn_route_daemon(root: &Path, observed: Arc<Mutex<Vec<String>>>, response: Value) -> PathBuf {
@@ -316,4 +344,580 @@ fn spawn_route_daemon(root: &Path, observed: Arc<Mutex<Vec<String>>>, response: 
         });
     });
     conn
+}
+
+struct MigrationRig {
+    root: PathBuf,
+    vault: PathBuf,
+    key: PathBuf,
+    auth: PathBuf,
+    handles: PathBuf,
+}
+
+impl MigrationRig {
+    fn new(tag: &str, entries: Value) -> Self {
+        let root = tmp_root(tag);
+        let vault = root.join("vault");
+        let key = root.join("master.key");
+        let auth = root.join("auth.json");
+        let handles = root.join("handles.json");
+        std::fs::create_dir_all(&vault).expect("vault directory");
+        std::fs::write(&auth, serde_json::to_vec(&entries).expect("auth json")).expect("auth file");
+        std::fs::set_permissions(&auth, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("auth mode");
+        let rig = Self {
+            root,
+            vault,
+            key,
+            auth,
+            handles,
+        };
+        let boot = rig.run(&["bootstrap"]);
+        assert!(
+            boot.status.success(),
+            "bootstrap failed: {}",
+            String::from_utf8_lossy(&boot.stderr)
+        );
+        rig
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .output()
+            .expect("run ck-auth")
+    }
+
+    fn migrate(&self, extra: &[&str]) -> Output {
+        let mut args = vec![
+            "migrate-opencode",
+            "--auth-file",
+            self.auth.to_str().unwrap(),
+            "--handle-file",
+            self.handles.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        self.run(&args)
+    }
+
+    fn migrate_with_env(&self, extra: &[&str], key: &str, value: &str) -> Output {
+        let mut args = vec![
+            "migrate-opencode",
+            "--auth-file",
+            self.auth.to_str().unwrap(),
+            "--handle-file",
+            self.handles.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .env(key, value)
+            .output()
+            .expect("run ck-auth with test seam")
+    }
+
+    fn set_auth(&self, entries: Value) {
+        std::fs::write(&self.auth, serde_json::to_vec(&entries).expect("auth json"))
+            .expect("rewrite auth");
+        std::fs::set_permissions(
+            &self.auth,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("auth mode");
+    }
+}
+
+impl Drop for MigrationRig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn open_vault(rig: &MigrationRig) -> EncryptedStore {
+    let config = credentials_core::resolver::ResolverConfig {
+        data_dir: rig.vault.clone(),
+        source: credentials_core::resolver::KeySource::OperatorPath {
+            path: rig.key.clone(),
+        },
+    };
+    let key = credentials_core::resolver::resolve(&config, None).expect("resolve test key");
+    let sqlite = open_sqlite(&StorageDescriptor {
+        module_id: credentials_core::contract::MODULE_ID.into(),
+        storage_namespace: credentials_core::contract::STORAGE_NAMESPACE.into(),
+        isolation: Isolation::Module,
+        backend: StorageBackend::Sqlite {
+            path: rig.vault.join("store.db").to_string_lossy().into_owned(),
+        },
+    })
+    .expect("open scratch vault");
+    EncryptedStore::migrate(&sqlite).expect("migrate scratch vault");
+    EncryptedStore::open(sqlite, key).expect("open scratch vault")
+}
+
+fn route_response(payload: &[u8]) -> Value {
+    json!({"result": {"payload": payload, "record_version": 1, "expires_at_ms": null}})
+}
+
+fn spawn_migration_route_daemon(
+    root: &Path,
+    observed: Arc<Mutex<Vec<String>>>,
+    responses: Arc<Mutex<Vec<Value>>>,
+) -> PathBuf {
+    use subc_protocol::{Flags, Frame, FrameType, Priority};
+    use subc_transport::{
+        authenticate_server, connection_file, read_frame, write_frame, ConnectionInfo, Endpoint,
+    };
+
+    let listener =
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let key = vec![8; 32];
+    let daemon_id = [5; 16];
+    let conn = root.join("migration-subc.json");
+    connection_file::write_atomic(
+        &conn,
+        &ConnectionInfo {
+            schema: connection_file::SCHEMA_VERSION,
+            wire_version: None,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".into(),
+                port,
+            }],
+            key: key.clone(),
+            daemon_id,
+            pid: std::process::id(),
+            daemon_ver: "test".into(),
+        },
+    )
+    .expect("connection file");
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                authenticate_server(
+                    &mut stream,
+                    &key,
+                    &daemon_id,
+                    "test",
+                    std::time::Duration::from_secs(3),
+                )
+                .await
+                .expect("handshake");
+                let first = read_frame(&mut stream)
+                    .await
+                    .expect("read first")
+                    .expect("first frame");
+                let first_body: Value = serde_json::from_slice(&first.body).expect("first json");
+                if first_body["op"] == "catalog.list" {
+                    observed
+                        .lock()
+                        .expect("observed")
+                        .push("catalog.list".into());
+                    let reply = Frame::build(
+                        FrameType::Response,
+                        Flags::new(false, Priority::Passive, false),
+                        0,
+                        0,
+                        first.header.corr,
+                        serde_json::to_vec(&json!({"modules": []})).unwrap(),
+                    )
+                    .unwrap();
+                    write_frame(&mut stream, &reply)
+                        .await
+                        .expect("catalog response");
+                    continue;
+                }
+                observed
+                    .lock()
+                    .expect("observed")
+                    .push(first_body["op"].as_str().unwrap_or_default().into());
+                let opened = Frame::build(
+                    FrameType::Response,
+                    Flags::new(false, Priority::Passive, false),
+                    0,
+                    0,
+                    first.header.corr,
+                    serde_json::to_vec(&json!({"route_channel": 7, "route_epoch": 3})).unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut stream, &opened)
+                    .await
+                    .expect("route response");
+                let get = read_frame(&mut stream)
+                    .await
+                    .expect("read get")
+                    .expect("get frame");
+                let get_body: Value = serde_json::from_slice(&get.body).expect("get json");
+                observed
+                    .lock()
+                    .expect("observed")
+                    .push(get_body["method"].as_str().unwrap_or_default().into());
+                let response = responses.lock().expect("responses").remove(0);
+                let reply = Frame::build(
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, false),
+                    7,
+                    3,
+                    get.header.corr,
+                    serde_json::to_vec(&response).unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut stream, &reply)
+                    .await
+                    .expect("get response");
+            }
+        });
+    });
+    conn
+}
+
+#[test]
+fn the_migrate_opencode_dry_run_writes_nothing_and_prints_a_non_secret_plan() {
+    let rig = MigrationRig::new(
+        "migration-dry",
+        json!({"deepseek": {"type": "api", "key": "dry-secret"}}),
+    );
+    let before = std::fs::read(&rig.auth).expect("auth before");
+    let out = rig.migrate(&["--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("dry_run compare=absent"));
+    assert!(!rig.handles.exists());
+    assert_eq!(std::fs::read(&rig.auth).expect("auth after"), before);
+    assert!(!stdout.contains("dry-secret") && !stderr.contains("dry-secret"));
+}
+
+#[test]
+fn the_migrate_opencode_first_run_stores_writes_a_handle_and_then_tombstones() {
+    let rig = MigrationRig::new(
+        "migration-first",
+        json!({"deepseek": {"type": "api", "key": "first-secret"}}),
+    );
+    let out = rig.migrate(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let auth: Value =
+        serde_json::from_slice(&std::fs::read(&rig.auth).expect("auth")).expect("auth json");
+    assert_eq!(
+        auth["deepseek"],
+        json!({"type":"api", "key":"claustrum-tombstone:v1:deepseek"})
+    );
+    let handles = opencode_files::read_handle_file(&rig.handles).expect("handles");
+    assert_eq!(
+        handles.providers[0].accounts[0].credential_id,
+        "apikey:deepseek:main"
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("first-secret"));
+}
+
+#[test]
+fn the_migrate_opencode_rerun_with_identical_material_is_a_no_op() {
+    let rig = MigrationRig::new(
+        "migration-identical",
+        json!({"deepseek": {"type": "api", "key": "same-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    rig.set_auth(json!({"deepseek": {"type": "api", "key": "same-secret"}}));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        observed,
+        Arc::new(Mutex::new(vec![route_response(b"same-secret")])),
+    );
+    let out = rig.migrate(&["--subc", conn.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("identical"));
+}
+
+#[test]
+fn the_migrate_opencode_different_material_refuses_without_replace() {
+    let rig = MigrationRig::new(
+        "migration-different",
+        json!({"deepseek": {"type": "api", "key": "old-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    rig.set_auth(json!({"deepseek": {"type": "api", "key": "new-secret"}}));
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![route_response(b"old-secret")])),
+    );
+    let out = rig.migrate(&["--subc", conn.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("differs; rerun with --replace"));
+}
+
+#[test]
+fn the_migrate_opencode_replace_rotates_the_handle_after_rereading_the_auth_entry() {
+    let rig = MigrationRig::new(
+        "migration-replace",
+        json!({"deepseek": {"type": "api", "key": "old-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let old = opencode_files::read_handle_file(&rig.handles)
+        .unwrap()
+        .providers[0]
+        .accounts[0]
+        .handle
+        .clone();
+    rig.set_auth(json!({"deepseek": {"type": "api", "key": "new-secret"}}));
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![route_response(b"old-secret")])),
+    );
+    let out = rig.migrate(&["--replace", "--subc", conn.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let new = opencode_files::read_handle_file(&rig.handles)
+        .unwrap()
+        .providers[0]
+        .accounts[0]
+        .handle
+        .clone();
+    assert_ne!(old, new);
+}
+
+#[test]
+fn the_migrate_opencode_remints_and_compares_a_lost_handle() {
+    let rig = MigrationRig::new(
+        "migration-lost",
+        json!({"deepseek": {"type": "api", "key": "lost-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    rig.set_auth(json!({"deepseek": {"type": "api", "key": "lost-secret"}}));
+    let mut handles = opencode_files::read_handle_file(&rig.handles).unwrap();
+    handles.providers[0].accounts[0].handle = "ckh_lost".into();
+    opencode_files::write_handle_file(&rig.handles, &handles).unwrap();
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![
+            json!({"result":{"error":{"code":"not_found"}}}),
+            route_response(b"lost-secret"),
+        ])),
+    );
+    let out = rig.migrate(&["--subc", conn.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(
+        opencode_files::read_handle_file(&rig.handles)
+            .unwrap()
+            .providers[0]
+            .accounts[0]
+            .handle,
+        "ckh_lost"
+    );
+}
+
+#[test]
+fn the_migrate_opencode_handle_write_failure_leaves_the_real_auth_entry_untouched() {
+    let rig = MigrationRig::new(
+        "migration-write-failure",
+        json!({"deepseek": {"type": "api", "key": "write-secret"}}),
+    );
+    let out = rig.run(&[
+        "migrate-opencode",
+        "--auth-file",
+        rig.auth.to_str().unwrap(),
+        "--handle-file",
+        "/dev/null/handles.json",
+    ]);
+    assert!(!out.status.success());
+    let auth: Value = serde_json::from_slice(&std::fs::read(&rig.auth).unwrap()).unwrap();
+    assert_eq!(auth["deepseek"]["key"], "write-secret");
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun() {
+    let rig = MigrationRig::new(
+        "migration-tombstone-seam",
+        json!({"deepseek": {"type": "api", "key": "old-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let h1 = opencode_files::read_handle_file(&rig.handles)
+        .expect("first handles")
+        .providers[0]
+        .accounts[0]
+        .handle
+        .clone();
+    rig.set_auth(json!({"deepseek": {"type": "api", "key": "new-secret"}}));
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![route_response(b"old-secret")])),
+    );
+    let out = rig.migrate_with_env(
+        &["--replace", "--subc", conn.to_str().unwrap()],
+        "CK_OPENCODE_TEST_FAIL_TOMBSTONE_REREAD",
+        "1",
+    );
+    assert!(
+        !out.status.success(),
+        "the seam must stop after writing the tombstone"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("re-run converges"));
+
+    let auth: Value =
+        serde_json::from_slice(&std::fs::read(&rig.auth).expect("auth")).expect("auth json");
+    assert_eq!(
+        auth["deepseek"],
+        json!({"type":"api", "key":"claustrum-tombstone:v1:deepseek"})
+    );
+    let handles: Value = serde_json::from_slice(&std::fs::read(&rig.handles).expect("handles"))
+        .expect("handles json");
+    let account = &handles["providers"][0]["accounts"][0];
+    let h2 = account["handle"].as_str().expect("new handle").to_string();
+    assert_ne!(h1, h2);
+    assert_eq!(account["superseded"], json!([h1]));
+    let store = open_vault(&rig);
+    assert_eq!(
+        store.resolve_handle(&h1).expect("H1 remains live"),
+        "apikey:deepseek:main"
+    );
+    assert_eq!(
+        store.resolve_handle(&h2).expect("H2 is live"),
+        "apikey:deepseek:main"
+    );
+    drop(store);
+    let audit = String::from_utf8_lossy(&rig.run(&["audit"]).stdout).to_string();
+    assert!(audit.contains("mint_handle"));
+    assert!(!audit.contains("revoke_handle"));
+
+    let rerun = rig.migrate(&[]);
+    assert!(
+        rerun.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rerun.stderr)
+    );
+    let handles: Value =
+        serde_json::from_slice(&std::fs::read(&rig.handles).expect("handles after rerun"))
+            .expect("handles json");
+    assert_eq!(handles["providers"][0]["accounts"][0]["handle"], h2);
+    assert!(handles["providers"][0]["accounts"][0]
+        .get("superseded")
+        .is_none());
+    let store = open_vault(&rig);
+    assert!(
+        store.resolve_handle(&h1).is_err(),
+        "H1 is revoked on convergence"
+    );
+    assert_eq!(
+        store.resolve_handle(&h2).expect("H2 remains live"),
+        "apikey:deepseek:main"
+    );
+    let audit = String::from_utf8_lossy(&rig.run(&["audit"]).stdout).to_string();
+    assert!(audit.contains("revoke_handle"));
+}
+
+#[test]
+fn the_migrate_opencode_restore_writes_the_real_entry_then_drops_its_handle() {
+    let rig = MigrationRig::new(
+        "migration-restore",
+        json!({"deepseek": {"type": "api", "key": "restore-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![route_response(b"restore-secret")])),
+    );
+    let out = rig.migrate(&["--restore", "deepseek", "--subc", conn.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let auth: Value = serde_json::from_slice(&std::fs::read(&rig.auth).unwrap()).unwrap();
+    assert_eq!(auth["deepseek"]["key"], "restore-secret");
+    assert!(opencode_files::read_handle_file(&rig.handles)
+        .unwrap()
+        .providers
+        .is_empty());
+}
+
+#[test]
+fn the_migrate_opencode_restore_refuses_a_record_that_needs_reauthentication() {
+    let rig = MigrationRig::new(
+        "migration-reauth",
+        json!({"deepseek": {"type": "api", "key": "reauth-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![
+            json!({"result":{"error":{"class":"auth_required","code":"needs_reauth"}}}),
+        ])),
+    );
+    let out = rig.migrate(&["--restore", "deepseek", "--subc", conn.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains(
+        "refusing restore for apikey:deepseek:main: vault record needs re-authentication"
+    ));
+}
+
+#[test]
+fn the_migrate_opencode_preserves_repeated_provider_filters_and_skips_oauth_by_default() {
+    let rig = MigrationRig::new(
+        "migration-filter",
+        json!({"deepseek": {"type": "api", "key": "one"}, "groq": {"type": "api", "key": "two"}, "anthropic": {"type":"oauth","access":"a","refresh":"r","expires":0}}),
+    );
+    let out = rig.migrate(&["--provider", "groq", "--provider", "deepseek"]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.find("provider=groq").unwrap() < stdout.find("provider=deepseek").unwrap());
+    let auth: Value = serde_json::from_slice(&std::fs::read(&rig.auth).unwrap()).unwrap();
+    assert_eq!(auth["anthropic"]["type"], "oauth");
+}
+
+#[test]
+fn the_migrate_opencode_leaves_a_legacy_two_segment_record_untouched() {
+    let rig = MigrationRig::new(
+        "migration-legacy",
+        json!({"deepseek": {"type": "api", "key": "legacy-secret"}}),
+    );
+    assert!(rig
+        .run(&[
+            "put",
+            "--id",
+            "apikey:deepseek",
+            "--payload",
+            "legacy-secret"
+        ])
+        .status
+        .success());
+    assert!(rig.migrate(&[]).status.success());
+    let listed = rig.run(&["list"]);
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("apikey:deepseek"));
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("apikey:deepseek:main"));
 }
