@@ -322,15 +322,26 @@ pub fn scan(conn: &Connection, key: &MasterKey) -> Result<Vec<RecordUsability>, 
                 },
             }
         };
+        let unservable_identity = !record.identity.is_servable();
+        let (account_id, invalid_account_id) = account_id_for_output(record.identity.account_id);
         out.push(RecordUsability {
             credential_id: id,
             state,
             usability,
-            unservable_identity: !record.identity.is_servable(),
-            account_id: record.identity.account_id,
+            unservable_identity: unservable_identity || invalid_account_id,
+            account_id,
         });
     }
     Ok(out)
+}
+
+fn account_id_for_output(account_id: Option<String>) -> (Option<String>, bool) {
+    match account_id {
+        Some(account_id) if account_id.chars().any(char::is_control) => {
+            (Some("<invalid>".to_string()), true)
+        }
+        account_id => (account_id, false),
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +418,18 @@ mod declared_expiry_tests {
             },
             "a static record must report the expiry its operator declared"
         );
+    }
+}
+
+#[cfg(test)]
+mod identity_output_tests {
+    use super::*;
+
+    #[test]
+    fn account_id_controls_are_never_returned_for_cli_rendering() {
+        let (account_id, invalid) = account_id_for_output(Some("acct\ncontrol".to_string()));
+        assert_eq!(account_id.as_deref(), Some("<invalid>"));
+        assert!(invalid);
     }
 }
 

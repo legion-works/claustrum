@@ -1147,7 +1147,7 @@ impl EncryptedStore {
                 if let Some(identity) =
                     existing_identity.filter(|identity| identity.validate().is_ok())
                 {
-                    sealed.identity = identity;
+                    sealed.identity = identity.normalized();
                 }
             }
             sealed.record_version = next_version;
@@ -1210,6 +1210,7 @@ impl EncryptedStore {
         let key_id_hex = self.key_id.to_hex();
         let now = now_ms();
         let audit_key = self.audit_key.clone();
+        let typed_error = std::cell::RefCell::new(None);
         let outcome = self.fenced_write(|tx| {
             let existing: Option<(i64, Vec<u8>)> = tx
                 .query_row(
@@ -1221,22 +1222,27 @@ impl EncryptedStore {
             let Some((current_version, envelope)) = existing else {
                 return Ok(None);
             };
-            let plaintext = envelope::open(
+            let plaintext = match envelope::open(
                 &self.key,
                 &envelope,
                 &RecordBinding {
                     credential_id,
                     record_version: current_version as u64,
                 },
-            )
-            .map_err(|error| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(StoreOpError::Decrypt(error)))
-            })?;
-            let record = VaultRecord::decode(&plaintext).map_err(|error| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(StoreOpError::Corrupt(
-                    error.to_string(),
-                )))
-            })?;
+            ) {
+                Ok(plaintext) => plaintext,
+                Err(error) => {
+                    *typed_error.borrow_mut() = Some(StoreOpError::Decrypt(error));
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            };
+            let record = match VaultRecord::decode(&plaintext) {
+                Ok(record) => record,
+                Err(error) => {
+                    *typed_error.borrow_mut() = Some(StoreOpError::Corrupt(error.to_string()));
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            };
             let next_version = (current_version as u64).saturating_add(1);
             let mut updated = record.with_identity(identity.clone());
             updated.record_version = next_version;
@@ -1270,7 +1276,14 @@ impl EncryptedStore {
                 )?;
             }
             Ok(Some(changed))
-        })?;
+        });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => match typed_error.into_inner() {
+                Some(typed) => return Err(typed),
+                None => return Err(StoreOpError::from(error)),
+            },
+        };
         match outcome {
             None => Err(StoreOpError::NotFound),
             Some(0) => Err(StoreOpError::CasMismatch),
@@ -4354,6 +4367,89 @@ mod tests {
                 .as_deref(),
             Some("acct-labelled")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn replacement_normalizes_a_legacy_email_only_identity() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(57);
+        let mut legacy = oauth_record();
+        legacy.identity = RecordIdentity {
+            account_id: None,
+            email: Some("legacy@example.com".to_string()),
+            org_name: None,
+        };
+        let blob = store
+            .seal_record("oauth:anthropic", &legacy)
+            .expect("seal legacy");
+        store
+            .create("oauth:anthropic", &oauth_record())
+            .expect("seed");
+        store
+            .with_raw_conn(|conn| {
+                conn.execute(
+                    "UPDATE credentials SET envelope = ?1 WHERE credential_id = 'oauth:anthropic'",
+                    rusqlite::params![blob],
+                )
+            })
+            .expect("seed legacy envelope");
+        store
+            .overwrite_unconditional_audited(
+                "oauth:anthropic",
+                &oauth_record(),
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("replace");
+        assert!(
+            store
+                .get("oauth:anthropic")
+                .expect("read")
+                .identity
+                .is_empty(),
+            "legacy email-only metadata must not become a served identity"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_identity_returns_a_typed_corrupt_error_for_an_undecodable_envelope() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(58);
+        store
+            .create("oauth:anthropic", &oauth_record())
+            .expect("seed");
+        let blob = envelope::seal(
+            &store.key,
+            b"not a vault record",
+            &RecordBinding {
+                credential_id: "oauth:anthropic",
+                record_version: 1,
+            },
+        )
+        .expect("seal malformed body");
+        store
+            .with_raw_conn(|conn| {
+                conn.execute(
+                    "UPDATE credentials SET envelope = ?1 WHERE credential_id = 'oauth:anthropic'",
+                    rusqlite::params![blob],
+                )
+            })
+            .expect("seed malformed envelope");
+        assert!(matches!(
+            store.set_identity_audited(
+                "oauth:anthropic",
+                RecordIdentity {
+                    account_id: Some("acct".to_string()),
+                    email: None,
+                    org_name: None,
+                },
+                AuditCtx::admin(AuditOp::SetIdentity),
+            ),
+            Err(StoreOpError::Corrupt(_))
+        ));
         let _ = std::fs::remove_dir_all(&root);
     }
 

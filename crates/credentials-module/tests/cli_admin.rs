@@ -1231,15 +1231,17 @@ fn import_and_set_identity_attach_sticky_account_metadata_without_replacing_secr
         "replace: {}",
         String::from_utf8_lossy(&replacement.stderr)
     );
+    let sticky = open_record()
+        .get("oauth:anthropic")
+        .expect("sticky identity");
+    assert_eq!(sticky.identity.account_id.as_deref(), Some("acct-set"));
     assert_eq!(
-        open_record()
-            .get("oauth:anthropic")
-            .expect("sticky identity")
-            .identity
-            .account_id
-            .as_deref(),
-        Some("acct-set"),
-        "token-only replacement must retain account metadata"
+        sticky.oauth.as_ref().expect("OAuth").refresh_token,
+        "refresh-rotated"
+    );
+    assert_eq!(
+        sticky.oauth.as_ref().expect("OAuth").access_token,
+        "opaque-rotated"
     );
 
     let cleared = run(&[
@@ -1258,13 +1260,20 @@ fn import_and_set_identity_attach_sticky_account_metadata_without_replacing_secr
         "clear identity: {}",
         String::from_utf8_lossy(&cleared.stderr)
     );
+    let cleared_record = open_record()
+        .get("oauth:anthropic")
+        .expect("cleared identity");
     assert!(
-        open_record()
-            .get("oauth:anthropic")
-            .expect("cleared identity")
-            .identity
-            .is_empty(),
+        cleared_record.identity.is_empty(),
         "--clear-identity must override sticky preservation"
+    );
+    assert_eq!(
+        cleared_record.oauth.as_ref().expect("OAuth").refresh_token,
+        "refresh-rotated"
+    );
+    assert_eq!(
+        cleared_record.oauth.as_ref().expect("OAuth").access_token,
+        "opaque-rotated"
     );
 
     assert!(
@@ -1313,11 +1322,16 @@ fn import_and_set_identity_attach_sticky_account_metadata_without_replacing_secr
         "email-only refusal must name the missing field"
     );
 
-    for invalid in ["", "account\ncontrol", &"x".repeat(257)] {
-        let invalid = run(&["set-identity", "oauth:anthropic", "--account-id", invalid]);
+    for invalid_value in ["", "account\ncontrol", &"x".repeat(257)] {
+        let invalid_output = run(&[
+            "set-identity",
+            "oauth:anthropic",
+            "--account-id",
+            invalid_value,
+        ]);
         assert!(
-            !invalid.status.success(),
-            "invalid account id {invalid:?} must refuse"
+            !invalid_output.status.success(),
+            "invalid account id {invalid_value:?} must refuse"
         );
     }
 

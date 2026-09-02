@@ -804,9 +804,7 @@ fn cmd_mint_signing_key(global: &GlobalArgs, args: &[String]) -> Result<(), CliE
     let (audit_op, mode, success) = if replace {
         (
             AdminAuditOp::Overwrite,
-            StoreMode::ReplaceUnconditional {
-                clear_identity: false,
-            },
+            StoreMode::ReplaceUnconditional,
             "replaced",
         )
     } else {
@@ -995,9 +993,7 @@ fn cmd_put(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
                     &id,
                     record,
                     AdminAuditOp::Overwrite,
-                    StoreMode::ReplaceUnconditional {
-                        clear_identity: false,
-                    },
+                    StoreMode::ReplaceUnconditional,
                 ),
             )?;
             println!("replaced {id} (unconditional)");
@@ -1015,12 +1011,21 @@ fn cmd_put(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
 
 /// Build an `admin.store` op body.
 fn store_op(id: &str, record: VaultRecord, audit_op: AdminAuditOp, mode: StoreMode) -> AdminOpBody {
-    AdminOpBody::Store {
-        v: ADMIN_OP_SCHEMA_V1,
-        id: id.to_string(),
-        record: Box::new(record),
-        audit_op,
-        mode,
+    match mode {
+        StoreMode::ReplaceUnconditional => AdminOpBody::StoreWithIdentityPolicy {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: id.to_string(),
+            record: Box::new(record),
+            audit_op,
+            clear_identity: false,
+        },
+        mode => AdminOpBody::Store {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: id.to_string(),
+            record: Box::new(record),
+            audit_op,
+            mode,
+        },
     }
 }
 
@@ -1178,14 +1183,13 @@ fn cmd_import(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     if has_flag(args, "--replace") {
         commit_admin(
             global,
-            store_op(
-                &id,
-                record,
-                AdminAuditOp::Import,
-                StoreMode::ReplaceUnconditional {
-                    clear_identity: requested_identity.clear,
-                },
-            ),
+            AdminOpBody::StoreWithIdentityPolicy {
+                v: ADMIN_OP_SCHEMA_V1,
+                id: id.clone(),
+                record: Box::new(record),
+                audit_op: AdminAuditOp::Import,
+                clear_identity: requested_identity.clear,
+            },
         )?;
         println!("replaced {id}");
     } else {
@@ -1806,9 +1810,7 @@ fn cmd_device_login(
                 id,
                 record,
                 AdminAuditOp::Login,
-                StoreMode::ReplaceUnconditional {
-                    clear_identity: false,
-                },
+                StoreMode::ReplaceUnconditional,
             ),
         )?;
         println!("logged in and replaced {id}");
@@ -1929,12 +1931,7 @@ fn cmd_login(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
 
         let replace = has_flag(args, "--replace") || interactive.replace;
         let (audit_op, store_mode) = if replace {
-            (
-                AdminAuditOp::Overwrite,
-                StoreMode::ReplaceUnconditional {
-                    clear_identity: false,
-                },
-            )
+            (AdminAuditOp::Overwrite, StoreMode::ReplaceUnconditional)
         } else {
             (AdminAuditOp::Put, StoreMode::Create)
         };
@@ -1982,9 +1979,7 @@ fn cmd_login(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     .map_err(CliError::Io)?
     {
         let mode = if special.replace {
-            StoreMode::ReplaceUnconditional {
-                clear_identity: false,
-            }
+            StoreMode::ReplaceUnconditional
         } else {
             StoreMode::Create
         };
@@ -2240,9 +2235,7 @@ fn cmd_login(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
                 &id,
                 record,
                 AdminAuditOp::Login,
-                StoreMode::ReplaceUnconditional {
-                    clear_identity: false,
-                },
+                StoreMode::ReplaceUnconditional,
             ),
         )?;
         println!("logged in and replaced {id}");

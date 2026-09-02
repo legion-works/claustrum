@@ -188,6 +188,9 @@ impl RecordIdentity {
 }
 
 fn validate_identity_value(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
     if value.len() > 256 {
         return Err(format!("{field} must be at most 256 bytes"));
     }
@@ -598,5 +601,32 @@ mod tests {
             serde_json::to_string(&CredentialKind::Cookie).unwrap(),
             "\"cookie\""
         );
+    }
+
+    #[test]
+    fn identity_validation_rejects_whitespace_only_optional_labels() {
+        for (field, identity) in [
+            (
+                "email",
+                RecordIdentity {
+                    account_id: Some("acct".into()),
+                    email: Some(" \t ".into()),
+                    org_name: None,
+                },
+            ),
+            (
+                "org_name",
+                RecordIdentity {
+                    account_id: Some("acct".into()),
+                    email: None,
+                    org_name: Some("   ".into()),
+                },
+            ),
+        ] {
+            assert!(
+                identity.validate().is_err(),
+                "whitespace-only {field} must be rejected"
+            );
+        }
     }
 }
