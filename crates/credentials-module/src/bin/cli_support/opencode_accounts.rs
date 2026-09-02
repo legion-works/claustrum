@@ -114,14 +114,18 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
         .iter()
         .any(|(_, _, candidate)| candidate == &id);
     if exists {
-        let verification_handle = opencode_migration::mint_handle(global, &id)?;
-        let existing = opencode_migration::get_material(global, &verification_handle)?
-            .ok_or_else(|| CliError::Io("fresh capability was revoked before comparison".into()))?;
-        if existing != material {
-            return Err(CliError::Usage(format!(
-                "existing credential {id} differs; remove the account before replacing it"
-            )));
-        }
+        opencode_migration::with_scoped_handle(global, &id, |verification_handle| {
+            let existing = opencode_migration::get_material(global, verification_handle)?
+                .ok_or_else(|| {
+                    CliError::Io("fresh capability was revoked before comparison".into())
+                })?;
+            if existing != material {
+                return Err(CliError::Usage(format!(
+                    "existing credential {id} differs; remove the account before replacing it"
+                )));
+            }
+            Ok(())
+        })?;
         opencode_migration::revoke_all_handles(global, &id)?;
     } else {
         commit_admin(

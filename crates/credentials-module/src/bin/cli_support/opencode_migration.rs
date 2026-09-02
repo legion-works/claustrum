@@ -748,12 +748,13 @@ pub(crate) fn mint_handle(global: &GlobalArgs, id: &str) -> Result<String, CliEr
     .ok_or_else(|| CliError::Io("mint did not return a handle".into()))
 }
 
-/// Mints a handle for `id` and runs `persist` with it. If `persist` fails, the handle is
-/// revoked before the error propagates, so a failed file write never strands a live bearer
-/// capability. If the revoke also fails, the returned error names the credential id and the
-/// two commands that close the window (`ck auth audit` shows the mint; `ck auth
-/// revoke-all-handles <id>` revokes it). The `superseded` journal covers the replace-then-crash
-/// case; this covers mint-then-crash, whose journal precondition is what failed.
+/// Mints a handle for `id` and runs `persist` with it. This is for handles meant to outlive the
+/// call: if `persist` fails, the handle is revoked before the error propagates, so a failed file
+/// write never strands a live bearer capability. Use `with_scoped_handle` when the handle is only
+/// needed during the closure and must die before it returns. If the revoke also fails, the returned
+/// error names the credential id and the two commands that close the window (`ck auth audit` shows
+/// the mint; `ck auth revoke-all-handles <id>` revokes it). The `superseded` journal covers the
+/// replace-then-crash case; this covers mint-then-crash, whose journal precondition is what failed.
 pub(crate) fn mint_then_persist<T>(
     global: &GlobalArgs,
     id: &str,
@@ -766,6 +767,29 @@ pub(crate) fn mint_then_persist<T>(
             Ok(()) => Err(persist_error),
             Err(revoke_error) => Err(CliError::Io(format!(
                 "failed to persist minted handle for credential {id}: {persist_error}; cleanup also failed: {revoke_error}; run `ck auth audit` to find the mint, then `ck auth revoke-all-handles {id}` to revoke it"
+            ))),
+        },
+    }
+}
+
+/// Mints a handle for a single operation and revokes it on every return path.
+pub(crate) fn with_scoped_handle<T>(
+    global: &GlobalArgs,
+    id: &str,
+    operation: impl FnOnce(&str) -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    let handle = mint_handle(global, id)?;
+    match operation(&handle) {
+        Ok(value) => revoke_handle(global, &handle).map_err(|revoke_error| {
+            CliError::Io(format!(
+                "verification handle cleanup failed for credential {id}: {revoke_error}; run `ck auth audit` to find the mint, then `ck auth revoke-all-handles {id}` to revoke it"
+            ))
+        })
+        .map(|()| value),
+        Err(operation_error) => match revoke_handle(global, &handle) {
+            Ok(()) => Err(operation_error),
+            Err(revoke_error) => Err(CliError::Io(format!(
+                "operation using verification handle for credential {id} failed: {operation_error}; cleanup also failed: {revoke_error}; run `ck auth audit` to find the mint, then `ck auth revoke-all-handles {id}` to revoke it"
             ))),
         },
     }
@@ -800,6 +824,12 @@ pub(crate) fn revoke_all_handles(global: &GlobalArgs, id: &str) -> Result<(), Cl
 }
 
 pub(crate) fn get_material(global: &GlobalArgs, handle: &str) -> Result<Option<Vec<u8>>, CliError> {
+    #[cfg(feature = "opencode-test-seam")]
+    if std::env::var("CK_OPENCODE_TEST_FAIL_GET_MATERIAL").as_deref() == Ok("1") {
+        return Err(CliError::Io(
+            "OpenCode test seam: material read interrupted".into(),
+        ));
+    }
     let connection = global.subc_conn.as_deref().ok_or_else(|| {
         CliError::Usage("migrate-opencode needs --subc for capability reads".into())
     })?;

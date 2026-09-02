@@ -1666,6 +1666,146 @@ fn the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_ha
     );
 }
 
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_opencode_account_add_revokes_its_verification_handle_when_existing_material_differs() {
+    let rig = MigrationRig::new(
+        "account-add-verification-mismatch",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    assert!(rig
+        .run(&[
+            "put",
+            "--id",
+            "apikey:deepseek:alt",
+            "--payload",
+            "stored-secret",
+        ])
+        .status
+        .success());
+    let key_file = rig.root.join("alt.key");
+    std::fs::write(&key_file, b"different-secret").expect("key file");
+    let connection = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![route_response(b"stored-secret")])),
+    );
+
+    let out = rig.run(&[
+        "opencode-account",
+        "add",
+        "--provider",
+        "deepseek",
+        "--label",
+        "alt",
+        "--key-file",
+        key_file.to_str().expect("key path"),
+        "--handle-file",
+        rig.handles.to_str().expect("handle path"),
+        "--subc",
+        connection.to_str().expect("connection path"),
+    ]);
+    assert!(
+        !out.status.success(),
+        "different existing material must refuse"
+    );
+    assert_minted_handle_was_revoked(&rig, "apikey:deepseek:alt");
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_opencode_account_add_revokes_its_verification_handle_when_material_read_fails() {
+    let rig = MigrationRig::new(
+        "account-add-verification-read-failure",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    assert!(rig
+        .run(&[
+            "put",
+            "--id",
+            "apikey:deepseek:alt",
+            "--payload",
+            "stored-secret",
+        ])
+        .status
+        .success());
+    let key_file = rig.root.join("alt.key");
+    std::fs::write(&key_file, b"stored-secret").expect("key file");
+    let args = [
+        "opencode-account",
+        "add",
+        "--provider",
+        "deepseek",
+        "--label",
+        "alt",
+        "--key-file",
+        key_file.to_str().expect("key path"),
+        "--handle-file",
+        rig.handles.to_str().expect("handle path"),
+    ];
+
+    let out = rig.run_with_env(&args, "CK_OPENCODE_TEST_FAIL_GET_MATERIAL", "1");
+    assert!(
+        !out.status.success(),
+        "the seam must stop material verification"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("material read interrupted"));
+    assert_minted_handle_was_revoked(&rig, "apikey:deepseek:alt");
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_opencode_account_add_names_remedies_when_verification_cleanup_fails() {
+    let rig = MigrationRig::new(
+        "account-add-verification-revoke-failure",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    assert!(rig
+        .run(&[
+            "put",
+            "--id",
+            "apikey:deepseek:alt",
+            "--payload",
+            "stored-secret",
+        ])
+        .status
+        .success());
+    let key_file = rig.root.join("alt.key");
+    std::fs::write(&key_file, b"different-secret").expect("key file");
+    let connection = spawn_migration_route_daemon(
+        &rig.root,
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(vec![route_response(b"stored-secret")])),
+    );
+    let args = [
+        "opencode-account",
+        "add",
+        "--provider",
+        "deepseek",
+        "--label",
+        "alt",
+        "--key-file",
+        key_file.to_str().expect("key path"),
+        "--handle-file",
+        rig.handles.to_str().expect("handle path"),
+        "--subc",
+        connection.to_str().expect("connection path"),
+    ];
+
+    let out = rig.run_with_env(&args, "CK_OPENCODE_TEST_FAIL_REVOKE", "1");
+    assert!(
+        !out.status.success(),
+        "cleanup failure must fail the command"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("apikey:deepseek:alt"));
+    assert!(stderr.contains("ck auth audit"));
+    assert!(stderr.contains("ck auth revoke-all-handles apikey:deepseek:alt"));
+}
+
 #[test]
 fn the_opencode_account_remove_revokes_the_handle_but_keeps_the_vault_record() {
     let rig = MigrationRig::new(
