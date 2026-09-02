@@ -11,6 +11,11 @@ This plugin owns OpenCode providers whose credentials live in Claustrum. It read
 | real credential | absent | leave the stock provider alone |
 | real credential | another owner | leave the stock provider alone |
 
+| credential shape | freshness policy |
+| --- | --- |
+| `api` | Re-observe the served credential on the next request after 10 minutes. |
+| `oauth` | Run one unref'd 60-second warm tick, requesting at least 270 minutes of TTL by default. Each warm waits at most 100 ms on the request path and continues detached. |
+
 The handle file comes from `CLAUSTRUM_OPENCODE_HANDLES`, or from `${XDG_CONFIG_HOME:-$HOME/.config}/cortexkit/opencode-handles.json`. It must be a regular file owned by the current user with mode `0600`. OpenCode auth is read from `${XDG_DATA_HOME:-$HOME/.local/share}/opencode/auth.json`.
 
 Run `ck auth migrate-opencode` to create or repair the tombstones and handle file. `superseded` handles remain in the file for migration history. They are not servable accounts.

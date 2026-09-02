@@ -79,7 +79,7 @@ export function parseHandleFile(value: unknown): OpenCodeHandleFileV1 {
   return { version: 1, providers };
 }
 
-type HandleFileStat = { isFile(): boolean; mode: number; uid?: number };
+type HandleFileStat = { isFile(): boolean; mode: number; uid?: number; mtimeMs?: number };
 export type HandleFileIo = {
   stat?: (path: string) => Promise<HandleFileStat>;
   readFile?: (path: string, encoding: "utf8") => Promise<string>;
@@ -125,4 +125,12 @@ export async function readHandleFile(path = defaultHandleFilePath(), io: HandleF
     if (error instanceof HandleFileValidationError) throw error;
     invalid(`handle file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+export async function handleFileRevision(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<string> {
+  const stat = io.stat ?? nodeStat;
+  const read = io.readFile ?? readFile;
+  const metadata = await stat(path);
+  const source = await read(path, "utf8");
+  return `${metadata.mtimeMs ?? 0}:${source}`;
 }

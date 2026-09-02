@@ -209,7 +209,7 @@ describe("OpenCode custody serve fetch", () => {
     time += 3_599_000;
     expect((await fetch("https://upstream.example/v1/chat")).status).toBe(200);
 
-    expect(client.gets).toEqual([MAIN_HANDLE, BACKUP_HANDLE]);
+    expect(client.gets).toEqual([MAIN_HANDLE, BACKUP_HANDLE, BACKUP_HANDLE]);
     expect(requests).toHaveLength(3);
   });
 

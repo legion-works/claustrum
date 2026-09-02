@@ -1,17 +1,18 @@
 import {
-  ClaustrumCredentialError,
   type ClaustrumReporterSource,
   type ServedCredential,
 } from "@cortexkit/claustrum-client";
 
 import { CustodySplitError } from "./errors";
+import { FreshnessController, type FreshnessAccount } from "./freshness";
+import type { CustodyLogger } from "./log";
 import { snapshotRequest } from "./request";
 import { isProviderTombstone, sentinel } from "./tombstone";
 
-export type ServeAccount = { label: string; handle: string };
+export type ServeAccount = FreshnessAccount;
 
 export type ServeClient = {
-  getCredential(handle: string): Promise<ServedCredential>;
+  getCredential(handle: string, minTtlMs?: number): Promise<ServedCredential>;
   reportAuthFailure(input: {
     handle: string;
     providerStatus: number;
@@ -27,16 +28,13 @@ export type CreateServeFetchOptions = {
   readAuthEntry: () => Promise<unknown> | unknown;
   upstreamFetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   now?: () => number;
-  log?: (line: string) => void;
+  shape?: "api" | "oauth";
+  freshness?: FreshnessController;
+  log?: CustodyLogger;
 };
 
 type AccountRuntime = {
-  label: string;
-  handle: string;
-  cached?: ServedCredential;
-  observedAt?: number;
-  cooldownUntil?: number;
-  unusable?: "gone" | "reauth" | "transient";
+  account: ServeAccount;
 };
 
 export class CustodyExhaustionError extends Error {
@@ -56,50 +54,25 @@ async function discard(response: Response): Promise<void> {
   }
 }
 
-function accountState(account: AccountRuntime, now: number): string {
-  if (account.unusable) return account.unusable;
-  if (account.cooldownUntil !== undefined && account.cooldownUntil > now) return "cooldown";
-  return "available";
-}
-
-function exhaustion(provider: string, accounts: AccountRuntime[], now: number): CustodyExhaustionError {
-  const states = accounts.map((account) => `${account.label}:${accountState(account, now)}`).join(", ");
+function exhaustion(provider: string, accounts: AccountRuntime[], freshness: FreshnessController): CustodyExhaustionError {
+  const states = accounts.map(({ account }) => `${account.label}:${freshness.state(account)}`).join(", ");
   return new CustodyExhaustionError(
     `custody accounts exhausted: provider=${provider} accounts=${states}; run ck auth migrate-opencode for gone handles`,
   );
 }
 
-function markGetFailure(error: unknown, account: AccountRuntime): void {
-  if (error instanceof ClaustrumCredentialError) {
-    if (error["class"] === "permanent" && error.code === "not_found") {
-      account.unusable = "gone";
-      return;
-    }
-    if (error["class"] === "auth_required") {
-      account.unusable = "reauth";
-      return;
-    }
-  }
-  account.unusable = "transient";
-}
-
-async function resolveCredential(
-  account: AccountRuntime,
-  client: ServeClient,
-  now: () => number,
-): Promise<ServedCredential> {
-  if (account.cached) return account.cached;
-  const served = await client.getCredential(account.handle);
-  account.cached = served;
-  account.observedAt = now();
-  account.unusable = undefined;
-  return served;
-}
-
 export function createServeFetch(options: CreateServeFetchOptions) {
   const providerSentinel = sentinel(options.provider);
   const now = options.now ?? Date.now;
-  const accounts: AccountRuntime[] = options.accounts.map((account) => ({ ...account }));
+  const accounts: AccountRuntime[] = options.accounts.map((account) => ({ account }));
+  const freshness = options.freshness ?? new FreshnessController({
+    provider: options.provider,
+    shape: options.shape ?? "api",
+    accounts: options.accounts,
+    client: options.client,
+    now,
+    log: options.log,
+  });
 
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const snapshot = await snapshotRequest(input, init, providerSentinel);
@@ -108,25 +81,23 @@ export function createServeFetch(options: CreateServeFetchOptions) {
       throw new CustodySplitError("local credential is real while custody handles remain; migrate or restore ownership");
     }
 
-    for (const account of accounts) {
+    for (const { account } of accounts) {
       const currentTime = now();
-      if (account.unusable === "gone" || account.unusable === "reauth") continue;
-      if (account.cooldownUntil !== undefined && account.cooldownUntil > currentTime) continue;
-
-      let served: ServedCredential;
-      try {
-        served = await resolveCredential(account, options.client, now);
-      } catch (error) {
-        markGetFailure(error, account);
-        options.log?.(`provider=${options.provider} account=${account.label} state=${account.unusable}`);
-        continue;
-      }
+      const served = await freshness.resolve(account);
+      if (!served) continue;
 
       const attempt = { material: served.material, recordVersion: served.recordVersion };
       const response = await options.upstreamFetch(snapshot.withMaterial(attempt.material));
       if (response.status >= 200 && response.status < 400) return response;
 
       if (response.status === 401) {
+        options.log?.warn({
+          provider: options.provider,
+          label: account.label,
+          credentialId: account.credential_id,
+          recordVersion: attempt.recordVersion,
+          httpStatus: 401,
+        });
         await discard(response);
         try {
           await options.client.reportAuthFailure({
@@ -136,23 +107,35 @@ export function createServeFetch(options: CreateServeFetchOptions) {
             reporterSource: "direct",
           });
         } finally {
-          account.cached = undefined;
+          freshness.invalidate(account);
         }
         continue;
       }
       if (response.status === 429) {
-        account.cooldownUntil = currentTime + cooldownFromRetryAfter(response.headers.get("Retry-After"), currentTime);
+        freshness.cooldown(account, cooldownFromRetryAfter(response.headers.get("Retry-After"), currentTime));
+        options.log?.warn({
+          provider: options.provider,
+          label: account.label,
+          credentialId: account.credential_id,
+          httpStatus: 429,
+        });
         await discard(response);
         continue;
       }
       if (response.status === 402) {
-        account.cooldownUntil = currentTime + 60 * 60 * 1_000;
+        freshness.cooldown(account, 60 * 60 * 1_000);
+        options.log?.warn({
+          provider: options.provider,
+          label: account.label,
+          credentialId: account.credential_id,
+          httpStatus: 402,
+        });
         await discard(response);
         continue;
       }
       return response;
     }
 
-    throw exhaustion(options.provider, accounts, now());
+    throw exhaustion(options.provider, accounts, freshness);
   };
 }
