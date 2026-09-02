@@ -10,8 +10,8 @@
 //! `open_sqlite`: if the daemon is running it holds the lease, so the CLI's acquire
 //! fails and the operator is told to stop the daemon, making "while the daemon is
 //! stopped" a structural precondition rather than an honor-system one. A plain route
-//! consumer (transport key only, no master key, no lease) cannot reach this path at
-//! all — there is no running-vault admin surface.
+//! consumer (transport key only, no master key, no lease) cannot reach these writes;
+//! secret reads remain capability-gated on the consumer route.
 //!
 //! Every write goes through the epoch-fenced path and appends an audit-chain entry
 //! (flagged as an admin write) atomically with the mutation. Bootstrap (first run)
@@ -24,6 +24,7 @@
 //!             `--payload-file` bytes exactly, and do not accept `--expires-ms`.
 //!   mint-signing-key --id signing:<provider>[:<generation>] [--replace]
 //!   import    --source opencode|pi|antigravity --id <id> --json <file>
+//!   migrate-opencode [--dry-run] [--replace] [--force-shape] [--restore <provider>]
 //!   invalidate --id <id>
 //!   rotate-master-key
 //!   mint-handle --id <id>                      print a fresh handle (once)
@@ -44,12 +45,24 @@ use std::process::ExitCode;
 mod admin_client;
 #[path = "cli_support/api_key_login.rs"]
 mod api_key_login;
+#[allow(dead_code)]
+#[path = "cli_support/credential_client.rs"]
+mod credential_client;
 #[path = "cli_support/google_login.rs"]
 mod google_login;
 #[path = "cli_support/login_listener.rs"]
 mod login_listener;
+#[path = "cli_support/opencode_accounts.rs"]
+mod opencode_accounts;
+#[allow(dead_code)]
+#[path = "cli_support/opencode_files.rs"]
+mod opencode_files;
+#[path = "cli_support/opencode_migration.rs"]
+mod opencode_migration;
 #[path = "cli_support/provider_login.rs"]
 mod provider_login;
+#[path = "cli_support/route_client.rs"]
+mod route_client;
 
 use base64::Engine;
 use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor, StoreError};
@@ -247,6 +260,8 @@ fn run() -> Result<(), CliError> {
         "put" => cmd_put(&global, &args),
         "mint-signing-key" => cmd_mint_signing_key(&global, &args),
         "import" => cmd_import(&global, &args),
+        "migrate-opencode" => opencode_migration::cmd_migrate_opencode(&global, &args),
+        "opencode-account" => opencode_accounts::cmd_opencode_account(&global, &args),
         "login" => cmd_login(&global, &args),
         "invalidate" => cmd_invalidate(&global, &args),
         "reactivate" => cmd_reactivate(&global, &args),
@@ -322,6 +337,20 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
         ],
         "mint-signing-key" => &["--id"],
         "import" => &["--source", "--provider", "--id", "--json", "--adapter"],
+        "migrate-opencode" => &[
+            "--restore",
+            "--auth-file",
+            "--handle-file",
+            "--provider",
+            "--serve-by",
+        ],
+        "opencode-account" => &[
+            "--provider",
+            "--label",
+            "--key-file",
+            "--before",
+            "--handle-file",
+        ],
         "login" => &["--provider", "--id", "--payload-file", "--account"],
         "invalidate" | "reactivate" | "mint-handle" | "revoke-all-handles" | "remove" => &["--id"],
         "logout" => &["--provider", "--id"],
@@ -339,11 +368,16 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
         "mint-signing-key" => &["--replace"],
         "import" => &["--replace"],
         "login" => &["--replace", "--no-listener", "--device"],
+        "migrate-opencode" => &["--dry-run", "--replace", "--force-shape"],
         _ => &[],
     };
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if command == "opencode-account" && matches!(arg.as_str(), "add" | "remove" | "list") {
+            i += 1;
+            continue;
+        }
         if bool_flags.contains(&arg.as_str()) {
             i += 1;
             continue;
@@ -380,6 +414,8 @@ fn usage_short() -> String {
         put                 ingest an api key, session cookie, or opaque secret\n\
         mint-signing-key    generate and custody a new Ed25519 signing key\n\
         import              import from opencode/pi/gemini-cli/antigravity\n\
+        migrate-opencode    custody OpenCode api auth entries idempotently\n\
+        opencode-account    add/remove/list labeled OpenCode api accounts\n\
        mint-handle         mint a capability handle for a credential\n\
        revoke-handle       revoke one capability handle\n\
        revoke-all-handles  revoke every handle for a credential\n\
@@ -503,6 +539,36 @@ fn help_verb(verb: &str) -> String {
                --provider selects an account by email/index, default activeIndex);\n\
              --adapter overrides the method-derived refresh adapter;\n\
              --replace overwrites an existing id (fix a wrong-source import; keeps handles)."
+        }
+        "migrate-opencode" => {
+            "ck auth migrate-opencode [--dry-run] [--replace] [--force-shape] [--restore <provider>]\n\
+             \x20                     [--auth-file <path>] [--handle-file <path>] [--provider <id>]...\n\
+             \x20                     [--serve-by <plugin-id>]\n\
+             \n\
+             Move OpenCode api entries into the vault as apikey:<provider>:main, write a\n\
+             capability handle file, then replace the auth entry with a provider tombstone.\n\
+             Re-running identical material is a no-op; different material refuses unless\n\
+             --replace is explicit. --provider is repeatable and preserves the requested\n\
+             provider order. OAuth and wellknown entries are skipped by default.\n\
+             \n\
+              --dry-run prints non-secret compare verdicts and stops before every write.\n\
+              Providers whose api key leaves the generic fetch seam are refused with source\n\
+              citations. --force-shape overrides that availability-only refusal and prints the\n\
+              concrete sentinel consequence.\n\
+             --restore <provider> safely writes an api entry back, revokes recorded handles,\n\
+             and removes that provider from the handle file. --restore cannot combine with\n\
+             --dry-run or --replace. The default --serve-by is opencode-claustrum."
+        }
+        "opencode-account" => {
+            "ck auth opencode-account add --provider <id> --label <label> --key-file <path|-> \
+             [--before <label>] [--handle-file <path>]\n\
+             ck auth opencode-account remove --provider <id> --label <label> \
+             [--handle-file <path>]\n\
+             ck auth opencode-account list [--provider <id>] [--handle-file <path>]\n\
+              Add, remove, or list labeled api accounts in a provider already migrated by
+              migrate-opencode. Keys are read from a file or stdin, never argv; stdin trims one
+              terminal LF or CRLF. List prints
+             labels, credential ids, lifecycle state, and record versions only."
         }
         "mint-handle" => {
             "ck auth mint-handle --id <id>\n\
@@ -3063,6 +3129,7 @@ fn cmd_usable(global: &GlobalArgs) -> Result<(), CliError> {
             global.data_dir.display()
         )));
     }
+    warn_unsafe_opencode_tombstones();
     let conn = usable::open_store_read_only(&db).map_err(|e| CliError::Io(e.to_string()))?;
 
     // Resolve the slot the STORE names, exactly as the daemon does. A rotation that
@@ -3214,6 +3281,40 @@ fn cmd_usable(global: &GlobalArgs) -> Result<(), CliError> {
     println!("  for a provider-rejected credential is the `needs_reauth` state, which a");
     println!("  consumer sets via report_auth_failure and the health gauge already counts.");
     Ok(())
+}
+
+fn warn_unsafe_opencode_tombstones() {
+    let auth_path = opencode_files::default_auth_path();
+    if !auth_path.exists() {
+        return;
+    }
+    let entries = match opencode_files::read_auth_entries(&auth_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!(
+                "WARN: OpenCode auth file {} could not be inspected for unsafe custody tombstones: {error}",
+                auth_path.display()
+            );
+            return;
+        }
+    };
+    for (provider, entry) in entries {
+        if !opencode_migration::is_api_tombstone(&entry, &provider) {
+            continue;
+        }
+        match opencode_migration::unsafe_provider_shape(&provider) {
+            Ok(Some(shape)) => println!(
+                "WARN: OpenCode tombstone provider={provider} shape={} why={} source={}; run ck auth migrate-opencode --restore {provider}",
+                shape.shape_names(),
+                shape.why(),
+                shape.sites(),
+            ),
+            Ok(None) => {}
+            Err(error) => println!(
+                "WARN: OpenCode provider shape table could not classify {provider}: {error}"
+            ),
+        }
+    }
 }
 
 /// Verify the tamper-evidence chain, WITHOUT stopping the daemon.

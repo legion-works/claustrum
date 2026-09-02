@@ -93,6 +93,49 @@ jobs:
         with:
           path: claustrum
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Bun install
+        run: bun install --frozen-lockfile
+
+      - name: Bun build
+        run: bun run build
+
+      - name: Bun typecheck
+        run: bun run typecheck
+
+      - name: Bun test packages
+        # The Unix-only files below use POSIX mode bits (0o600 / 0o640 / 0o777) that
+        # `chmod()` cannot express on Windows and that `handles.ts` validates against;
+        # the `/proc/self/fd` descriptor-closure probe is Linux-only. They would
+        # either no-op the write and fail the mode check, or read a directory that
+        # does not exist there. The platform-agnostic subset still exercises wire
+        # codecs, sentinel substitution, the four-cell injection table, freshness,
+        # oauth tick, exhaustion, and split-custody refusal — the bulk of the suite.
+        # Unix-only files excluded on Windows:
+        #   - packages/opencode/src/tests/config-hook.test.ts (chmod mode bits, /proc/self/fd)
+        #   - packages/opencode/src/tests/serve.test.ts (chmod mode bits for handles fixture)
+        # Pinned to bash: Windows runners default to pwsh and the matrix-arm `[[ ]]` test would
+        # not run there at all. GitHub Windows images ship bash; the same shell choice is used
+        # by the inbound-contract / endpoint-hosts / path-rendering / threshold-controls steps
+        # for the same reason.
+        # The hermetic env (XDG_RUNTIME_DIR / CLAUSTRUM_SUBC_CONNECTION) is set on both legs
+        # so a stray `bun test packages` invocation cannot reach for the daemon's default
+        # connection path on a runner whose env is otherwise unset.
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            XDG_RUNTIME_DIR=/nonexistent CLAUSTRUM_SUBC_CONNECTION=/nonexistent/x.json \
+              bun test packages/opencode/src/tests/freshness.test.ts \
+                       packages/opencode/src/tests/lifecycle.test.ts \
+                       packages/opencode/src/tests/contracts.test.ts \
+                       packages/client
+          else
+            bun run test:hermetic
+          fi
+
       # This repo path-deps the private cortexkit/subconscious (subc wire) and
       # cortexkit/commons (storage libs) siblings. The default GITHUB_TOKEN is
       # scoped to this repo only, so mint a short-lived token from the org-installed
@@ -199,7 +242,7 @@ jobs:
       # Without this the gated binaries would rot unnoticed until the next rename, which
       # is the worst moment to discover they no longer compile.
       - name: Clippy (conformance seams)
-        run: cargo clippy --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools,opencode-test-seam -- -D warnings
 
       - name: Test
         run: cargo test --locked --workspace --all-targets
@@ -210,7 +253,13 @@ jobs:
       # lease-lock release) and compile to nothing on Windows, so the step is harmless
       # there.
       - name: Security-conformance suite (crash-safety seams)
-        run: cargo test --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam
+        run: cargo test --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam,opencode-test-seam
+
+      - name: OpenCode custody crash cuts
+        if: matrix.os == 'ubuntu'
+        run: |
+          cargo test --locked -p credentials-module --features opencode-test-seam --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
+          cargo test --locked -p credentials-module --features opencode-test-seam --test cli_opencode the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle
 
       # Run the #[ignore]'d real-daemon e2e (incl. the on-the-wire malicious-client
       # harness) under a real supervised subc-core. This is the ONLY layer that
@@ -239,13 +288,11 @@ jobs:
 
   # WHAT A FORK PR CAN ACTUALLY BE TOLD, given that the job above cannot run for it.
   #
-  # THE NAME IS THE CONTRACT. It says "no build, no tests" because a green check on a
-  # PR reads as "the suite passed", and a green that means less than it looks is worse
-  # than the red it replaces -- the contributor stops looking, and so do I. Everything
-  # here is a source scan; nothing compiles, nothing runs the vault.
+  # The cargo suite cannot run for a fork, but the public Bun workspace can. A green
+  # check still does not exercise the vault or its private sibling dependencies.
   #
-  # These four are the entire fork-safe set, and that is a measured claim rather than a
-  # convenient one: every other gate arm either shells to cargo (which loads the
+  # The source scans and Bun workspace are the fork-safe set. Every remaining gate arm
+  # either shells to cargo (which loads the
   # workspace manifest, which path-deps the private siblings, which a fork cannot check
   # out) or reads ../subconscious directly, as the inbound-contract check does. Verified
   # by reading each script for sibling references and cargo invocations -- 0 and 0 for
@@ -256,7 +303,7 @@ jobs:
   # constant that drifted from its manifest, and a Windows-breaking path comparison --
   # every one of which has fired here in the last fortnight.
   fork-safe:
-    name: Fork-safe checks (no build, no tests)
+    name: Fork-safe checks
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name != github.repository
@@ -265,17 +312,33 @@ jobs:
       - name: Checkout claustrum
         uses: actions/checkout@v5
 
-      - name: Source scans that need no build
+      - name: Source scans
         run: |
           python3 scripts/check-doc-status.py
           python3 scripts/check-path-rendering.py
           python3 scripts/threshold-controls.py
           python3 scripts/endpoint-hosts.py
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Bun install
+        run: bun install --frozen-lockfile
+
+      - name: Bun build
+        run: bun run build
+
+      - name: Bun typecheck
+        run: bun run typecheck
+
+      - name: Bun test packages
+        run: bun run test:hermetic
+
       - name: State what this job did NOT check
         run: |
-          echo "Source scans only. This job did NOT build, ran no test, and did not"
-          echo "exercise the vault. The full suite needs private sibling repositories"
+          echo "Source scans and Bun package checks only. This job did NOT exercise the vault."
+          echo "The full Rust suite needs private sibling repositories"
           echo "that a fork PR cannot check out, so a maintainer runs scripts/gate.sh"
           echo "on the merge candidate before it lands. Green here is necessary and"
           echo "nowhere near sufficient."
