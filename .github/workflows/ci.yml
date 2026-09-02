@@ -117,12 +117,21 @@ jobs:
         # Unix-only files excluded on Windows:
         #   - packages/opencode/src/tests/config-hook.test.ts (chmod mode bits, /proc/self/fd)
         #   - packages/opencode/src/tests/serve.test.ts (chmod mode bits for handles fixture)
+        # Pinned to bash: Windows runners default to pwsh and the matrix-arm `[[ ]]` test would
+        # not run there at all. GitHub Windows images ship bash; the same shell choice is used
+        # by the inbound-contract / endpoint-hosts / path-rendering / threshold-controls steps
+        # for the same reason.
+        # The hermetic env (XDG_RUNTIME_DIR / CLAUSTRUM_SUBC_CONNECTION) is set on both legs
+        # so a stray `bun test packages` invocation cannot reach for the daemon's default
+        # connection path on a runner whose env is otherwise unset.
+        shell: bash
         run: |
           if [[ "${{ matrix.os }}" == "windows" ]]; then
-            bun test packages/opencode/src/tests/freshness.test.ts \
-                     packages/opencode/src/tests/lifecycle.test.ts \
-                     packages/opencode/src/tests/contracts.test.ts \
-                     packages/client
+            XDG_RUNTIME_DIR=/nonexistent CLAUSTRUM_SUBC_CONNECTION=/nonexistent/x.json \
+              bun test packages/opencode/src/tests/freshness.test.ts \
+                       packages/opencode/src/tests/lifecycle.test.ts \
+                       packages/opencode/src/tests/contracts.test.ts \
+                       packages/client
           else
             bun run test:hermetic
           fi

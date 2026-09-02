@@ -187,7 +187,7 @@ export class FreshnessController {
     const generation = ++slot.generation;
     const inFlight = this.#client.getCredential(account.handle, minTtlMs)
       .then((served) => {
-        if (version !== this.#version || generation !== slot.generation) return undefined;
+        if (!this.#isCurrent(slot, version, generation)) return undefined;
         slot.cached = served;
         slot.observedAt = this.#now();
         slot.cooldownUntil = undefined;
@@ -196,7 +196,7 @@ export class FreshnessController {
         return served;
       })
       .catch((error: unknown) => {
-        if (version === this.#version && generation === slot.generation) this.#markFailure(account, slot, error);
+        if (this.#isCurrent(slot, version, generation)) this.#markFailure(account, slot, error);
         return undefined;
       })
       .finally(() => {
@@ -204,6 +204,10 @@ export class FreshnessController {
       });
     slot.inFlight = inFlight;
     return inFlight;
+  }
+
+  #isCurrent(slot: Slot, version: string | undefined, generation: number): boolean {
+    return version === this.#version && generation === slot.generation;
   }
 
   async #bounded(account: FreshnessAccount, promise: Promise<ServedCredential | undefined>, expire = true): Promise<ServedCredential | undefined> {

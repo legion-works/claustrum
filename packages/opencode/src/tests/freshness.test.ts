@@ -26,8 +26,9 @@ function credential(material: string, recordVersion = 1): ServedCredential {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 class FakeClient {
@@ -168,6 +169,35 @@ describe("custody freshness", () => {
 
     expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("fresh"));
     expect(client.gets).toHaveLength(2);
+  });
+
+  test("a stale rejection cannot poison a new revision's slot", async () => {
+    // P1: an older-revision get that rejects with not_found must not flip the
+    // new slot to `gone`. Without the catch-arm fence, a late permanent/not_found
+    // would block the replacement credential until another handle revision.
+    let version = "one";
+    const pending = deferred<ServedCredential>();
+    const gone = new ClaustrumCredentialError("not_found", "permanent", "gone");
+    let calls = 0;
+    const client = new FakeClient(async () => {
+      calls += 1;
+      if (calls === 1) return pending.promise;
+      return credential("fresh", 9);
+    });
+    const freshness = controller({ client, handleVersion: () => version });
+
+    const first = freshness.resolve(apiAccounts[0]!);
+    await Promise.resolve();
+    version = "two";
+    await freshness.resolve(apiAccounts[0]!); // bumps generation on the same slot
+    pending.reject(gone);
+    await first;
+    await Promise.resolve();
+
+    // The new slot must not have inherited the rejection's `gone` state, and a
+    // subsequent resolve must reach the client and return the new material.
+    expect(freshness.state(apiAccounts[0]!)).not.toBe("gone");
+    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("fresh", 9));
   });
 
   test("keeps the longer account cooldown when a later response asks for less time", () => {

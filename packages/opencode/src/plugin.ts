@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ClaustrumClient, detectClaustrumConnection } from "@cortexkit/claustrum-client";
 import type { Plugin } from "@opencode-ai/plugin";
 
+import { boundedBytesText, readBounded, type BoundedReadDescriptor } from "./bounded-read";
 import {
   AuthFileValidationError,
   CustodyAuthReadError,
@@ -29,11 +30,9 @@ const AUTH_SCAN_CARRY_BYTES = TOMBSTONE_PREFIX.length + 64;
 const SCANNED_PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const FORBIDDEN_PROVIDER_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
-type AuthFileReadResult = { bytesRead: number };
-type AuthFileDescriptor = {
+type AuthFileDescriptor = BoundedReadDescriptor & {
   stat(): Promise<{ size: number }>;
   readFile(options: { encoding: "utf8" }): Promise<string>;
-  read?(buffer: Uint8Array, offset: number, length: number, position: number): AuthFileReadResult | Promise<AuthFileReadResult>;
   close(): Promise<void>;
 };
 
@@ -77,27 +76,19 @@ export async function readAuthFile(
     try {
       const statSize = (await descriptor.stat()).size;
       // The stat-then-read pair is a TOCTOU window: a writer that grows the file
-      // between the two reads can drive the read past the cap. A bounded `read()`
-      // into a cap+1 buffer closes the window — exactly cap bytes is parsed, and
-      // one byte more than the cap is rejected up front without consuming the entire
-      // descriptor. Real FileHandle (node:fs/promises.open) exposes `read()`; tests
-      // inject one too. The legacy `readFile` path is preserved for descriptors that
-      // do not — its cap check is the size on the initial stat, which is the same
-      // TOCTOU hole the bounded path exists to close.
+      // between the two reads can drive the read past the cap. `readBounded` closes
+      // the window by reading into a cap+1 buffer — one byte past the cap is rejected
+      // up front without consuming the entire descriptor. The legacy `readFile` path
+      // is preserved for descriptors that do not expose `read()`; its cap check is
+      // the size on the initial stat, which is the same TOCTOU hole the bounded path
+      // exists to close.
       if (descriptor.read) {
         if (statSize > AUTH_FILE_MAX_BYTES) {
           throw new AuthFileValidationError("auth file exceeds 1 MiB");
         }
-        const buffer = Buffer.alloc(AUTH_FILE_MAX_BYTES + 1);
-        let total = 0;
-        while (total < AUTH_FILE_MAX_BYTES + 1) {
-          const chunk = await descriptor.read(buffer, total, buffer.length - total, total);
-          if (chunk.bytesRead === 0) break;
-          total += chunk.bytesRead;
-        }
-        if (total > AUTH_FILE_MAX_BYTES) throw new AuthFileValidationError("auth file exceeds 1 MiB");
-        const text = buffer.subarray(0, total).toString("utf8");
-        value = parseSecretJson(text, "auth file");
+        const { buffer, bytes } = await readBounded(descriptor, AUTH_FILE_MAX_BYTES);
+        if (bytes === -1) throw new AuthFileValidationError("auth file exceeds 1 MiB");
+        value = parseSecretJson(boundedBytesText(bytes, buffer), "auth file");
       } else {
         if (statSize > AUTH_FILE_MAX_BYTES) {
           throw new AuthFileValidationError("auth file exceeds 1 MiB");

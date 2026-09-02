@@ -446,6 +446,38 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await expect(readHandleFile(files.handles)).rejects.toThrow("symlink");
   });
 
+  test("refuses a handle descriptor that grows past the 256 KiB cap between fstat and read", async () => {
+    // Sibling to `refuses an auth descriptor that grows past the 1 MiB cap`: the same
+    // TOCTOU hole on the handle path. Inject an `open` that fstat returns a small size
+    // for but whose `read` returns a payload that exceeds the cap. Bounded read
+    // refuses with the existing `exceeds 256 KiB` message before consuming the whole
+    // descriptor.
+    let requestedLengths: number[] = [];
+    let totalBuffered = 0;
+    await expect(readHandleFile("/tmp/handles.json", {
+      stat: async () => ({ isFile: () => false, isDirectory: () => true, mode: 0o40755, uid: process.getuid?.() }),
+      open: async () => {
+        const chunk = Buffer.alloc(512 * 1024, 0x78);
+        return {
+          stat: async () => ({ isFile: () => true, mode: 0o100600, uid: process.getuid?.(), size: 256 }),
+          readFile: async () => chunk.toString("utf8"),
+          read: (buffer, offset, length, position) => {
+            requestedLengths.push(length);
+            const remaining = chunk.length - position;
+            if (remaining <= 0) return { bytesRead: 0 };
+            const slice = chunk.subarray(position, position + Math.min(length, remaining));
+            buffer.set(slice, offset);
+            totalBuffered += slice.length;
+            return { bytesRead: slice.length };
+          },
+          close: async () => {},
+        };
+      },
+    })).rejects.toThrow("256 KiB");
+    expect(requestedLengths.every((length) => length <= 256 * 1024 + 1)).toBe(true);
+    expect(totalBuffered).toBeLessThanOrEqual(256 * 1024 + 1);
+  });
+
   test("refuses an oversized auth.json with a typed auth-read failure before it can configure custody", async () => {
     const files = await fixture("large-auth-file");
     await writeHandles(files.handles, handles("deepseek"));
@@ -475,7 +507,9 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     // content read must not slip a tombstone past the cap. The bounded descriptor
     // read stops at cap+1 and refuses without ever returning the full payload.
     let reads = 0;
-    let buffered = Buffer.alloc(0);
+    let requestedLengths: number[] = [];
+    let totalBuffered = 0;
+    let closed = 0;
     await expect(readAuthFile("/tmp/auth.json", async () => {
       const chunk = Buffer.alloc(2 * 1024 * 1024, 0x78); // 2 MiB of `x` would exceed
       return {
@@ -483,18 +517,23 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
         readFile: async () => { reads += 1; return chunk.toString("utf8"); },
         read: (buffer, offset, length, position) => {
           reads += 1;
+          requestedLengths.push(length);
           const remaining = chunk.length - position;
           if (remaining <= 0) return { bytesRead: 0 };
           const slice = chunk.subarray(position, position + Math.min(length, remaining));
           buffer.set(slice, offset);
-          buffered = Buffer.concat([buffered, slice]);
+          totalBuffered += slice.length;
           return { bytesRead: slice.length };
         },
-        close: async () => {},
+        close: async () => { closed += 1; },
       };
     })).rejects.toThrow("exceeds 1 MiB");
+    // The bounded reader asked for AT MOST cap+1 bytes (1 MiB + 1) on every call;
+    // anything beyond proves the TOCTOU hole is still open.
     expect(reads).toBeGreaterThan(0);
-    expect(buffered.length).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(requestedLengths.every((length) => length <= 1024 * 1024 + 1)).toBe(true);
+    expect(totalBuffered).toBeLessThanOrEqual(1024 * 1024 + 1);
+    expect(closed).toBe(1);
   });
 
   test("parses auth content read through the bounded descriptor when it fits the cap", async () => {

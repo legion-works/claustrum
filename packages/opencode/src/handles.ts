@@ -4,6 +4,7 @@ import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 
+import { boundedBytesText, readBounded, type BoundedReadDescriptor } from "./bounded-read";
 import { HandleFileValidationError } from "./errors";
 import { parseSecretJson, SecretJsonParseError } from "./secret-json";
 
@@ -98,11 +99,9 @@ type HandleFileStat = {
   uid?: number;
   mtimeMs?: number;
 };
-type HandleFileReadResult = { bytesRead: number };
-type HandleFileDescriptor = {
+type HandleFileDescriptor = BoundedReadDescriptor & {
   stat(): Promise<HandleFileStat>;
   readFile(options: { encoding: "utf8" }): Promise<string>;
-  read?(buffer: Uint8Array, offset: number, length: number, position: number): HandleFileReadResult | Promise<HandleFileReadResult>;
   close(): Promise<void>;
 };
 export type HandleFileIo = {
@@ -112,7 +111,8 @@ export type HandleFileIo = {
   // Injectable descriptor: when supplied, the handle reader uses a bounded read into a
   // cap+1 buffer instead of `readFile()`. The cap check then catches a TOCTOU write that
   // grows the file between fstat and read; the unbounded path is preserved for callers
-  // that pre-trust the source.
+  // that pre-trust the source. Mirrors `ConfigHookDependencies.authReader`'s `openFile`
+  // so a grow-after-fstat handle test can exercise the same bounded read path.
   open?: (path: string) => Promise<HandleFileDescriptor>;
   currentUid?: () => number | undefined;
 };
@@ -137,14 +137,15 @@ async function readHandleSnapshot(path = defaultHandleFilePath(), io: HandleFile
   const stat = io.stat ?? nodeStat;
   const lstat = io.lstat ?? nodeLstat;
   const read = io.readFile ?? readFile;
-  let descriptor: Awaited<ReturnType<typeof nodeOpen>> | undefined;
+  const openFd = io.open ?? ((candidate: string) => nodeOpen(candidate, constants.O_RDONLY | constants.O_NOFOLLOW));
+  let descriptor: HandleFileDescriptor | undefined;
   try {
     let metadata: HandleFileStat;
     try {
       if (io.lstat || io.readFile) {
         metadata = await lstat(path);
       } else {
-        descriptor = await nodeOpen(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        descriptor = await openFd(path);
         metadata = await descriptor.stat();
       }
     } catch (error) {
@@ -179,17 +180,12 @@ async function readHandleSnapshot(path = defaultHandleFilePath(), io: HandleFile
       if (descriptor) {
         // Bounded read on the already-fstat'd descriptor closes the TOCTOU window a
         // size-only check leaves open: a writer that grows the file between fstat and
-        // readFile would otherwise drive the read past the cap. cap+1 bytes are read;
-        // anything beyond refuses before the full descriptor is consumed.
-        const buffer = Buffer.alloc(HANDLE_FILE_MAX_BYTES + 1);
-        let total = 0;
-        while (total < HANDLE_FILE_MAX_BYTES + 1) {
-          const chunk = await descriptor.read!(buffer, total, buffer.length - total, total);
-          if (chunk.bytesRead === 0) break;
-          total += chunk.bytesRead;
-        }
-        if (total > HANDLE_FILE_MAX_BYTES) invalid("handle file exceeds 256 KiB");
-        source = buffer.subarray(0, total).toString("utf8");
+        // readFile would otherwise drive the read past the cap. The shared helper
+        // allocates the cap+1 buffer and reports bytes > cap so the message is uniform
+        // across auth and handle paths.
+        const { buffer, bytes } = await readBounded(descriptor, HANDLE_FILE_MAX_BYTES);
+        if (bytes === -1) invalid("handle file exceeds 256 KiB");
+        source = boundedBytesText(bytes, buffer);
       } else {
         source = await read(path, "utf8");
       }
