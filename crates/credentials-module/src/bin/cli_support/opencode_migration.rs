@@ -364,7 +364,7 @@ fn is_api_tombstone(entry: &Value, provider: &str) -> bool {
     entry == &api_tombstone(provider)
 }
 
-fn read_handles_or_empty(path: &Path) -> Result<opencode_files::HandleFile, CliError> {
+pub(crate) fn read_handles_or_empty(path: &Path) -> Result<opencode_files::HandleFile, CliError> {
     if path.exists() {
         opencode_files::read_handle_file(path).map_err(files_error)
     } else {
@@ -406,7 +406,7 @@ fn account_handle(
     }
 }
 
-fn finalize_superseded(
+pub(crate) fn finalize_superseded(
     global: &GlobalArgs,
     handles: &mut opencode_files::HandleFile,
     provider: &str,
@@ -524,7 +524,7 @@ fn update_specific_handle(
     Ok(())
 }
 
-fn remove_account(
+pub(crate) fn remove_account(
     handles: &mut opencode_files::HandleFile,
     provider: &str,
     label: &str,
@@ -546,7 +546,7 @@ fn remove_account(
     Ok(())
 }
 
-fn write_and_verify_handles(
+pub(crate) fn write_and_verify_handles(
     path: &Path,
     handles: &opencode_files::HandleFile,
 ) -> Result<(), CliError> {
@@ -554,7 +554,7 @@ fn write_and_verify_handles(
     opencode_files::verify_handle_written(path, handles).map_err(files_error)
 }
 
-fn mint_handle(global: &GlobalArgs, id: &str) -> Result<String, CliError> {
+pub(crate) fn mint_handle(global: &GlobalArgs, id: &str) -> Result<String, CliError> {
     commit_admin(
         global,
         AdminOpBody::MintHandle {

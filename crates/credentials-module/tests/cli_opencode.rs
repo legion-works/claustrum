@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor};
@@ -390,6 +391,27 @@ impl MigrationRig {
             .arg(&self.key)
             .output()
             .expect("run ck-auth")
+    }
+
+    fn run_with_stdin(&self, args: &[&str], input: &[u8]) -> Output {
+        let mut child = cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ck-auth");
+        child
+            .stdin
+            .take()
+            .expect("stdin pipe")
+            .write_all(input)
+            .expect("write stdin");
+        child.wait_with_output().expect("wait ck-auth")
     }
 
     fn migrate(&self, extra: &[&str]) -> Output {
@@ -920,4 +942,257 @@ fn the_migrate_opencode_leaves_a_legacy_two_segment_record_untouched() {
     let listed = rig.run(&["list"]);
     assert!(String::from_utf8_lossy(&listed.stdout).contains("apikey:deepseek"));
     assert!(String::from_utf8_lossy(&listed.stdout).contains("apikey:deepseek:main"));
+}
+
+#[test]
+fn the_opencode_account_add_imports_mints_and_appends_the_account() {
+    let rig = MigrationRig::new(
+        "account-add",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let key_file = rig.root.join("alt.key");
+    std::fs::write(&key_file, b"alt-secret").expect("key file");
+
+    let out = rig.run(&[
+        "opencode-account",
+        "add",
+        "--provider",
+        "deepseek",
+        "--label",
+        "alt",
+        "--key-file",
+        key_file.to_str().unwrap(),
+        "--handle-file",
+        rig.handles.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let handles = opencode_files::read_handle_file(&rig.handles).expect("handles");
+    assert_eq!(
+        handles.providers[0]
+            .accounts
+            .iter()
+            .map(|account| account.label.as_str())
+            .collect::<Vec<_>>(),
+        ["main", "alt"]
+    );
+    let store = open_vault(&rig);
+    assert_eq!(
+        store
+            .get("apikey:deepseek:alt")
+            .expect("alt record")
+            .payload,
+        b"alt-secret"
+    );
+}
+
+#[test]
+fn the_opencode_account_add_before_preserves_the_requested_order() {
+    let rig = MigrationRig::new(
+        "account-before",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let key_file = rig.root.join("priority.key");
+    std::fs::write(&key_file, b"priority-secret").expect("key file");
+
+    let out = rig.run(&[
+        "opencode-account",
+        "add",
+        "--provider",
+        "deepseek",
+        "--label",
+        "priority",
+        "--key-file",
+        key_file.to_str().unwrap(),
+        "--before",
+        "main",
+        "--handle-file",
+        rig.handles.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let handles = opencode_files::read_handle_file(&rig.handles).expect("handles");
+    assert_eq!(
+        handles.providers[0]
+            .accounts
+            .iter()
+            .map(|account| account.label.as_str())
+            .collect::<Vec<_>>(),
+        ["priority", "main"]
+    );
+}
+
+#[test]
+fn the_opencode_account_add_key_file_stdin_does_not_echo_material() {
+    let rig = MigrationRig::new(
+        "account-stdin",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let material = b"stdin-secret";
+    let out = rig.run_with_stdin(
+        &[
+            "opencode-account",
+            "add",
+            "--provider",
+            "deepseek",
+            "--label",
+            "stdin",
+            "--key-file",
+            "-",
+            "--handle-file",
+            rig.handles.to_str().unwrap(),
+        ],
+        material,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(!stdout.contains("stdin-secret") && !stderr.contains("stdin-secret"));
+}
+
+#[test]
+fn the_opencode_account_remove_revokes_the_handle_but_keeps_the_vault_record() {
+    let rig = MigrationRig::new(
+        "account-remove",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let key_file = rig.root.join("alt.key");
+    std::fs::write(&key_file, b"alt-secret").expect("key file");
+    assert!(rig
+        .run(&[
+            "opencode-account",
+            "add",
+            "--provider",
+            "deepseek",
+            "--label",
+            "alt",
+            "--key-file",
+            key_file.to_str().unwrap(),
+            "--handle-file",
+            rig.handles.to_str().unwrap(),
+        ])
+        .status
+        .success());
+    let handles = opencode_files::read_handle_file(&rig.handles).expect("handles");
+    let alt_handle = handles.providers[0].accounts[1].handle.clone();
+
+    let out = rig.run(&[
+        "opencode-account",
+        "remove",
+        "--provider",
+        "deepseek",
+        "--label",
+        "alt",
+        "--handle-file",
+        rig.handles.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let handles = opencode_files::read_handle_file(&rig.handles).expect("handles");
+    assert_eq!(handles.providers[0].accounts.len(), 1);
+    let store = open_vault(&rig);
+    assert!(store.resolve_handle(&alt_handle).is_err());
+    assert_eq!(
+        store
+            .get("apikey:deepseek:alt")
+            .expect("record remains")
+            .payload,
+        b"alt-secret"
+    );
+}
+
+#[test]
+fn the_opencode_account_list_shows_non_secret_state_without_credential_get() {
+    let rig = MigrationRig::new(
+        "account-list",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let conn = spawn_migration_route_daemon(
+        &rig.root,
+        observed.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let out = rig.run(&[
+        "opencode-account",
+        "list",
+        "--provider",
+        "deepseek",
+        "--handle-file",
+        rig.handles.to_str().unwrap(),
+        "--subc",
+        conn.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("main") && stdout.contains("active") && stdout.contains("v1"));
+    assert!(!stdout.contains("main-secret"));
+    assert!(!observed
+        .lock()
+        .expect("observed")
+        .iter()
+        .any(|method| method == "credential.get"));
+}
+
+#[test]
+fn the_opencode_account_rejects_duplicate_or_invalid_labels_without_any_write() {
+    let rig = MigrationRig::new(
+        "account-invalid",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let auth_before = std::fs::read(&rig.auth).expect("auth before");
+    let handles_before = std::fs::read(&rig.handles).expect("handles before");
+    let audit_before = rig.run(&["audit"]).stdout;
+    let key_file = rig.root.join("invalid.key");
+    std::fs::write(&key_file, b"should-not-store").expect("key file");
+
+    for (label, refusal) in [
+        ("main", "account label 'main' already exists"),
+        ("bad:label", "must not contain ':'"),
+    ] {
+        let out = rig.run(&[
+            "opencode-account",
+            "add",
+            "--provider",
+            "deepseek",
+            "--label",
+            label,
+            "--key-file",
+            key_file.to_str().unwrap(),
+            "--handle-file",
+            rig.handles.to_str().unwrap(),
+        ]);
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(refusal),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(&rig.auth).expect("auth after"), auth_before);
+        assert_eq!(
+            std::fs::read(&rig.handles).expect("handles after"),
+            handles_before
+        );
+    }
+    assert_eq!(rig.run(&["audit"]).stdout, audit_before);
+    assert!(String::from_utf8_lossy(&rig.run(&["list"]).stdout).contains("apikey:deepseek:main"));
 }

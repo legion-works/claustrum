@@ -52,6 +52,8 @@ mod credential_client;
 mod google_login;
 #[path = "cli_support/login_listener.rs"]
 mod login_listener;
+#[path = "cli_support/opencode_accounts.rs"]
+mod opencode_accounts;
 #[allow(dead_code)]
 #[path = "cli_support/opencode_files.rs"]
 mod opencode_files;
@@ -259,6 +261,7 @@ fn run() -> Result<(), CliError> {
         "mint-signing-key" => cmd_mint_signing_key(&global, &args),
         "import" => cmd_import(&global, &args),
         "migrate-opencode" => opencode_migration::cmd_migrate_opencode(&global, &args),
+        "opencode-account" => opencode_accounts::cmd_opencode_account(&global, &args),
         "login" => cmd_login(&global, &args),
         "invalidate" => cmd_invalidate(&global, &args),
         "reactivate" => cmd_reactivate(&global, &args),
@@ -341,6 +344,13 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
             "--provider",
             "--serve-by",
         ],
+        "opencode-account" => &[
+            "--provider",
+            "--label",
+            "--key-file",
+            "--before",
+            "--handle-file",
+        ],
         "login" => &["--provider", "--id", "--payload-file", "--account"],
         "invalidate" | "reactivate" | "mint-handle" | "revoke-all-handles" | "remove" => &["--id"],
         "logout" => &["--provider", "--id"],
@@ -364,6 +374,10 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if command == "opencode-account" && matches!(arg.as_str(), "add" | "remove" | "list") {
+            i += 1;
+            continue;
+        }
         if bool_flags.contains(&arg.as_str()) {
             i += 1;
             continue;
@@ -401,6 +415,7 @@ fn usage_short() -> String {
         mint-signing-key    generate and custody a new Ed25519 signing key\n\
         import              import from opencode/pi/gemini-cli/antigravity\n\
         migrate-opencode    custody OpenCode api auth entries idempotently\n\
+        opencode-account    add/remove/list labeled OpenCode api accounts\n\
        mint-handle         mint a capability handle for a credential\n\
        revoke-handle       revoke one capability handle\n\
        revoke-all-handles  revoke every handle for a credential\n\
@@ -540,6 +555,16 @@ fn help_verb(verb: &str) -> String {
              --restore <provider> safely writes an api entry back, revokes recorded handles,\n\
              and removes that provider from the handle file. --restore cannot combine with\n\
              --dry-run or --replace. The default --serve-by is opencode-claustrum."
+        }
+        "opencode-account" => {
+            "ck auth opencode-account add --provider <id> --label <label> --key-file <path|-> \
+             [--before <label>] [--handle-file <path>]\n\
+             ck auth opencode-account remove --provider <id> --label <label> \
+             [--handle-file <path>]\n\
+             ck auth opencode-account list [--provider <id>] [--handle-file <path>]\n\
+             Add, remove, or list labeled api accounts in a provider already migrated by
+             migrate-opencode. Keys are read from a file or stdin, never argv. List prints
+             labels, credential ids, lifecycle state, and record versions only."
         }
         "mint-handle" => {
             "ck auth mint-handle --id <id>\n\
