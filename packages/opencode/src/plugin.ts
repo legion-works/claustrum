@@ -70,6 +70,13 @@ async function readAuth(path: string, reader: (path: string) => Promise<Record<s
   return reader(path);
 }
 
+const NATIVE_LLM_TRUE = new Set(["true", "yes", "on", "1"]);
+
+export function nativeLlmEnabled(raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  return NATIVE_LLM_TRUE.has(raw.trim().toLowerCase());
+}
+
 function logError(log: CustodyLogger, error: Error, provider: string) {
   log.error({
     provider,
@@ -205,7 +212,11 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             continue;
           }
 
-          if (process.env.OPENCODE_EXPERIMENTAL_NATIVE_LLM === "1") {
+          // The native runtime reads `provider.options.apiKey` directly and never consults
+          // `options.fetch` (session/llm/native-runtime.ts, statusWithFetch), so with it on the
+          // sentinel would go to the wire as the key. OpenCode parses the flag with Effect's
+          // Config.boolean (effect/runtime-flags.ts:57): true/yes/on/1, case-insensitive.
+          if (nativeLlmEnabled(process.env.OPENCODE_EXPERIMENTAL_NATIVE_LLM)) {
             const refusal = new CustodyNativeRuntimeError(
               "OpenCode native LLM mode bypasses the custody fetch seam; unset OPENCODE_EXPERIMENTAL_NATIVE_LLM",
             );

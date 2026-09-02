@@ -431,18 +431,39 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(logs[0]).toContain("custody_disabled");
   });
 
-  test("refuses observed tombstones when native LLM mode bypasses the fetch seam", async () => {
-    const files = await fixture("native-llm");
-    await writeHandles(files.handles, handles("deepseek"));
-    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
-    useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", "1");
-    const logs: string[] = [];
-    const cfg = config("deepseek");
+  // OpenCode parses the flag with Effect's Config.boolean (runtime-flags.ts:57), which accepts
+  // true/yes/on/1 case-insensitively; a guard that only fires on "1" would read as covered
+  // while `=true` sends the sentinel to the wire.
+  for (const value of ["1", "true", "TRUE", "yes", "on"]) {
+    test(`refuses observed tombstones when native LLM mode is enabled with ${JSON.stringify(value)}`, async () => {
+      const files = await fixture(`native-llm-${value.toLowerCase()}`);
+      await writeHandles(files.handles, handles("deepseek"));
+      await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+      useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", value);
+      const logs: string[] = [];
+      const cfg = config("deepseek");
 
-    await hook(cfg, { log: (line) => logs.push(line) });
+      await hook(cfg, { log: (line) => logs.push(line) });
 
-    expect(logs.join("\n")).toContain("CustodyNativeRuntimeError");
-    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
-      .rejects.toThrow("native LLM");
-  });
+      expect(logs.join("\n")).toContain("CustodyNativeRuntimeError");
+      await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
+        .rejects.toThrow("native LLM");
+    });
+  }
+
+  for (const value of ["0", "false", "off", "no", ""]) {
+    test(`serves normally when native LLM mode is off with ${JSON.stringify(value)}`, async () => {
+      const files = await fixture(`native-llm-off-${value || "empty"}`);
+      await writeHandles(files.handles, handles("deepseek"));
+      await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+      useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", value);
+      const logs: string[] = [];
+      const cfg = config("deepseek");
+
+      await hook(cfg, { log: (line) => logs.push(line) });
+
+      expect(logs.join("\n")).not.toContain("CustodyNativeRuntimeError");
+      expect(cfg.provider.deepseek.options?.apiKey).toBe(sentinel("deepseek"));
+    });
+  }
 });
