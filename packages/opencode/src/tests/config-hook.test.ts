@@ -455,9 +455,8 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
 
     await hook(cfg, { log: (line) => logs.push(line) });
 
-    expect(logs.join("\n")).toContain("AuthFileValidationError");
-    expect(logs.join("\n")).toContain("exceeds 1 MiB");
-    await expectRefusal(cfg, "deepseek", /auth-read failure.*exceeds 1 MiB/);
+    expect(logs.join("\n")).toContain("CustodyAuthReadError");
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*AuthFileValidationError.*custody auth source refused/);
   });
 
   test("refuses an oversized tombstone when the handle file is absent", async () => {
@@ -468,7 +467,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
 
     await hook(cfg);
 
-    await expectRefusal(cfg, "deepseek", /auth-read failure.*1 MiB.*bounded tombstone scan/);
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*AuthFileValidationError.*bounded tombstone scan/);
   });
 
   test("skips a hostile auth provider key rather than materializing it after a handle read failure", async () => {
@@ -532,7 +531,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
 
     await hook(cfg);
 
-    await expectRefusal(cfg, "deepseek", /auth-read failure.*invalid JSON.*bounded tombstone scan/);
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*AuthFileValidationError.*bounded tombstone scan/);
   });
 
   test("refuses every scanned tombstone without disturbing configured providers absent from the scan", async () => {
@@ -577,9 +576,8 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
 
     await hook(cfg, { log: (line) => logs.push(line) });
 
-    expect(logs.join("\n")).toContain("AuthFileValidationError");
-    expect(logs.join("\n")).toContain("invalid JSON");
-    await expectRefusal(cfg, "deepseek", /auth-read failure.*invalid JSON/);
+    expect(logs.join("\n")).toContain("CustodyAuthReadError");
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*AuthFileValidationError.*custody auth source refused/);
   });
 
   test("refuses an unreadable auth source for every owned handle provider", async () => {
@@ -605,9 +603,9 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
       log: (line) => logs.push(line),
     });
 
-    expect(logs.join("\n")).toContain("auth-read failure");
-    await expectRefusal(cfg, "deepseek", /auth-read failure.*permission denied/);
-    await expectRefusal(cfg, "xai", /auth-read failure.*permission denied/);
+    expect(logs.join("\n")).toContain("CustodyAuthReadError");
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*Error.*custody auth source refused/);
+    await expectRefusal(cfg, "xai", /auth-read failure.*Error.*custody auth source refused/);
   });
 
   test("preserves provider and account order when injecting each owned tombstone", async () => {
@@ -783,8 +781,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
 
     await hook(cfg, { log: (line) => logs.push(line) });
 
-    expect(logs.join("\n")).toContain("tombstone_shape_drift");
-    expect(logs.join("\n")).toContain("metadata");
+    expect(logs.join("\n")).toContain("CustodyOrphanError");
     expect(logs.join("\n")).not.toContain(sentinel("deepseek"));
     await expectRefusal(cfg, "azure", /tombstone_shape_drift/);
   });
@@ -873,6 +870,33 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(logs.join("\n")).toContain("HandleFileValidationError");
   });
 
+  test("never echoes malformed auth or handle input in custody errors", async () => {
+    const files = await fixture("secret-json-parse-canary");
+    const apiKey = "k".repeat(40);
+    const logs: string[] = [];
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeFile(files.auth, `{"deepseek": ${apiKey}}`);
+    await chmod(files.auth, 0o600);
+    const authCfg = config("deepseek");
+    prepareRefusalProbe(authCfg, "deepseek");
+
+    await hook(authCfg, { log: (line) => logs.push(line) });
+    await expectRefusal(authCfg, "deepseek", /auth-read failure/);
+
+    await writeFile(files.handles, `{"providers": ${HANDLE}}`);
+    await chmod(files.handles, 0o600);
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+    const handleCfg = config("deepseek");
+    prepareRefusalProbe(handleCfg, "deepseek");
+
+    await hook(handleCfg, { log: (line) => logs.push(line) });
+    await expectRefusal(handleCfg, "deepseek", /handle file unavailable/);
+
+    const evidence = logs.join("\n");
+    expect(evidence).not.toContain(apiKey);
+    expect(evidence).not.toContain(HANDLE);
+  });
+
   test("reconnects after a transient connection failure and its backoff", async () => {
     let now = 0;
     let available = false;
@@ -947,7 +971,6 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
       await hook(cfg, { log: (line) => logs.push(line) });
 
       expect(logs.join("\n")).toContain("CustodyNativeRuntimeError");
-      expect(logs.join("\n")).toContain(`OPENCODE_EXPERIMENTAL_NATIVE_LLM=${value}`);
       await expectRefusal(cfg, "deepseek", new RegExp(`OPENCODE_EXPERIMENTAL_NATIVE_LLM=${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
     });
   }

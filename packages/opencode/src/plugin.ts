@@ -17,6 +17,7 @@ import {
 import { FreshnessController } from "./freshness";
 import { defaultHandleFilePath, handleFileRevision, OUR_PLUGIN_ID, readHandleFile, type OpenCodeHandleFileV1 } from "./handles";
 import { createLogger, serializedLogSink, type CustodyLogger, type LogSink } from "./log";
+import { parseSecretJson } from "./secret-json";
 import { createServeFetch, type ServeClient } from "./serve";
 import { carriesSentinel, decodeHostAuthEntry, isProviderTombstone, sentinel, sentinelShapeDrift, TOMBSTONE_PREFIX } from "./tombstone";
 
@@ -55,7 +56,7 @@ async function readAuthFile(path: string): Promise<Record<string, unknown>> {
     }
     let value: unknown;
     try {
-      value = JSON.parse(await readFile(path, "utf8"));
+        value = parseSecretJson(await readFile(path, "utf8"), "auth file");
     } catch (error) {
       if (error instanceof AuthFileValidationError) throw error;
       throw new AuthFileValidationError(`auth file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
@@ -78,7 +79,7 @@ async function readAuth(path: string, reader: (path: string) => Promise<Record<s
   const content = process.env.OPENCODE_AUTH_CONTENT;
   if (content) {
     try {
-      const value: unknown = JSON.parse(content);
+        const value: unknown = parseSecretJson(content, "auth file");
       if (!value || typeof value !== "object" || Array.isArray(value)) {
         return {};
       }
@@ -129,7 +130,7 @@ async function scanAuthSource(path: string, onHit: (provider: string) => void): 
   const content = process.env.OPENCODE_AUTH_CONTENT;
   if (content) {
     try {
-      const value: unknown = JSON.parse(content);
+      const value: unknown = parseSecretJson(content, "auth file");
     } catch {
       return scanAuthTombstones(path, onHit);
     }
@@ -156,13 +157,13 @@ function logError(log: CustodyLogger, error: Error, provider: string) {
     provider,
     errorClass: error.name,
     errorCode: (error as NodeJS.ErrnoException).code,
-    errorMessage: error.message,
+    errorMessage: `${error.name}: custody operation refused`,
   });
 }
 
 function authReadRefusal(error: unknown, fromBoundedScan = false): CustodyAuthReadError {
-  const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-  return new CustodyAuthReadError(`auth-read failure: ${cause}${fromBoundedScan ? "; provider list came from a bounded tombstone scan" : ""}`);
+  const cause = error instanceof Error ? error.name : "unknown error";
+  return new CustodyAuthReadError(`auth-read failure: ${cause}: custody auth source refused${fromBoundedScan ? "; provider list came from a bounded tombstone scan" : ""}`);
 }
 
 export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependencies = {}): Plugin {
@@ -276,7 +277,7 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         } catch (error) {
           const typed = error instanceof HandleFileValidationError
             ? error
-            : new HandleFileValidationError(error instanceof Error ? error.message : String(error));
+            : new HandleFileValidationError(`handle reader failed: ${error instanceof Error ? error.name : "unknown error"}`);
           logError(log, typed, "handle-file");
           let auth: Record<string, unknown>;
           try {

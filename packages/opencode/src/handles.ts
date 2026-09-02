@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
 
 import { HandleFileValidationError } from "./errors";
+import { parseSecretJson, SecretJsonParseError } from "./secret-json";
 
 export const OUR_PLUGIN_ID = "opencode-claustrum";
 const HANDLE_FILE_MAX_BYTES = 256 * 1024;
@@ -166,16 +167,18 @@ async function readHandleSnapshot(path = defaultHandleFilePath(), io: HandleFile
     } catch (error) {
       invalid(`cannot read handle file: ${error instanceof Error ? error.message : String(error)}`);
     }
+    let value: unknown;
     try {
-      return {
-        file: parseHandleFile(JSON.parse(source)),
-        source,
-        mtimeMs: metadata.mtimeMs,
-      };
+      value = parseSecretJson(source, "handle file");
     } catch (error) {
-      if (error instanceof HandleFileValidationError) throw error;
-      invalid(`handle file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+      if (error instanceof SecretJsonParseError) invalid("handle file contains invalid JSON");
+      throw error;
     }
+    return {
+      file: parseHandleFile(value),
+      source,
+      mtimeMs: metadata.mtimeMs,
+    };
   } finally {
     await descriptor?.close();
   }
