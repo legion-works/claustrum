@@ -55,14 +55,23 @@ export function asCredentialError(
   const result = isRecord(response) && isRecord(response.result) ? response.result : undefined
   const error = result && isRecord(result.error) ? result.error : undefined
   const rawClass = error?.class
-  const errorClass =
-    typeof rawClass === 'string' && (ERROR_CLASS_WIRE_SET as readonly string[]).includes(rawClass)
-      ? rawClass as ClaustrumCredentialErrorClass
-      : 'transient'
-  if (typeof rawClass !== 'string' || errorClass === 'transient' && rawClass !== 'transient') {
-    logUnknownClass(typeof rawClass === 'string' ? rawClass : 'unknown')
-  }
-  const code = error && typeof error.code === 'string' ? error.code : fallbackCode
+  const rawCode = error?.code
+  // The wire contract in `crates/credentials-module/src/read_surface.rs` carries BOTH
+  // `class` and `code` on every error envelope. A frame missing `code` is therefore
+  // malformed: even when `class` is itself in the wire set, the half-formed envelope
+  // is not a valid permanent reason — preserving `class` would let a malicious or
+  // broken peer drive a `gone` action with `{ error: { class: 'permanent' } }`.
+  // Anthropic's cut-line rule (unknown or absent class → transient) generalises to
+  // any malformed envelope; both fields must be present and class must be known.
+  const hasValidClass = typeof rawClass === 'string' && (ERROR_CLASS_WIRE_SET as readonly string[]).includes(rawClass)
+  const hasCode = typeof rawCode === 'string'
+  const envelopeValid = hasValidClass && hasCode
+  const errorClass: ClaustrumCredentialErrorClass = envelopeValid
+    ? rawClass as ClaustrumCredentialErrorClass
+    : 'transient'
+  if (typeof rawClass !== 'string') logUnknownClass('unknown')
+  else if (!hasValidClass) logUnknownClass(rawClass)
+  const code = hasCode ? rawCode : fallbackCode
   return new ClaustrumCredentialError(code, errorClass, credentialErrorAction(errorClass))
 }
 

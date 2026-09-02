@@ -43,9 +43,23 @@ const TEMP_SUFFIX = '.connection.json'
 // produce a different token (sanitized user on macOS, the literal "unknown" if all of
 // the lookups miss). The glob is the only way to mirror the daemon without re-deriving
 // the token (which is filesystem-side-effecting per the Rust side comment).
+// The home tier resolves from `$HOME` directly, mirroring `non_empty_env("HOME")` in
+// `discover_subc_connection_file`. The Rust code does NOT fall back to a `getpwuid`-style
+// lookup; the client must not either, or an operator who points HOME at a per-test
+// fixture (CI, a second user, a sandboxed run) loses the daemon they started there.
+function homeTierPath(): string | undefined {
+  const homeEnv = process.env.HOME?.trim()
+  return homeEnv ? join(homeEnv, '.local', 'share', 'cortexkit', 'run', PRODUCTION_FILE_NAME) : undefined
+}
+
 function highestPriorityAbsentMarker(): string {
   const runtime = process.env.XDG_RUNTIME_DIR?.trim()
   if (runtime) return join(runtime, PRODUCTION_FILE_NAME)
+  const home = homeTierPath()
+  if (home) return home
+  // HOME unset — the Rust tier falls through to the tempdir glob with no fixed path.
+  // Surface the os-reported home so `detectClaustrumConnection` returns an `absent`
+  // path the operator can fix; without this, the caller gets a misleading `./...` path.
   return join(userInfo().homedir, '.local', 'share', 'cortexkit', 'run', PRODUCTION_FILE_NAME)
 }
 
@@ -55,11 +69,8 @@ function findExistingConnectionPath(): string | undefined {
     const p = join(runtime, PRODUCTION_FILE_NAME)
     if (safeIsFile(p)) return p
   }
-  const home = userInfo().homedir
-  if (home) {
-    const p = join(home, '.local', 'share', 'cortexkit', 'run', PRODUCTION_FILE_NAME)
-    if (safeIsFile(p)) return p
-  }
+  const home = homeTierPath()
+  if (home && safeIsFile(home)) return home
   const matches = listSubcConnectionFiles(tmpdir())
   // A single matching file IS the daemon; multiple matches mean different OS users
   // happened to share the temp dir. Picking one would route credential-bearing

@@ -205,6 +205,32 @@ describe("OpenCode custody serve fetch", () => {
     expect(new URL(forwarded).searchParams.get("note")).toBe(`prefix-material-main-suffix`);
   });
 
+  test("forwards a query value whose letter case differs from the sentinel untouched", async () => {
+    // P2: the previous regex used `/gi`, which matched the sentinel letters regardless
+    // of case. An ordinary query value that merely differs in letter case
+    // (`CLAUSTRUM-TOMBSTONE:V1:deepseek`) was substituted with vault material, replacing
+    // a benign query with the real key. Only the hex digits inside `%XX` need to
+    // case-fold; the sentinel letters must match EXACTLY.
+    const requests: Request[] = [];
+    const fetch = serve({ upstream: createUpstream([200], requests) });
+    const upperLetters = SENTINEL.toUpperCase().replace(/:/g, "%3A");
+
+    await fetch(`https://upstream.example/v1/chat?x=${upperLetters}`);
+
+    const forwarded = requests[0]?.url ?? "";
+    // The upper-letter form is NOT the sentinel — it must survive the round trip
+    // byte-for-byte, NOT be replaced with vault material.
+    expect(forwarded).toContain(upperLetters);
+    expect(new URL(forwarded).searchParams.get("x")).toBe("CLAUSTRUM-TOMBSTONE:V1:DEEPSEEK");
+    // And the lowercase-hex sentinel in the same position (hex-only case fold) must
+    // still be substituted, so the existing fail-closed coverage is preserved.
+    const requestsLower: Request[] = [];
+    const fetchLower = serve({ upstream: createUpstream([200], requestsLower) });
+    const lowerHex = encodeURIComponent(SENTINEL).replace(/%[0-9A-F]{2}/g, (m) => m.toLowerCase());
+    await fetchLower(`https://upstream.example/v1/chat?x=${lowerHex}`);
+    expect(new URL(requestsLower[0]?.url ?? "").searchParams.get("x")).toBe("material-main");
+  });
+
   test("refuses a sentinel embedded in the URL pathname after decode", async () => {
     // The pathname branch previously checked only the raw `pathname` string for the
     // sentinel. An encoded form (`claustrum-tombstone%3Av1%3Adeepseek`) survives because

@@ -196,6 +196,49 @@ describe('ClaustrumClient', () => {
     }
   })
 
+  test('default discovery uses process.env.HOME for the home tier, not userInfo().homedir', async () => {
+    // P1: the Rust `discover_subc_connection_file` resolves the home tier from
+    // `non_empty_env("HOME")` directly — no `getpwuid`-style fallback. The client must
+    // mirror this: when HOME is overridden to a fixture dir holding a production
+    // connection file, the client returns that file rather than the real user's
+    // ~/.local/share/cortexkit/run/subc-connection.json. Without the mirror, an
+    // override is silently ignored and a daemon started under the test fixture is
+    // unreachable, leaving vault-backed requests dead.
+    const tempRoot = await mkdtemp(join(tmpdir(), 'claustrum-home-override-'))
+    tempDirs.push(tempRoot)
+    const originalXdg = process.env.XDG_RUNTIME_DIR
+    const originalHome = process.env.HOME
+
+    const homeDir = join(tempRoot, 'home')
+    const { mkdir } = await import('node:fs/promises')
+    await mkdir(homeDir, { recursive: true })
+    const runDir = join(homeDir, '.local', 'share', 'cortexkit', 'run')
+    await mkdir(runDir, { recursive: true })
+    const fixtureFile = join(runDir, 'subc-connection.json')
+    await writeFile(fixtureFile, JSON.stringify({
+      schema: 1,
+      wire_version: PROTOCOL_VERSION,
+      endpoints: [{ host: '127.0.0.1', port: 8765 }],
+      key: Array.from({ length: 32 }, () => 3),
+      daemon_id: Array.from({ length: 16 }, () => 4),
+      pid: 3,
+      daemon_ver: 'home-override',
+    }))
+    await chmod(fixtureFile, 0o600)
+
+    process.env.XDG_RUNTIME_DIR = undefined
+    process.env.HOME = homeDir
+
+    try {
+      expect(getDefaultClaustrumConnectionPath()).toBe(fixtureFile)
+    } finally {
+      process.env.HOME = originalHome
+      if (originalXdg === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = originalXdg
+      await rm(fixtureFile, { force: true })
+    }
+  })
+
   test('default discovery refuses ambiguity when multiple connection files share the temp dir', async () => {
     const originalXdg = process.env.XDG_RUNTIME_DIR
     const originalHome = process.env.HOME
@@ -349,6 +392,28 @@ describe('ClaustrumClient', () => {
       })
       client.close()
     }
+  })
+
+  test('treats an envelope that omits code as malformed and falls back to transient', async () => {
+    // P2: the wire contract in read_surface.rs says BOTH `class` and `code` are always
+    // present. A frame missing `code` is therefore malformed; treating its `class`
+    // as authoritative lets a malicious or broken peer drive a "gone" action (the
+    // mapping of `permanent`) by sending a half-formed error. The cut-line rule
+    // (Anthropic: unknown or absent class → transient) is the safer fallback: a
+    // malformed envelope is treated as transient and retried.
+    const client = await ClaustrumClient.connect({
+      connector: async () =>
+        new FakeDaemon([
+          { result: { error: { class: 'permanent' } } },
+        ]) as never,
+    })
+
+    await expect(client.getCredential('credential-handle')).rejects.toMatchObject({
+      code: 'invalid_response',
+      class: 'transient',
+      action: 'retry',
+    })
+    client.close()
   })
 
   test('bounds an UNKNOWN error class to transient and logs only the class name', async () => {

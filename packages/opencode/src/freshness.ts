@@ -190,7 +190,23 @@ export class FreshnessController {
     const version = this.#version;
     const generation = ++slot.generation;
     const inFlight = this.#client.getCredential(account.handle, minTtlMs)
-      .then((served) => {
+      .then(async (served) => {
+        // Re-read the handle revision after the RPC completes: a handle file change
+        // mid-RPC means the captured `version` is stale and the served credential may
+        // bind to a different handle record. `#isCurrent` only compares the captured
+        // version against `this.#version`, which doesn't move until the next
+        // `refreshHandleVersion` runs — so without this check, a quiet window between
+        // the RPC settling and the next resolve would accept the stale material.
+        if (this.#handleVersion) {
+          let current: string;
+          try {
+            current = await this.#handleVersion();
+          } catch {
+            // Failed re-read is treated as a version mismatch: refuse to cache.
+            return undefined;
+          }
+          if (current !== version) return undefined;
+        }
         if (!this.#isCurrent(slot, version, generation)) return undefined;
         slot.cached = served;
         slot.observedAt = this.#now();

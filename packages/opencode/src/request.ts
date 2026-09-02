@@ -33,23 +33,49 @@ function substituteQueryValue(value: string, sentinel: string, encodedMaterial: 
 }
 
 // Replaces occurrences of `sentinel` and a case-insensitively-spelled percent
-// encoding of `sentinel` in `value` with `encodedMaterial`. Falls back to a
-// `replaceEvery` of the literal sentinel when encoding cannot be computed (e.g.
-// the sentinel contains a string that the `encodeURIComponent`-then-lower regex
-// disagrees on, which is rare; the literal pass keeps coverage of the by-hand
-// substitution path in that case).
+// encoding of `sentinel` in `value` with `encodedMaterial`. Only the hex digits inside
+// `%XX` may case-fold (an upstream that re-encoded with lowercase hex would otherwise
+// let the sentinel slip past raw substitution); the sentinel's own letters must match
+// EXACTLY, so an ordinary query value that differs only by letter case is forwarded
+// untouched instead of being rewritten with vault material.
 function caseInsensitiveReplace(value: string, sentinel: string, encodedMaterial: string): string {
   const substituted = value.split(sentinel).join(encodedMaterial);
   const encodedSentinel = encodeURIComponent(sentinel);
   if (encodedSentinel === sentinel) return substituted;
-  // The encoded form MUST survive unescaping to the sentinel; an upstream that
-  // matches the decoded form against an allowlist would accept either %3A or %3a.
-  // Case-insensitive flag handles both hex casings since ASCII letters case-fold.
-  const re = new RegExp(escapeForRegex(encodedSentinel), "gi");
-  return substituted.replace(re, encodedMaterial);
+  return substituted.replace(encodedSentinelHexInsensitiveRegex(encodedSentinel), encodedMaterial);
 }
 
 function escapeForRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Builds a regex for `encodedSentinel` that matches the literal sentinel letters
+// EXACTLY but accepts either case for the hex digits inside each `%XX` escape.
+// Without this, an `i`-flagged regex would also case-fold the sentinel's own
+// letters and rewrite an unrelated query value into vault material.
+function encodedSentinelHexInsensitiveRegex(encodedSentinel: string): RegExp {
+  let pattern = "";
+  let i = 0;
+  while (i < encodedSentinel.length) {
+    if (encodedSentinel[i] === "%" && i + 2 < encodedSentinel.length) {
+      const hex = encodedSentinel.slice(i + 1, i + 3);
+      if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+        const c1 = hex[0];
+        const c2 = hex[1];
+        const v1 = /[A-Fa-f]/.test(c1) ? `[${c1.toLowerCase()}${c1.toUpperCase()}]` : c1;
+        const v2 = /[A-Fa-f]/.test(c2) ? `[${c2.toLowerCase()}${c2.toUpperCase()}]` : c2;
+        pattern += `%${v1}${v2}`;
+        i += 3;
+        continue;
+      }
+    }
+    pattern += escapeChar(encodedSentinel[i]);
+    i += 1;
+  }
+  return new RegExp(pattern, "g");
+}
+
+function escapeChar(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 

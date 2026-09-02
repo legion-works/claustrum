@@ -155,6 +155,45 @@ describe("custody freshness", () => {
     ]);
   });
 
+  test("discards a warm whose handle revision changed during the RPC and no concurrent resolve bumped the generation", async () => {
+    // P1: a handle file change mid-RPC must not let an in-flight get repopulate the cache
+    // with a credential that binds to the old handle record. The captured `version` at
+    // warm-start is the only signal available before the RPC resolves; the post-RPC check
+    // re-reads the handle revision and discards the result on mismatch. Without that, the
+    // existing `#isCurrent` (version + generation) check accepts the stale credential:
+    // a generation bump from a CONCURRENT resolve catches the same shape, but traffic
+    // arriving after only the RPC settles — with no in-between resolve — would see it.
+    let version = "one";
+    const pending = deferred<ServedCredential>();
+    let calls = 0;
+    let versionReads = 0;
+    const client = new FakeClient(async () => ++calls === 1 ? pending.promise : credential("after-change"));
+    const freshness = controller({
+      client,
+      handleVersion: () => { versionReads += 1; return version; },
+    });
+
+    const first = freshness.resolve(apiAccounts[0]!);
+    await Promise.resolve();
+    // One read happens up-front in refreshHandleVersion; capture the baseline so the
+    // post-RPC re-read is visible in the count.
+    const readsAfterRefresh = versionReads;
+    expect(readsAfterRefresh).toBeGreaterThanOrEqual(1);
+    // Handle file changes; NO concurrent resolve that would bump the generation.
+    version = "two";
+    pending.resolve(credential("stale"));
+    await first;
+    await Promise.resolve();
+
+    // The post-RPC check re-reads the handle revision at least once more.
+    expect(versionReads).toBeGreaterThan(readsAfterRefresh);
+
+    // Subsequent resolve observes the new version via its own refreshHandleVersion and
+    // issues a fresh RPC; the cached "stale" never reaches the consumer.
+    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("after-change"));
+    expect(client.gets).toHaveLength(2);
+  });
+
   test("does not cache a warm that completed after its handle revision changed", async () => {
     let version = "one";
     const pending = deferred<ServedCredential>();

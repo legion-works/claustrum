@@ -744,6 +744,36 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(cfg.provider.anthropic.options?.apiKey).toBeUndefined();
   });
 
+  test("leaves a sentinel-bearing shape drift owned by another plugin for that owner", async () => {
+    // P1: when `handle.serve` names another plugin and the auth entry carries a sentinel
+    // that does not form a valid provider tombstone (a shape drift), this plugin must NOT
+    // install a refusing fetch. Ownership is the seam: serve=other → leave the entry
+    // entirely alone. The bug was that the sentinel-bearing refusal ran before the
+    // owner check, hijacking anthropic-auth's fetch with a refusing one of ours.
+    //
+    // A real shape drift has to SURVIVE the host decode (which strips excess fields like
+    // `extra`). The shortest such drift is an oauth tombstone plus an `accountId` carrying
+    // the sentinel: decode preserves it, `isProviderTombstone` rejects the 5-key entry,
+    // and `carriesSentinel` still fires on `accountId`.
+    const files = await fixture("other-owner-shape-drift");
+    await writeHandles(files.handles, {
+      version: 1,
+      providers: [{ provider: "anthropic", shape: "oauth", serve: "anthropic-auth", accounts: [{ label: "main", handle: HANDLE, credential_id: "oauth:anthropic:main" }] }],
+    });
+    await writeAuth(files.auth, {
+      anthropic: { ...tombstoneFor("oauth", "anthropic"), accountId: sentinel("anthropic") },
+    });
+    const logs: string[] = [];
+    const cfg = config("anthropic");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("debug");
+    expect(logs.join("\n")).toContain("anthropic-auth");
+    expect(cfg.provider.anthropic.options?.apiKey).toBeUndefined();
+    expect(cfg.provider.anthropic.options?.fetch).toBeUndefined();
+  });
+
   test("uses OPENCODE_AUTH_CONTENT before a differing auth file during config", async () => {
     const files = await fixture("env-config-auth");
     await writeHandles(files.handles, handles("deepseek"));

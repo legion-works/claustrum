@@ -351,9 +351,19 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         for (const provider of providers) {
           const handle = byProvider.get(provider);
           const entry = Object.hasOwn(auth, provider) ? auth[provider] : undefined;
+          const owner = handle?.serve;
+
+          // Ownership is the seam: any `serve` value other than ours leaves the entry
+          // entirely alone. The named owner's plugin is what should see the auth entry;
+          // hijacking its provider with our refusing fetch (or its absence of one)
+          // breaks the contract documented in docs/opencode-custody-design.md.
+          if (owner !== undefined && owner !== OUR_PLUGIN_ID) {
+            log.debug({ provider, errorClass: "other_owner", errorCode: owner });
+            continue;
+          }
+
           const tombstone = isProviderTombstone(entry, provider);
           const consumesTombstone = carriesSentinel(entry);
-          const owner = handle?.serve;
 
           if (!tombstone) {
             if (consumesTombstone) {
@@ -380,13 +390,10 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             }
             continue;
           }
-          if (owner !== OUR_PLUGIN_ID) {
-            if (owner) log.debug({ provider, errorClass: "other_owner", errorCode: owner });
-            else {
-              const refusal = new CustodyOrphanError("tombstone has no serving handle; run ck auth migrate-opencode");
-              logError(log, refusal, provider);
-              configureRefusal(provider, refusal);
-            }
+          if (owner === undefined) {
+            const refusal = new CustodyOrphanError("tombstone has no serving handle; run ck auth migrate-opencode");
+            logError(log, refusal, provider);
+            configureRefusal(provider, refusal);
             continue;
           }
           if (handle!.shape !== (entry as { type?: unknown }).type) {
