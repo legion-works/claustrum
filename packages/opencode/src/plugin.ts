@@ -228,14 +228,27 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         controllers = [];
         const cfg = input as MutableConfig;
         const providerConfig = cfg.provider ?? (cfg.provider = Object.create(null) as Record<string, ConfigProvider>);
+        const materializeProvider = (provider: string): ConfigProvider | undefined => {
+          if (!SCANNED_PROVIDER_ID.test(provider) || FORBIDDEN_PROVIDER_IDS.has(provider)) {
+            log.error({
+              provider: "invalid-provider",
+              errorClass: "CustodyOrphanError",
+              errorCode: "invalid_provider_id",
+              errorMessage: `refusing invalid provider id len=${provider.length} prefix=${JSON.stringify(provider.slice(0, 12))}`,
+            });
+            return undefined;
+          }
+          return Object.hasOwn(providerConfig, provider)
+            ? providerConfig[provider]!
+            : (providerConfig[provider] = {});
+        };
         const configureRefusal = (provider: string, error: Error) => {
           // A raw scan can name a provider only in a note or a mis-keyed entry. Creating that
           // provider makes it visible to OpenCode, but preserves the required host-load superset;
           // cfg.provider is therefore the only hit storage: O(unique ids), like the host's own
           // provider entries. This is availability/UI direction only because the sentinel is non-secret.
-          const configured = Object.hasOwn(providerConfig, provider)
-            ? providerConfig[provider]!
-            : (providerConfig[provider] = {});
+          const configured = materializeProvider(provider);
+          if (!configured) return;
           configured.options = {
             ...(configured.options ?? {}),
             fetch: async () => { throw error; },
@@ -245,10 +258,6 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
           const refusal = authReadRefusal(error, true);
           const providers = new Set(ownedProviders);
           const refuse = (provider: string) => {
-            if ((!SCANNED_PROVIDER_ID.test(provider) || FORBIDDEN_PROVIDER_IDS.has(provider)) && !Object.hasOwn(providerConfig, provider)) {
-              logError(log, refusal, provider);
-              return;
-            }
             logError(log, refusal, provider);
             configureRefusal(provider, refusal);
           };
@@ -327,9 +336,8 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
                 `local credential is real while custody handles remain; run ck auth migrate-opencode --provider ${provider} to re-tombstone, or ck auth migrate-opencode --restore ${provider} to use the local credential`,
               );
               logError(log, error, provider);
-              const configured = Object.hasOwn(cfg.provider, provider)
-                ? cfg.provider[provider]!
-                : (cfg.provider[provider] = {});
+              const configured = materializeProvider(provider);
+              if (!configured) continue;
               configured.options = {
                 ...(configured.options ?? {}),
                 fetch: async () => { throw error; },
@@ -365,9 +373,8 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             continue;
           }
 
-          const configured = Object.hasOwn(cfg.provider, provider)
-            ? cfg.provider[provider]!
-            : (cfg.provider[provider] = {});
+          const configured = materializeProvider(provider);
+          if (!configured) continue;
           const freshness = new FreshnessController({
             provider,
             shape: handle!.shape,
@@ -395,9 +402,9 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
                 try {
                   current = await handleReader(defaultHandleFilePath());
                 } catch (error) {
-                  throw new CustodyOwnershipError(
-                    `could not verify custody handle ownership: ${error instanceof Error ? error.message : String(error)}`,
-                  );
+                    throw new CustodyOwnershipError(
+                    `could not verify custody handle ownership: ${error instanceof Error ? error.name : "unknown error"}`,
+                    );
                 }
                 const currentProvider = current.providers.find((candidate) => candidate.provider === provider);
                 if (currentProvider?.serve !== OUR_PLUGIN_ID || JSON.stringify(currentProvider) !== JSON.stringify(handle)) {

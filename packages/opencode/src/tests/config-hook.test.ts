@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { readdirSync } from "node:fs";
 import { chmod, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -412,6 +413,29 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(await handleFileRevision(files.handles)).not.toContain("ckh_");
   });
 
+  test("closes descriptors when handle validation rejects before reading", async () => {
+    if (process.platform !== "linux") return;
+    const files = await fixture("fd-close-on-validation");
+    await writeHandles(files.handles, handles("deepseek"));
+    await chmod(files.handles, 0o640);
+    const before = readdirSync("/proc/self/fd").length;
+    for (let index = 0; index < 5; index += 1) await expect(readHandleFile(files.handles)).rejects.toThrow("0600");
+    expect(readdirSync("/proc/self/fd").length).toBe(before);
+  });
+
+  test("derives a handle revision from the same bounded source it validates", async () => {
+    const source = JSON.stringify(handles("deepseek"));
+    let reads = 0;
+    const io = {
+      lstat: async () => ({ isFile: () => true, mode: 0o100600, uid: process.getuid?.() }),
+      stat: async () => ({ isFile: () => false, isDirectory: () => true, mode: 0o40755, uid: process.getuid?.() }),
+      readFile: async () => ++reads === 1 ? source : "x".repeat(512 * 1024),
+    };
+
+    await expect(handleFileRevision("/tmp/handles.json", io)).resolves.not.toContain("x".repeat(20));
+    expect(reads).toBe(1);
+  });
+
   test("rejects a symlinked handle file", async () => {
     const files = await fixture("symlink-handle-file");
     const target = join(ROOT, "symlink-handle-file", "target.json");
@@ -445,6 +469,33 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await hook(cfg);
 
     await expectRefusal(cfg, "deepseek", /auth-read failure.*1 MiB.*bounded tombstone scan/);
+  });
+
+  test("skips a hostile auth provider key rather than materializing it after a handle read failure", async () => {
+    const files = await fixture("hostile-auth-key");
+    await writeFile(files.handles, "not json");
+    await chmod(files.handles, 0o600);
+    await writeAuth(files.auth, { ["__proto__"]: tombstoneFor("api", "__proto__") });
+    const cfg = config();
+
+    await hook(cfg);
+
+    expect(Object.getPrototypeOf(cfg.provider)).toBe(Object.prototype);
+    expect("options" in {}).toBe(false);
+  });
+
+  test("skips a hostile scanned provider key rather than materializing it", async () => {
+    const files = await fixture("hostile-scanned-key");
+    await writeFile(files.handles, "not json");
+    await chmod(files.handles, 0o600);
+    await writeFile(files.auth, `${"x".repeat(1024 * 1024)}${sentinel("__proto__")}`);
+    await chmod(files.auth, 0o600);
+    const cfg = config();
+
+    await hook(cfg);
+
+    expect(Object.getPrototypeOf(cfg.provider)).toBe(Object.prototype);
+    expect("options" in {}).toBe(false);
   });
 
   test("finds a tombstone after 1 MiB when its sentinel crosses a scan chunk boundary", async () => {
@@ -817,9 +868,9 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
 
     await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example", {
       headers: { Authorization: `Bearer ${sentinel("deepseek")}` },
-    })).rejects.toThrow(/could not verify custody handle ownership.*mode must be exactly 0600/);
+    })).rejects.toThrow("could not verify custody handle ownership: HandleFileValidationError");
     expect(forwarded).toBe(0);
-    expect(logs.join("\n")).toContain("mode must be exactly 0600");
+    expect(logs.join("\n")).toContain("HandleFileValidationError");
   });
 
   test("reconnects after a transient connection failure and its backoff", async () => {

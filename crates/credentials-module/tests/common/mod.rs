@@ -85,7 +85,7 @@ pub fn tmp_root(tag: &str) -> PathBuf {
 /// checking.
 ///
 /// Callers here create the directory themselves, so this cannot refuse a collision the
-/// way `cli_admin::tmp_root` does; the nanosecond component is what prevents one.
+/// way `tmp_root` does; the nanosecond component only makes one unlikely.
 pub fn unique_temp_dir(label: &str) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()

@@ -261,7 +261,7 @@ export class FreshnessController {
       this.#version = current;
     } catch (error) {
       const refusal = new CustodyOwnershipError(
-        `could not verify custody handle ownership: ${error instanceof Error ? error.message : String(error)}`,
+        `could not verify custody handle ownership: ${error instanceof Error ? error.name : "unknown error"}`,
       );
       this.#log?.error({ provider: this.#provider, errorClass: refusal.name, errorMessage: refusal.message });
       throw refusal;

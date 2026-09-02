@@ -29,7 +29,7 @@ export async function snapshotRequest(
       url.search = query
         .split("&")
         .map((part) => part.includes(sentinel)
-          ? replaceEvery(part, sentinel, material)
+          ? replaceEvery(part, sentinel, encodedMaterial)
           : replaceEvery(part, encodedSentinel, encodedMaterial))
         .join("&");
 
@@ -38,9 +38,13 @@ export async function snapshotRequest(
         substitutedHeaders.set(name, replaceEvery(value, sentinel, material));
       }
       if (methodOverride === "GET") {
+        // RFC 9110 representation and payload headers describe a body this replay omits.
         substitutedHeaders.delete("content-length");
         substitutedHeaders.delete("content-type");
+        substitutedHeaders.delete("content-encoding");
         substitutedHeaders.delete("transfer-encoding");
+        substitutedHeaders.delete("content-language");
+        substitutedHeaders.delete("content-location");
       }
       if (url.toString().includes(sentinel) || [...substitutedHeaders.values()].some((value) => value.includes(sentinel))) {
         throw new Error("custody sentinel remains in a forwarded request");

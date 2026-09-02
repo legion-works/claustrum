@@ -1,3 +1,7 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import type { OpenCodeHandleFileV1 } from "./handles";
 import type { OpenCodeAuthEntry } from "./tombstone";
 
@@ -9,19 +13,6 @@ export type GoldenTombstone = {
   };
 };
 
-export const goldenTombstone: GoldenTombstone = {
-  version: 1,
-  fixtures: {
-    api: { provider: "deepseek", entry: { type: "api", key: "claustrum-tombstone:v1:deepseek" } },
-    oauth: {
-      provider: "anthropic",
-      entry: {
-        type: "oauth",
-        refresh: "claustrum-tombstone:v1:anthropic",
-        access: "claustrum-tombstone:v1:anthropic",
-        expires: 0,
-      },
-    },
-  },
-};
+const goldenPath = join(dirname(fileURLToPath(import.meta.url)), "..", "golden", "tombstone.json");
+export const goldenTombstone = JSON.parse(readFileSync(goldenPath, "utf8")) as GoldenTombstone;
 export type { OpenCodeHandleFileV1 };

@@ -128,6 +128,20 @@ describe("OpenCode custody serve fetch", () => {
     expect(url.searchParams.getAll("key")).toEqual(["material-main", "before-material-main-after"]);
   });
 
+  test("percent-encodes substituted query material while preserving untouched query bytes", async () => {
+    const requests: Request[] = [];
+    const material = "a&b=c+d%25#e";
+    const fetch = serve({ client: clientWith(credential(material, 7)), upstream: createUpstream([200], requests) });
+
+    await fetch(`https://upstream.example/v1/chat?a=%2F&x=${SENTINEL}&b=1+2`);
+
+    const url = new URL(requests[0]?.url ?? "");
+    expect(url.search).toContain("a=%2F");
+    expect(url.search).toContain("b=1+2");
+    expect([...url.searchParams.keys()]).toHaveLength(3);
+    expect(url.searchParams.get("x")).toBe(material);
+  });
+
   test("reports the credential version used for a 401, clears its cache, and tries the next account", async () => {
     const requests: Request[] = [];
     let currentRecordVersion = 7;
@@ -203,9 +217,15 @@ describe("OpenCode custody serve fetch", () => {
       },
     });
 
-    expect((await fetch("https://upstream.example/start", { method: "POST", body: "body" })).status).toBe(200);
+    expect((await fetch("https://upstream.example/start", {
+      method: "POST",
+      body: "body",
+      headers: { "content-encoding": "gzip", "content-language": "en" },
+    })).status).toBe(200);
     expect(requests[1]?.method).toBe("GET");
     expect(requests[1]?.headers.get("content-length")).toBeNull();
+    expect(requests[1]?.headers.get("content-encoding")).toBeNull();
+    expect(requests[1]?.headers.get("content-language")).toBeNull();
   });
 
   test("keeps the GET and empty body after a 303 followed by a 307", async () => {
@@ -312,6 +332,22 @@ describe("OpenCode custody serve fetch", () => {
     });
 
     await expect(fetch(`https://upstream.example/?key=${encodeURIComponent(SENTINEL)}`)).rejects.toThrow("upstream request failed");
+    expect(JSON.stringify(entries)).not.toContain("MATERIAL-CANARY");
+  });
+
+  test("does not expose verifier error messages", async () => {
+    const entries: unknown[] = [];
+    const fetch = createServeFetch({
+      provider: PROVIDER,
+      accounts: [accounts[0]!],
+      client: clientWith(),
+      readAuthEntry: () => tombstoneFor("api", PROVIDER),
+      verifyOwnership: async () => { throw new Error("MATERIAL-CANARY https://upstream.example/?key=MATERIAL-CANARY"); },
+      upstreamFetch: async () => new Response("must not forward"),
+      log: { debug() {}, info() {}, warn() {}, error(entry) { entries.push(entry); } },
+    });
+
+    await expect(fetch("https://upstream.example/v1/chat")).rejects.toThrow("could not verify custody handle ownership: Error");
     expect(JSON.stringify(entries)).not.toContain("MATERIAL-CANARY");
   });
 

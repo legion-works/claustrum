@@ -130,7 +130,7 @@ export function createServeFetch(options: CreateServeFetchOptions) {
         const refusal = error instanceof CustodyOwnershipError
           ? error
           : new CustodyOwnershipError(
-            `could not verify custody handle ownership: ${error instanceof Error ? error.message : String(error)}`,
+            `could not verify custody handle ownership: ${error instanceof Error ? error.name : "unknown error"}`,
           );
         options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
         throw refusal;

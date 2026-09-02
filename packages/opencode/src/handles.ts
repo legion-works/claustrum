@@ -114,66 +114,80 @@ function currentUid(): number | undefined {
   return process.getuid?.() ?? userInfo().uid;
 }
 
-export async function readHandleFile(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<OpenCodeHandleFileV1> {
+type HandleFileSnapshot = {
+  file: OpenCodeHandleFileV1;
+  source?: string;
+  mtimeMs?: number;
+};
+
+async function readHandleSnapshot(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<HandleFileSnapshot> {
   const stat = io.stat ?? nodeStat;
   const lstat = io.lstat ?? nodeLstat;
   const read = io.readFile ?? readFile;
-  let metadata: HandleFileStat;
   let descriptor: Awaited<ReturnType<typeof nodeOpen>> | undefined;
   try {
-    if (io.lstat || io.readFile) {
-      metadata = await lstat(path);
-    } else {
-      descriptor = await nodeOpen(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      metadata = await descriptor.stat();
+    let metadata: HandleFileStat;
+    try {
+      if (io.lstat || io.readFile) {
+        metadata = await lstat(path);
+      } else {
+        descriptor = await nodeOpen(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        metadata = await descriptor.stat();
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { file: { version: 1, providers: [] } };
+      invalid(`cannot stat handle file: ${error instanceof Error ? error.message : String(error)}`);
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, providers: [] };
-    invalid(`cannot stat handle file: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (metadata.isSymbolicLink?.()) invalid("handle file must not be a symlink");
-  if (!metadata.isFile()) invalid("handle file must be a regular file");
-  if ((metadata.size ?? 0) > HANDLE_FILE_MAX_BYTES) invalid("handle file exceeds 256 KiB");
-  if ((metadata.mode & 0o777) !== 0o600) invalid("handle file mode must be exactly 0600");
-  const uid = io.currentUid ?? currentUid;
-  const expectedUid = uid();
-  if (expectedUid !== undefined && metadata.uid !== undefined && metadata.uid !== expectedUid) {
-    invalid("handle file is not owned by the current uid");
-  }
-  let parent: HandleFileStat;
-  try {
-    parent = await stat(dirname(path));
-  } catch (error) {
-    invalid(`cannot stat handle file parent: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (!parent.isDirectory?.()) invalid("handle file parent must be a directory");
-  if (expectedUid !== undefined && parent.uid !== undefined && parent.uid !== expectedUid) {
-    invalid("handle file parent is not owned by the current uid");
-  }
-  if ((parent.mode & 0o002) !== 0 && (parent.mode & 0o1000) === 0) {
-    invalid("handle file parent is world-writable without sticky bit");
-  }
-  let source: string;
-  try {
-    source = descriptor ? await descriptor.readFile({ encoding: "utf8" }) : await read(path, "utf8");
-  } catch (error) {
-    invalid(`cannot read handle file: ${error instanceof Error ? error.message : String(error)}`);
+    if (metadata.isSymbolicLink?.()) invalid("handle file must not be a symlink");
+    if (!metadata.isFile()) invalid("handle file must be a regular file");
+    if ((metadata.size ?? 0) > HANDLE_FILE_MAX_BYTES) invalid("handle file exceeds 256 KiB");
+    if ((metadata.mode & 0o777) !== 0o600) invalid("handle file mode must be exactly 0600");
+    const uid = io.currentUid ?? currentUid;
+    const expectedUid = uid();
+    if (expectedUid !== undefined && metadata.uid !== undefined && metadata.uid !== expectedUid) {
+      invalid("handle file is not owned by the current uid");
+    }
+    let parent: HandleFileStat;
+    try {
+      parent = await stat(dirname(path));
+    } catch (error) {
+      invalid(`cannot stat handle file parent: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!parent.isDirectory?.()) invalid("handle file parent must be a directory");
+    if (expectedUid !== undefined && parent.uid !== undefined && parent.uid !== expectedUid) {
+      invalid("handle file parent is not owned by the current uid");
+    }
+    if ((parent.mode & 0o002) !== 0 && (parent.mode & 0o1000) === 0) {
+      invalid("handle file parent is world-writable without sticky bit");
+    }
+    let source: string;
+    try {
+      source = descriptor ? await descriptor.readFile({ encoding: "utf8" }) : await read(path, "utf8");
+    } catch (error) {
+      invalid(`cannot read handle file: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      return {
+        file: parseHandleFile(JSON.parse(source)),
+        source,
+        mtimeMs: metadata.mtimeMs,
+      };
+    } catch (error) {
+      if (error instanceof HandleFileValidationError) throw error;
+      invalid(`handle file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
   } finally {
     await descriptor?.close();
   }
-  try {
-    return parseHandleFile(JSON.parse(source));
-  } catch (error) {
-    if (error instanceof HandleFileValidationError) throw error;
-    invalid(`handle file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  throw new HandleFileValidationError("unreachable handle read state");
+}
+
+export async function readHandleFile(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<OpenCodeHandleFileV1> {
+  return (await readHandleSnapshot(path, io)).file;
 }
 
 export async function handleFileRevision(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<string> {
-  const stat = io.stat ?? nodeStat;
-  const read = io.readFile ?? readFile;
-  await readHandleFile(path, io);
-  const metadata = await stat(path);
-  const source = await read(path, "utf8");
-  return `${metadata.mtimeMs ?? 0}:${createHash("sha256").update(source).digest("hex")}`;
+  const snapshot = await readHandleSnapshot(path, io);
+  if (snapshot.source === undefined) invalid("cannot revise absent handle file");
+  return `${snapshot.mtimeMs ?? 0}:${createHash("sha256").update(snapshot.source).digest("hex")}`;
 }
