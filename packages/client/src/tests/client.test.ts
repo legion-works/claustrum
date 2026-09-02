@@ -126,6 +126,17 @@ describe('ClaustrumClient', () => {
     await new Promise<void>((resolve) => daemon.close(() => resolve()))
   })
 
+  test('never echoes connection-file key material from a JSON parse failure', async () => {
+    const path = await tempPath('secret-parse.json')
+    const key = 'k'.repeat(40)
+    await writeFile(path, `{"key": ${key}}`)
+
+    const result = await detectClaustrumConnection(path)
+
+    expect(result).toEqual(expect.objectContaining({ status: 'malformed', reason: 'connection file is not valid JSON' }))
+    expect(JSON.stringify(result)).not.toContain(key)
+  })
+
   test('identity scrubs inherited SUBC_MODULE_ID and SUBC_LAUNCH_NONCE then hashes the store path', async () => {
     process.env.SUBC_MODULE_ID = 'inherited-module'
     process.env.SUBC_LAUNCH_NONCE = 'inherited-nonce'

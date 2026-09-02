@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { tmpdir, userInfo } from 'node:os'
 import { join } from 'node:path'
+import { ConnectionJsonParseError, parseSecretJson } from './secret-json'
 
 export type ClaustrumEndpoint = {
   host: string
@@ -51,7 +52,7 @@ export async function detectClaustrumConnection(
   const path = resolveClaustrumConnectionPath(explicitPath)
   let value: unknown
   try {
-    value = JSON.parse(await readFile(path, 'utf8'))
+    value = parseSecretJson(await readFile(path, 'utf8'))
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       return { status: 'absent', path }
@@ -59,7 +60,9 @@ export async function detectClaustrumConnection(
     return {
       status: 'malformed',
       path,
-      reason: error instanceof Error ? error.message : String(error),
+      reason: error instanceof ConnectionJsonParseError
+        ? 'connection file is not valid JSON'
+        : 'connection file could not be read',
     }
   }
 
