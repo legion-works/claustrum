@@ -16,19 +16,16 @@
 //! never silently retries or falls back after dispatch; it returns a distinct error
 //! the CLI surfaces as "verify with list/verify-audit before retrying".
 
-use std::time::Duration;
-
 use credentials_core::admin_auth::{AdminMacKey, TranscriptParts, ADMIN_NONCE_LEN, VAULT_ID_LEN};
 use credentials_core::admin_ops::AdminOpBody;
 use credentials_core::resolver::{self, ResolverConfig};
-use credentials_core::{vault_id_for, MODULE_ID};
+use credentials_core::vault_id_for;
 use serde_json::{json, Value};
-use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget};
-use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
+use subc_protocol::FrameType;
+use subc_transport::write_frame;
 use tokio::net::TcpStream;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const RPC_TIMEOUT: Duration = Duration::from_secs(15);
+use crate::route_client;
 
 /// The outcome of attempting a route-plane commit.
 pub enum RouteCommit {
@@ -56,10 +53,6 @@ pub fn commit(
     conn_path: &std::path::Path,
     op: &AdminOpBody,
 ) -> RouteCommit {
-    let conn = match connection_file::read(conn_path) {
-        Ok(c) => c,
-        Err(e) => return RouteCommit::NoLiveModule(format!("no subc connection file: {e}")),
-    };
     let vault_id = match vault_id_for(data_dir) {
         Some(v) => v,
         None => return RouteCommit::NoLiveModule("cannot derive vault id".into()),
@@ -69,7 +62,7 @@ pub fn commit(
         Err(e) => return RouteCommit::Refused(format!("encoding op: {e}")),
     };
 
-    run_async(async move { commit_async(&conn, &vault_id, config, &op_bytes).await })
+    run_async(async move { commit_async(conn_path, &vault_id, config, &op_bytes).await })
 }
 
 fn run_async<F: std::future::Future<Output = RouteCommit>>(fut: F) -> RouteCommit {
@@ -84,30 +77,18 @@ fn run_async<F: std::future::Future<Output = RouteCommit>>(fut: F) -> RouteCommi
 }
 
 async fn commit_async(
-    conn: &connection_file::ConnectionInfo,
+    conn_path: &std::path::Path,
     vault_id: &[u8; VAULT_ID_LEN],
     config: &ResolverConfig,
     op_bytes: &[u8],
 ) -> RouteCommit {
-    let Some(endpoint) = conn.endpoints.first() else {
-        return RouteCommit::NoLiveModule("connection file has no endpoint".into());
+    let mut stream = match route_client::connect(conn_path).await {
+        Ok(stream) => stream,
+        Err(e) => return RouteCommit::NoLiveModule(e),
     };
-    let mut stream = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        TcpStream::connect((endpoint.host.as_str(), endpoint.port)),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return RouteCommit::NoLiveModule(format!("connect: {e}")),
-        Err(_) => return RouteCommit::NoLiveModule("connect timed out".into()),
-    };
-    if let Err(e) = authenticate_client(&mut stream, conn, CONNECT_TIMEOUT).await {
-        return RouteCommit::NoLiveModule(format!("client handshake: {e}"));
-    }
 
     // The vault module must be catalog-live; otherwise there is no module to admin.
-    match catalog_has_vault(&mut stream).await {
+    match route_client::catalog_has_module(&mut stream).await {
         Ok(true) => {}
         Ok(false) => {
             return RouteCommit::NoLiveModule("vault module not in catalog".into());
@@ -117,10 +98,13 @@ async fn commit_async(
 
     // Wire v2: route identity is (channel, epoch); every route frame must carry
     // the epoch the route was opened under, or the daemon's relay drops it.
-    let (route_channel, route_epoch) = match route_open(&mut stream, &config.data_dir).await {
-        Ok(pair) => pair,
+    let route = match route_client::open_route(stream, &config.data_dir, "ck-auth", "admin").await {
+        Ok(route) => route,
         Err(e) => return RouteCommit::NoLiveModule(format!("route.open: {e}")),
     };
+    let route_channel = route.channel;
+    let route_epoch = route.epoch;
+    let mut stream = route.stream;
 
     // admin.challenge: fetch a nonce + the module's key_id (so we resolve the SAME
     // key) + its vault_id (so we confirm we are talking to the intended vault).
@@ -199,7 +183,7 @@ async fn challenge(
     route_channel: u16,
     route_epoch: u32,
 ) -> Result<([u8; ADMIN_NONCE_LEN], String, String), RpcFail> {
-    let frame = route_request(
+    let frame = route_client::route_request(
         route_channel,
         route_epoch,
         100,
@@ -208,11 +192,11 @@ async fn challenge(
     if let Err(e) = write_frame(stream, &frame).await {
         return Err(RpcFail::Transport(format!("write admin.challenge: {e}")));
     }
-    let resp = read_route_response(stream, 100)
+    let resp = route_client::read_route_response(stream, 100)
         .await
         .map_err(RpcFail::Transport)?;
     if resp.header.ty == FrameType::Error {
-        return Err(RpcFail::Refused(error_reason(&resp.body)));
+        return Err(RpcFail::Refused(route_client::error_reason(&resp.body)));
     }
     let value: Value = serde_json::from_slice(&resp.body)
         .map_err(|e| RpcFail::Transport(format!("decode challenge: {e}")))?;
@@ -248,7 +232,7 @@ async fn admin_op(
         Ok(s) => s.to_string(),
         Err(_) => return RouteCommit::Refused("op body is not valid utf-8".into()),
     };
-    let frame = route_request(
+    let frame = route_client::route_request(
         route_channel,
         route_epoch,
         101,
@@ -261,9 +245,9 @@ async fn admin_op(
         // Failed BEFORE the bytes left us: safe to treat as not-dispatched.
         return RouteCommit::NoLiveModule(format!("write admin.op: {e}"));
     }
-    match read_route_response(stream, 101).await {
+    match route_client::read_route_response(stream, 101).await {
         Ok(resp) if resp.header.ty == FrameType::Error => {
-            RouteCommit::Refused(error_reason(&resp.body))
+            RouteCommit::Refused(route_client::error_reason(&resp.body))
         }
         Ok(resp) => match serde_json::from_slice::<Value>(&resp.body) {
             Ok(v) => RouteCommit::Committed(v["result"].clone()),
@@ -276,132 +260,6 @@ async fn admin_op(
             "op was sent but no response arrived ({e}); it may have committed — verify with `list`/`verify-audit` before retrying"
         )),
     }
-}
-
-async fn catalog_has_vault(stream: &mut TcpStream) -> Result<bool, String> {
-    let frame = control_request(1, json!({ "op": "catalog.list" }));
-    write_frame(stream, &frame)
-        .await
-        .map_err(|e| format!("write catalog.list: {e}"))?;
-    let resp = read_control_response(stream, 1).await?;
-    let value: Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
-    Ok(value["modules"]
-        .as_array()
-        .map(|ms| ms.iter().any(|m| m["module_id"] == MODULE_ID))
-        .unwrap_or(false))
-}
-
-async fn route_open(stream: &mut TcpStream, root: &std::path::Path) -> Result<(u16, u32), String> {
-    let target = RouteTarget::ManagementSurface {
-        module_id: MODULE_ID.to_string(),
-    };
-    let identity = BindIdentity {
-        project_root: root.to_path_buf(),
-        harness: "ck-auth".to_string(),
-        session: "admin".to_string(),
-    };
-    let frame = control_request(
-        2,
-        json!({ "op": "route.open", "target": target, "identity": identity }),
-    );
-    write_frame(stream, &frame)
-        .await
-        .map_err(|e| format!("write route.open: {e}"))?;
-    let resp = read_control_response(stream, 2).await?;
-    if resp.header.ty == FrameType::Error {
-        return Err(error_reason(&resp.body));
-    }
-    let value: Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
-    let channel = value["route_channel"]
-        .as_u64()
-        .map(|c| c as u16)
-        .ok_or_else(|| "route.open returned no route_channel".to_string())?;
-    // Wire v2: the daemon names the binding's epoch alongside the channel.
-    let epoch = value["route_epoch"]
-        .as_u64()
-        .map(|e| e as u32)
-        .ok_or_else(|| "route.open returned no route_epoch".to_string())?;
-    Ok((channel, epoch))
-}
-
-fn control_request(corr: u64, body: Value) -> Frame {
-    // Channel-0 control frames carry the reserved epoch 0 (wire v2 §3.1).
-    Frame::build(
-        FrameType::Request,
-        Flags::new(false, Priority::Passive, false),
-        0,
-        0,
-        corr,
-        serde_json::to_vec(&body).unwrap(),
-    )
-    .unwrap()
-}
-
-fn route_request(channel: u16, epoch: u32, corr: u64, body: Value) -> Frame {
-    Frame::build(
-        FrameType::Request,
-        Flags::new(false, Priority::Interactive, false),
-        channel,
-        epoch,
-        corr,
-        serde_json::to_vec(&body).unwrap(),
-    )
-    .unwrap()
-}
-
-async fn read_control_response(stream: &mut TcpStream, corr: u64) -> Result<Frame, String> {
-    read_matching(stream, 0, corr).await
-}
-
-async fn read_route_response(stream: &mut TcpStream, corr: u64) -> Result<Frame, String> {
-    // Route responses arrive on the route channel; match by corr only (the channel
-    // is whatever route.open returned).
-    tokio::time::timeout(RPC_TIMEOUT, async {
-        loop {
-            let frame = read_frame(stream)
-                .await
-                .map_err(|e| format!("read: {e}"))?
-                .ok_or_else(|| "connection closed".to_string())?;
-            if frame.header.corr == corr
-                && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
-            {
-                return Ok(frame);
-            }
-        }
-    })
-    .await
-    .map_err(|_| "response timed out".to_string())?
-}
-
-async fn read_matching(stream: &mut TcpStream, channel: u16, corr: u64) -> Result<Frame, String> {
-    tokio::time::timeout(RPC_TIMEOUT, async {
-        loop {
-            let frame = read_frame(stream)
-                .await
-                .map_err(|e| format!("read: {e}"))?
-                .ok_or_else(|| "connection closed".to_string())?;
-            if frame.header.channel == channel
-                && frame.header.corr == corr
-                && matches!(frame.header.ty, FrameType::Response | FrameType::Error)
-            {
-                return Ok(frame);
-            }
-        }
-    })
-    .await
-    .map_err(|_| "response timed out".to_string())?
-}
-
-fn error_reason(body: &[u8]) -> String {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .or_else(|| v.get("detail"))
-                .and_then(|m| m.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| "module refused the op".to_string())
 }
 
 fn hex(bytes: &[u8]) -> String {

@@ -44,12 +44,20 @@ use std::process::ExitCode;
 mod admin_client;
 #[path = "cli_support/api_key_login.rs"]
 mod api_key_login;
+#[allow(dead_code)]
+#[path = "cli_support/credential_client.rs"]
+mod credential_client;
 #[path = "cli_support/google_login.rs"]
 mod google_login;
 #[path = "cli_support/login_listener.rs"]
 mod login_listener;
+#[allow(dead_code)]
+#[path = "cli_support/opencode_files.rs"]
+mod opencode_files;
 #[path = "cli_support/provider_login.rs"]
 mod provider_login;
+#[path = "cli_support/route_client.rs"]
+mod route_client;
 
 use base64::Engine;
 use cortexkit_store::{open_sqlite, Isolation, StorageBackend, StorageDescriptor, StoreError};
