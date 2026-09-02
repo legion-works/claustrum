@@ -6,7 +6,7 @@ import {
   createOpencodeClaustrumPlugin,
   type ConfigHookDependencies,
 } from "../plugin";
-import { CustodySplitError } from "../errors";
+import { CustodySplitError, HandleFileValidationError } from "../errors";
 import { handleFileRevision, parseHandleFile, readHandleFile } from "../handles";
 import { sentinel, tombstoneFor } from "../tombstone";
 
@@ -234,6 +234,32 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     });
 
     await hook(cfg, { handleReader, log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("HandleFileValidationError");
+    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+  });
+
+  test("rejects a world-writable non-sticky handle parent but accepts a uid-owned 0755 parent", async () => {
+    const files = await fixture("handle-parent-mode");
+    await writeHandles(files.handles, handles("deepseek"));
+    const parent = join(ROOT, "handle-parent-mode", "config", "cortexkit");
+
+    await chmod(parent, 0o777);
+    await expect(readHandleFile(files.handles)).rejects.toBeInstanceOf(HandleFileValidationError);
+
+    await chmod(parent, 0o755);
+    await expect(readHandleFile(files.handles)).resolves.toMatchObject(handles("deepseek"));
+  });
+
+  test("the config hook rejects a world-writable non-sticky handle parent", async () => {
+    const files = await fixture("plugin-handle-parent-mode");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+    await chmod(join(ROOT, "plugin-handle-parent-mode", "config", "cortexkit"), 0o777);
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("HandleFileValidationError");
     expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();

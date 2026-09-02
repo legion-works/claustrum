@@ -292,6 +292,9 @@ run_expect 2 "login crash cut" \
 run_expect 1 "opencode tombstone reread crash cut" \
   cargo test --locked -p credentials-module --features opencode-test-seam \
     --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
+run_expect 1 "opencode account handle-write crash cut" \
+  cargo test --locked -p credentials-module --features opencode-test-seam \
+    --test cli_opencode the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle
 # The preceding arm compiles the seam into the release target. Rebuild the shipped CLI
 # immediately so every later check and the caller inherit a production artifact.
 run_check "release ck-auth (default features)" \

@@ -211,6 +211,30 @@ describe("OpenCode custody serve fetch", () => {
     expect(requests[1]?.method).toBe("GET");
   });
 
+  test("keeps the GET and empty body after a 303 followed by a 307", async () => {
+    const requests: Request[] = [];
+    const fetch = serve({
+      upstream: async (request) => {
+        const forwarded = new Request(request);
+        requests.push(forwarded);
+        if (forwarded.url.endsWith("/start")) {
+          return new Response(null, { status: 303, headers: { Location: "/middle" } });
+        }
+        if (forwarded.url.endsWith("/middle")) {
+          return new Response(null, { status: 307, headers: { Location: "/final" } });
+        }
+        return new Response("ok");
+      },
+    });
+
+    expect((await fetch("https://upstream.example/start", { method: "POST", body: "body" })).status).toBe(200);
+    expect(requests).toHaveLength(3);
+    expect(requests[1]?.method).toBe("GET");
+    expect(await requests[1]?.text()).toBe("");
+    expect(requests[2]?.method).toBe("GET");
+    expect(await requests[2]?.text()).toBe("");
+  });
+
   test("refuses a cross-origin redirect before an attacker receives substituted headers or can report 401", async () => {
     const attackerRequests: Request[] = [];
     const client = clientWith();

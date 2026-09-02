@@ -143,6 +143,9 @@ export async function readHandleFile(path = defaultHandleFilePath(), io: HandleF
   if (expectedUid !== undefined && parent.uid !== undefined && parent.uid !== expectedUid) {
     invalid("handle file parent is not owned by the current uid");
   }
+  if ((parent.mode & 0o002) !== 0 && (parent.mode & 0o1000) === 0) {
+    invalid("handle file parent is world-writable without sticky bit");
+  }
   let source: string;
   try {
     source = await read(path, "utf8");
