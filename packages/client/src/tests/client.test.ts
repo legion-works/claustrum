@@ -47,6 +47,9 @@ const tempDirs: string[] = []
 const originalConnection = process.env.CLAUSTRUM_SUBC_CONNECTION
 const originalModuleId = process.env.SUBC_MODULE_ID
 const originalLaunchNonce = process.env.SUBC_LAUNCH_NONCE
+const originalXdgRuntime = process.env.XDG_RUNTIME_DIR
+const originalHome = process.env.HOME
+const originalTmpdir = process.env.TMPDIR
 
 async function tempPath(name: string): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), 'claustrum-client-'))
@@ -65,6 +68,12 @@ afterEach(async () => {
   else process.env.SUBC_MODULE_ID = originalModuleId
   if (originalLaunchNonce === undefined) delete process.env.SUBC_LAUNCH_NONCE
   else process.env.SUBC_LAUNCH_NONCE = originalLaunchNonce
+  if (originalXdgRuntime === undefined) delete process.env.XDG_RUNTIME_DIR
+  else process.env.XDG_RUNTIME_DIR = originalXdgRuntime
+  if (originalHome === undefined) delete process.env.HOME
+  else process.env.HOME = originalHome
+  if (originalTmpdir === undefined) delete process.env.TMPDIR
+  else process.env.TMPDIR = originalTmpdir
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
@@ -163,16 +172,14 @@ describe('ClaustrumClient', () => {
     // filename does NOT match the client's `subc-${uid}.connection.json` literal.
     const tempRoot = await mkdtemp(join(tmpdir(), 'claustrum-discover-'))
     tempDirs.push(tempRoot)
-    const originalXdg = process.env.XDG_RUNTIME_DIR
-    const originalHome = process.env.HOME
 
     const homeDir = join(tempRoot, 'home')
-    const { mkdir } = await import('node:fs/promises')
+    const fixtureTmp = join(tempRoot, 'tmp')
     await mkdir(homeDir, { recursive: true })
+    await mkdir(fixtureTmp, { recursive: true })
 
-    // Write a daemon-style file into the OS tmpdir (whatever `os.tmpdir()` returns).
     const token = `rediscovery-${Date.now()}-${process.pid}`
-    const daemonFile = join(tmpdir(), `subc-${token}.connection.json`)
+    const daemonFile = join(fixtureTmp, `subc-${token}.connection.json`)
     await writeFile(daemonFile, JSON.stringify({
       schema: 1,
       wire_version: PROTOCOL_VERSION,
@@ -183,15 +190,13 @@ describe('ClaustrumClient', () => {
       daemon_ver: 'test',
     }))
     await chmod(daemonFile, 0o600)
-    process.env.XDG_RUNTIME_DIR = undefined
+    delete process.env.XDG_RUNTIME_DIR
     process.env.HOME = homeDir
+    process.env.TMPDIR = fixtureTmp
 
     try {
       expect(getDefaultClaustrumConnectionPath()).toBe(daemonFile)
     } finally {
-      process.env.HOME = originalHome
-      if (originalXdg === undefined) delete process.env.XDG_RUNTIME_DIR
-      else process.env.XDG_RUNTIME_DIR = originalXdg
       await rm(daemonFile, { force: true })
     }
   })
@@ -206,12 +211,10 @@ describe('ClaustrumClient', () => {
     // unreachable, leaving vault-backed requests dead.
     const tempRoot = await mkdtemp(join(tmpdir(), 'claustrum-home-override-'))
     tempDirs.push(tempRoot)
-    const originalXdg = process.env.XDG_RUNTIME_DIR
-    const originalHome = process.env.HOME
-
     const homeDir = join(tempRoot, 'home')
-    const { mkdir } = await import('node:fs/promises')
     await mkdir(homeDir, { recursive: true })
+    const fixtureTmp = join(tempRoot, 'tmp')
+    await mkdir(fixtureTmp, { recursive: true })
     const runDir = join(homeDir, '.local', 'share', 'cortexkit', 'run')
     await mkdir(runDir, { recursive: true })
     const fixtureFile = join(runDir, 'subc-connection.json')
@@ -226,41 +229,37 @@ describe('ClaustrumClient', () => {
     }))
     await chmod(fixtureFile, 0o600)
 
-    process.env.XDG_RUNTIME_DIR = undefined
+    delete process.env.XDG_RUNTIME_DIR
     process.env.HOME = homeDir
+    process.env.TMPDIR = fixtureTmp
 
     try {
       expect(getDefaultClaustrumConnectionPath()).toBe(fixtureFile)
     } finally {
-      process.env.HOME = originalHome
-      if (originalXdg === undefined) delete process.env.XDG_RUNTIME_DIR
-      else process.env.XDG_RUNTIME_DIR = originalXdg
       await rm(fixtureFile, { force: true })
     }
   })
 
   test('default discovery refuses ambiguity when multiple connection files share the temp dir', async () => {
-    const originalXdg = process.env.XDG_RUNTIME_DIR
-    const originalHome = process.env.HOME
-
-    const a = join(tmpdir(), `subc-ambiguous-a-${process.pid}-${Date.now()}.connection.json`)
-    const b = join(tmpdir(), `subc-ambiguous-b-${process.pid}-${Date.now()}.connection.json`)
+    const tempRoot = await mkdtemp(join(tmpdir(), 'claustrum-ambiguous-'))
+    tempDirs.push(tempRoot)
+    const fixtureTmp = join(tempRoot, 'tmp')
+    await mkdir(fixtureTmp, { recursive: true })
+    const a = join(fixtureTmp, `subc-ambiguous-a-${process.pid}-${Date.now()}.connection.json`)
+    const b = join(fixtureTmp, `subc-ambiguous-b-${process.pid}-${Date.now()}.connection.json`)
     await writeFile(a, '{"schema":1}')
     await writeFile(b, '{"schema":1}')
 
-    process.env.XDG_RUNTIME_DIR = undefined
-    const homeDir = join(tmpdir(), `claustrum-ambiguous-home-${process.pid}-${Date.now()}`)
-    const { mkdir } = await import('node:fs/promises')
+    delete process.env.XDG_RUNTIME_DIR
+    const homeDir = join(tempRoot, 'home')
     await mkdir(homeDir, { recursive: true })
     process.env.HOME = homeDir
+    process.env.TMPDIR = fixtureTmp
 
     try {
       const path = getDefaultClaustrumConnectionPath()
       expect([a, b]).not.toContain(path)
     } finally {
-      process.env.HOME = originalHome
-      if (originalXdg === undefined) delete process.env.XDG_RUNTIME_DIR
-      else process.env.XDG_RUNTIME_DIR = originalXdg
       await rm(a, { force: true })
       await rm(b, { force: true })
     }
@@ -312,7 +311,6 @@ describe('ClaustrumClient', () => {
     const expectedFingerprint = createHash('sha256')
       .update(await realpath(linkedStoragePath))
       .digest('hex')
-      .slice(0, 12)
     expect(daemon.calls[0]).toMatchObject({
       options: {
         consumerIdentity: null,

@@ -31,7 +31,6 @@ afterEach(() => {
     else process.env[key] = value;
   }
   savedEnv.clear();
-  for (const key of ENV_KEYS) delete process.env[key];
 });
 
 type TestConfig = {

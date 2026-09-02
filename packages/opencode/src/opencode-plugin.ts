@@ -1,6 +1,7 @@
 import { OpencodeClaustrumPlugin } from "./plugin";
+import { OUR_PLUGIN_ID } from "./handles";
 
 export default {
-  id: "opencode-claustrum",
+  id: OUR_PLUGIN_ID,
   server: OpencodeClaustrumPlugin,
 };

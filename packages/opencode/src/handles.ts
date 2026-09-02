@@ -208,7 +208,6 @@ async function readHandleSnapshot(path = defaultHandleFilePath(), io: HandleFile
   } finally {
     await descriptor?.close();
   }
-  throw new HandleFileValidationError("unreachable handle read state");
 }
 
 export async function readHandleFile(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<OpenCodeHandleFileV1> {

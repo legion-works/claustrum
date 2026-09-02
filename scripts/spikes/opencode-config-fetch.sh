@@ -14,7 +14,6 @@ export XDG_DATA_HOME="$ROOT/data"
 export XDG_CACHE_HOME="$ROOT/cache"
 export XDG_STATE_HOME="$ROOT/state"
 
-rm -rf "$ROOT"
 mkdir -p "$XDG_CONFIG_HOME/opencode" "$XDG_DATA_HOME/opencode" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
 
 STUB_PID=""
@@ -199,7 +198,7 @@ chmod 600 "$XDG_DATA_HOME/opencode/auth.json"
 run_provider() {
   local provider="$1"
   local output
-  if ! output="$(opencode run -m "${provider}/spike" 'Return the stub response.' 2>&1)"; then
+  if ! output="$(timeout 120 opencode run -m "${provider}/spike" 'Return the stub response.' 2>&1)"; then
     printf '%s\n' "$output" > "$ROOT/run-${provider}.log"
     printf 'SPIKE FAIL %s run_failed\n' "$provider" >&2
     printf '%s\n' "$output" >&2

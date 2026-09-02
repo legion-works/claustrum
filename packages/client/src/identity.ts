@@ -18,7 +18,7 @@ export function storageFingerprint(storagePath: string): string {
     }
     canonicalPath = resolve(realpathSync(ancestor), relative(ancestor, absolutePath))
   }
-  return createHash('sha256').update(canonicalPath).digest('hex').slice(0, 12)
+  return createHash('sha256').update(canonicalPath).digest('hex')
 }
 
 export function storeIdentity(projectRoot: string, storagePath: string): BindIdentity {

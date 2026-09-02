@@ -54,7 +54,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn tmp_root(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
+        .map(|d| d.as_nanos())
         .unwrap_or(0);
     let d = std::env::temp_dir().join(format!(
         "ck-cred-cli-{}-{}-{}-{nanos:09}",

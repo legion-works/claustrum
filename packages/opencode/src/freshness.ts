@@ -144,6 +144,8 @@ export class FreshnessController {
     const slot = this.#slot(account);
     slot.cached = undefined;
     slot.observedAt = undefined;
+    slot.inFlight = undefined;
+    slot.generation += 1;
   }
 
   cooldown(account: FreshnessAccount, durationMs: number): number {

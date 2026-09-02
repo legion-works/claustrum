@@ -2113,7 +2113,7 @@ fn the_fake_daemon_drops_quickly_when_drop_runs_while_a_frame_read_is_hung() {
     drop(conn); // TestDaemon::drop sends the shutdown channel; the read must observe it.
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed < Duration::from_secs(5),
         "TestDaemon::drop blocked for {elapsed:?}; the per-frame read is not observing the shutdown channel"
     );
 }

@@ -28,12 +28,13 @@ else
   # operations at whichever user's daemon the shell saw first; that file is then bound
   # to the acceptance rig's CLAUSTRUM_SUBC_CONNECTION export through the same root.
   # REFUSE the ambiguous case so the acceptance run cannot cross users.
-  matches="$(ls -1 /tmp/subc-*.connection.json 2>/dev/null || true)"
+  TEMP_BASE="${TMPDIR:-/tmp}"
+  matches="$(ls -1 "$TEMP_BASE"/subc-*.connection.json 2>/dev/null || true)"
   count="$(printf '%s\n' "$matches" | grep -c . || true)"
   case "$count" in
     0) SUBC="" ;;
     1) SUBC="$matches" ;;
-    *) printf 'ACCEPT FAIL ambiguous subc connection files in /tmp (%d candidates); set CLAUSTRUM_SUBC_CONNECTION or SUBC to choose:\n' "$count" >&2
+    *) printf 'ACCEPT FAIL ambiguous subc connection files in %s (%d candidates); set CLAUSTRUM_SUBC_CONNECTION or SUBC to choose:\n' "$TEMP_BASE" "$count" >&2
        printf '%s\n' "$matches" >&2
        exit 1
        ;;

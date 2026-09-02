@@ -213,6 +213,22 @@ describe("custody freshness", () => {
     expect(client.gets).toHaveLength(2);
   });
 
+  test("invalidate fences and detaches an in-flight credential get", async () => {
+    const pending = deferred<ServedCredential>();
+    let calls = 0;
+    const client = new FakeClient(async () => ++calls === 1 ? pending.promise : credential("after-401"));
+    const freshness = controller({ client });
+
+    const first = freshness.resolve(apiAccounts[0]!);
+    await Promise.resolve();
+    freshness.invalidate(apiAccounts[0]!);
+    pending.resolve(credential("stale-before-401"));
+
+    expect(await first).toBeUndefined();
+    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("after-401"));
+    expect(client.gets).toHaveLength(2);
+  });
+
   test("a stale rejection cannot poison a new revision's slot", async () => {
     // P1: an older-revision get that rejects with not_found must not flip the
     // new slot to `gone`. Without the catch-arm fence, a late permanent/not_found
