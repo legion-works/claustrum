@@ -111,6 +111,11 @@ FMT_PKGS=$(cargo metadata --no-deps --format-version 1 \
 # shellcheck disable=SC2086
 run_check "format" cargo fmt $FMT_PKGS -- --check
 
+run_check "bun frozen install" /home/icetea/.bun/bin/bun install --frozen-lockfile
+run_check "bun typecheck" /home/icetea/.bun/bin/bun run typecheck
+run_check "bun build" /home/icetea/.bun/bin/bun run build
+run_check "bun tests" /home/icetea/.bun/bin/bun test packages
+
 run_check "clippy" \
   cargo clippy --locked --workspace --all-targets -- -D warnings
 run_check "clippy (seam features)" \
@@ -227,12 +232,12 @@ stream and pass the arm without ever seeing it skip."
 # follows it), and any gap between the floor and the real count is how many can go
 # before anyone is told. Measured 402 across the workspace's suites at the time of
 # writing; an earlier floor of 200 left a third of them free to disappear.
-# The current measured total is 464 after adding request-shape pins for the read surface,
-# alongside the source-level checks that keep diagnostic enum documentation complete.
+# The current measured total is 466 after adding strict handle-file parity checks for the
+# plugin and CLI read surfaces.
 #
 # Raise this when tests are added. A failure here is normally that, not a defect --
 # but it should be a deliberate edit rather than a number nobody revisits.
-run_expect 464 "workspace unit + integration" \
+run_expect 466 "workspace unit + integration" \
   cargo test --locked --workspace
 
 # Two independent defences, because each catches what the other misses:
@@ -285,6 +290,10 @@ run_expect 2 "login crash cut" \
 run_expect 1 "opencode tombstone reread crash cut" \
   cargo test --locked -p credentials-module --features opencode-test-seam \
     --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
+# The preceding arm compiles the seam into the release target. Rebuild the shipped CLI
+# immediately so every later check and the caller inherit a production artifact.
+run_check "release ck-auth (default features)" \
+  cargo build --release --locked --offline -p credentials-module --bin ck-auth
 # The migration tools are feature-gated, so clippy compiles them but nothing RAN them
 # until this arm existed. Compiling proves they build; the property that matters -- the
 # key-identity diagnostic works while the daemon holds the lease -- is a runtime fact.

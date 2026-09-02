@@ -9,11 +9,22 @@ const PROVIDER = "deepseek";
 const MAIN_HANDLE = `ckh_${"a".repeat(43)}`;
 const BACKUP_HANDLE = `ckh_${"b".repeat(43)}`;
 
+type TestConfig = {
+  provider: Record<string, {
+    options: {
+      baseURL: string;
+      headers: { "x-stock": string };
+      fetch?: typeof globalThis.fetch;
+      apiKey?: string;
+    };
+  }>;
+};
+
 function credential(material: string, recordVersion: number): ServedCredential {
   return { material, recordVersion, expiresAtMs: null };
 }
 
-function config() {
+function config(): TestConfig {
   return {
     provider: {
       [PROVIDER]: {
@@ -30,6 +41,12 @@ async function hooks(input: Parameters<typeof createOpencodeClaustrumPlugin>[0])
 }
 
 describe("exported OpenCode custody plugin lifecycle", () => {
+  test("exports the plugin function from a dedicated file-plugin entrypoint", async () => {
+    const module = await import("../opencode-plugin") as unknown as { default?: unknown };
+
+    expect(typeof module.default).toBe("function");
+  });
+
   test("injects an owned tombstone provider and substitutes through the real plugin fetch", async () => {
     const cfg = config();
     const requests: Request[] = [];
@@ -43,10 +60,10 @@ describe("exported OpenCode custody plugin lifecycle", () => {
         getCredential: async () => credential("vault-material", 4),
         reportAuthFailure: async () => {},
       }) as never,
-      fetch: async (request) => {
+      fetch: (async (request) => {
         requests.push(new Request(request));
         return new Response("upstream", { status: 200 });
-      },
+      }) as typeof globalThis.fetch,
       log: () => {},
     });
 
@@ -78,7 +95,7 @@ describe("exported OpenCode custody plugin lifecycle", () => {
         getCredential: async (handle: string) => handle === MAIN_HANDLE ? credential("first", 7) : credential("second", 8),
         reportAuthFailure: async (report: unknown) => { reports.push(report); },
       }) as never,
-      fetch: async () => new Response("upstream", { status: ++requests === 1 ? 401 : 200 }),
+      fetch: (async () => new Response("upstream", { status: ++requests === 1 ? 401 : 200 })) as unknown as typeof globalThis.fetch,
       log: () => {},
     });
 
@@ -93,13 +110,38 @@ describe("exported OpenCode custody plugin lifecycle", () => {
     }]);
   });
 
+  test("refuses the exported plugin fetch before forwarding a real credential owned by custody", async () => {
+    const cfg = config();
+    cfg.provider[PROVIDER].options.apiKey = "local-key";
+    let forwarded = 0;
+    const pluginHooks = await hooks({
+      handleReader: async () => ({
+        version: 1,
+        providers: [{ provider: PROVIDER, shape: "api", serve: "opencode-claustrum", accounts: [{ label: "main", handle: MAIN_HANDLE, credential_id: "id" }] }],
+      }),
+      authReader: async () => ({ [PROVIDER]: { type: "api", key: "local-key" } }),
+      fetch: (async () => {
+        forwarded += 1;
+        return new Response("must not forward");
+      }) as never,
+      log: () => {},
+    });
+
+    await pluginHooks.config?.(cfg);
+    const fetch = cfg.provider[PROVIDER].options.fetch as typeof globalThis.fetch;
+
+    expect(cfg.provider[PROVIDER].options.apiKey).toBe("local-key");
+    await expect(fetch("https://upstream.test")).rejects.toThrow("migrate-opencode");
+    expect(forwarded).toBe(0);
+  });
+
   test("leaves a pre-existing provider option byte-identical when handle validation fails", async () => {
     const cfg = config();
     const before = JSON.stringify(cfg.provider[PROVIDER].options);
     const pluginHooks = await hooks({
       handleReader: async () => { throw new Error("invalid handle file"); },
       authReader: async () => ({ [PROVIDER]: tombstoneFor("api", PROVIDER) }),
-      fetch: async () => new Response("must not run"),
+      fetch: (async () => new Response("must not run")) as unknown as typeof globalThis.fetch,
       log: () => {},
     });
 

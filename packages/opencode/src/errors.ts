@@ -9,3 +9,7 @@ export class CustodySplitError extends Error {
 export class CustodyOrphanError extends Error {
   override name = "CustodyOrphanError";
 }
+
+export class CustodyExhaustionError extends Error {
+  override name = "CustodyExhaustionError";
+}

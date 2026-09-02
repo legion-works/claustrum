@@ -283,7 +283,7 @@ describe("custody freshness", () => {
     const exhausted = createServeFetch({
       provider: PROVIDER,
       accounts: [{ label: "main", handle, credential_id: "id" }],
-      client: new FakeClient(async () => { throw new ClaustrumCredentialError("not_found", "permanent", `${rawBody} ${connectionKey}`); }),
+      client: new FakeClient(async () => { throw new ClaustrumCredentialError("not_found", "permanent", "gone"); }),
       readAuthEntry: () => tombstoneFor("api", PROVIDER),
       upstreamFetch: async () => new Response(rawBody, { status: 200 }),
       log: logger,

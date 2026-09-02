@@ -88,82 +88,92 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
       config: async (input) => {
         for (const controller of controllers) controller.dispose();
         controllers = [];
-      let handles: OpenCodeHandleFileV1;
-      try {
-        handles = await handleReader(defaultHandleFilePath());
-      } catch (error) {
-        const typed = error instanceof HandleFileValidationError
-          ? error
-          : new HandleFileValidationError(error instanceof Error ? error.message : String(error));
-        logError(log, typed, "handle-file");
-        return;
-      }
-
-      let auth: Record<string, unknown>;
-      try {
-        auth = await authReader(defaultAuthPath());
-      } catch (error) {
-        log.error({
-          errorClass: error instanceof Error ? error.name : "AuthReadError",
-          errorCode: (error as NodeJS.ErrnoException).code,
-        });
-        return;
-      }
-
-      const byProvider = new Map(handles.providers.map((provider) => [provider.provider, provider]));
-      const providers = [...byProvider.keys()];
-      for (const provider of Object.keys(auth)) {
-        if (!byProvider.has(provider) && isProviderTombstone(auth[provider], provider)) providers.push(provider);
-      }
-
-      const cfg = input as MutableConfig;
-      cfg.provider ??= {};
-      for (const provider of providers) {
-        const handle = byProvider.get(provider);
-        const entry = auth[provider];
-        const tombstone = isProviderTombstone(entry, provider);
-        const owner = handle?.serve;
-
-        if (!tombstone) {
-          if (owner === OUR_PLUGIN_ID) logError(log, new CustodySplitError("local credential is real; migrate or restore ownership"), provider);
-          continue;
-        }
-        if (owner !== OUR_PLUGIN_ID) {
-          if (owner) log.debug({ provider, errorClass: "other_owner" });
-          else logError(log, new CustodyOrphanError("tombstone has no serving handle; run ck auth migrate-opencode"), provider);
-          continue;
+        let handles: OpenCodeHandleFileV1;
+        try {
+          handles = await handleReader(defaultHandleFilePath());
+        } catch (error) {
+          const typed = error instanceof HandleFileValidationError
+            ? error
+            : new HandleFileValidationError(error instanceof Error ? error.message : String(error));
+          logError(log, typed, "handle-file");
+          return;
         }
 
-        const configured = cfg.provider[provider] ??= {};
-        const freshness = new FreshnessController({
-          provider,
-          shape: handle!.shape,
-          accounts: handle!.accounts,
-          client,
-          minTtlMs: dependencies.oauthMinTtlMs,
-          now: dependencies.now,
-          handleVersion: () => handleVersionReader(defaultHandleFilePath()),
-          log,
-          setInterval: dependencies.setInterval,
-          clearInterval: dependencies.clearInterval,
-        });
-        controllers.push(freshness);
-        configured.options = {
-          ...(configured.options ?? {}),
-          apiKey: sentinel(provider),
-          fetch: createServeFetch({
+        let auth: Record<string, unknown>;
+        try {
+          auth = await authReader(defaultAuthPath());
+        } catch (error) {
+          log.error({
+            errorClass: error instanceof Error ? error.name : "AuthReadError",
+            errorCode: (error as NodeJS.ErrnoException).code,
+          });
+          return;
+        }
+
+        const byProvider = new Map(handles.providers.map((provider) => [provider.provider, provider]));
+        const providers = [...byProvider.keys()];
+        for (const provider of Object.keys(auth)) {
+          if (!byProvider.has(provider) && isProviderTombstone(auth[provider], provider)) providers.push(provider);
+        }
+
+        const cfg = input as MutableConfig;
+        cfg.provider ??= {};
+        for (const provider of providers) {
+          const handle = byProvider.get(provider);
+          const entry = auth[provider];
+          const tombstone = isProviderTombstone(entry, provider);
+          const owner = handle?.serve;
+
+          if (!tombstone) {
+            if (owner === OUR_PLUGIN_ID) {
+              const error = new CustodySplitError(
+                `local credential is real while custody handles remain; run ck auth migrate-opencode --provider ${provider} to re-tombstone, or ck auth migrate-opencode --restore ${provider} to use the local credential`,
+              );
+              logError(log, error, provider);
+              const configured = cfg.provider[provider] ??= {};
+              configured.options = {
+                ...(configured.options ?? {}),
+                fetch: async () => { throw error; },
+              };
+            }
+            continue;
+          }
+          if (owner !== OUR_PLUGIN_ID) {
+            if (owner) log.debug({ provider, errorClass: "other_owner", errorCode: owner });
+            else logError(log, new CustodyOrphanError("tombstone has no serving handle; run ck auth migrate-opencode"), provider);
+            continue;
+          }
+
+          const configured = cfg.provider[provider] ??= {};
+          const freshness = new FreshnessController({
             provider,
+            shape: handle!.shape,
             accounts: handle!.accounts,
             client,
-            shape: handle!.shape,
-            freshness,
-            readAuthEntry: async () => (await authReader(defaultAuthPath()))[provider],
-            upstreamFetch,
+            minTtlMs: dependencies.oauthMinTtlMs,
+            now: dependencies.now,
+            handleVersion: () => handleVersionReader(defaultHandleFilePath()),
             log,
-          }),
-        };
-      }
-    },
+            setInterval: dependencies.setInterval,
+            clearInterval: dependencies.clearInterval,
+          });
+          controllers.push(freshness);
+          configured.options = {
+            ...(configured.options ?? {}),
+            apiKey: sentinel(provider),
+            fetch: createServeFetch({
+              provider,
+              accounts: handle!.accounts,
+              client,
+              shape: handle!.shape,
+              freshness,
+              readAuthEntry: async () => (await authReader(defaultAuthPath()))[provider],
+              upstreamFetch,
+              log,
+            }),
+          };
+        }
+      },
       dispose: async () => {
         for (const controller of controllers) controller.dispose();
         controllers = [];
@@ -173,3 +183,5 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
 }
 
 export const OpencodeClaustrumPlugin = createOpencodeClaustrumPlugin();
+
+export default OpencodeClaustrumPlugin;

@@ -3,8 +3,13 @@ import {
   type ServedCredential,
 } from "@cortexkit/claustrum-client";
 
-import { CustodySplitError } from "./errors";
-import { FreshnessController, type FreshnessAccount } from "./freshness";
+import { CustodyExhaustionError, CustodySplitError } from "./errors";
+import {
+  DEFAULT_RETRY_AFTER_MS,
+  FreshnessController,
+  PAYMENT_REQUIRED_COOLDOWN_MS,
+  type FreshnessAccount,
+} from "./freshness";
 import type { CustodyLogger } from "./log";
 import { snapshotRequest } from "./request";
 import { isProviderTombstone, sentinel } from "./tombstone";
@@ -37,14 +42,10 @@ type AccountRuntime = {
   account: ServeAccount;
 };
 
-export class CustodyExhaustionError extends Error {
-  override name = "CustodyExhaustionError";
-}
-
 function cooldownFromRetryAfter(value: string | null, now: number): number {
   if (value && /^\d+$/.test(value.trim())) return Number(value.trim()) * 1_000;
   const date = value ? Date.parse(value) : Number.NaN;
-  return Number.isFinite(date) ? Math.max(0, date - now) : 60_000;
+  return Number.isFinite(date) ? Math.max(0, date - now) : DEFAULT_RETRY_AFTER_MS;
 }
 
 async function discard(response: Response): Promise<void> {
@@ -123,7 +124,7 @@ export function createServeFetch(options: CreateServeFetchOptions) {
         continue;
       }
       if (response.status === 402) {
-        freshness.cooldown(account, 60 * 60 * 1_000);
+        freshness.cooldown(account, PAYMENT_REQUIRED_COOLDOWN_MS);
         options.log?.warn({
           provider: options.provider,
           label: account.label,

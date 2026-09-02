@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File, OpenOptions},
     io::Write,
@@ -218,10 +218,17 @@ fn validate_handle_file(file: &HandleFile) -> Result<(), OpenCodeFilesError> {
             "handle file must have version 1".into(),
         ));
     }
+    let mut provider_ids = BTreeSet::new();
     for (index, provider) in file.providers.iter().enumerate() {
         if provider.provider.is_empty() {
             return Err(OpenCodeFilesError::Invalid(format!(
                 "provider {index} has invalid provider"
+            )));
+        }
+        if !provider_ids.insert(&provider.provider) {
+            return Err(OpenCodeFilesError::Invalid(format!(
+                "provider {index} duplicates provider {}",
+                provider.provider
             )));
         }
         match provider.shape {
@@ -232,8 +239,48 @@ fn validate_handle_file(file: &HandleFile) -> Result<(), OpenCodeFilesError> {
                 "provider {index} requires serve"
             )));
         }
+        let mut labels = BTreeSet::new();
+        for account in &provider.accounts {
+            if account.label.is_empty() {
+                return Err(OpenCodeFilesError::Invalid(format!(
+                    "provider {index} has an empty account label"
+                )));
+            }
+            if !labels.insert(&account.label) {
+                return Err(OpenCodeFilesError::Invalid(format!(
+                    "provider {index} duplicates account label {}",
+                    account.label
+                )));
+            }
+            if !valid_handle(&account.handle) {
+                return Err(OpenCodeFilesError::Invalid(format!(
+                    "provider {index} account {} has invalid handle",
+                    account.label
+                )));
+            }
+            if account.credential_id.is_empty() {
+                return Err(OpenCodeFilesError::Invalid(format!(
+                    "provider {index} account {} has invalid credential id",
+                    account.label
+                )));
+            }
+            if account
+                .superseded
+                .iter()
+                .any(|handle| !valid_handle(handle))
+            {
+                return Err(OpenCodeFilesError::Invalid(format!(
+                    "provider {index} account {} has invalid superseded handle",
+                    account.label
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+fn valid_handle(handle: &str) -> bool {
+    handle.starts_with("ckh_") && handle.len() == 47
 }
 
 fn write_atomic(path: &Path, bytes: &[u8], secure_parent: bool) -> Result<(), OpenCodeFilesError> {

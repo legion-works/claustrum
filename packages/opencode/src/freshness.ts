@@ -46,6 +46,8 @@ const DEFAULT_MIN_TTL_MS = 270 * 60_000;
 const WARM_BUDGET_MS = 100;
 const TRANSIENT_BACKOFF_MS = 60_000;
 const REAUTH_BACKOFF_MS = 5 * 60_000;
+export const DEFAULT_RETRY_AFTER_MS = 60_000;
+export const PAYMENT_REQUIRED_COOLDOWN_MS = 60 * 60 * 1_000;
 
 export class FreshnessController {
   readonly #provider?: string;
@@ -85,11 +87,6 @@ export class FreshnessController {
   }
 
   #clearInterval?: (handle: IntervalHandle) => void;
-
-  peek(account: FreshnessAccount): ServedCredential | undefined {
-    const slot = this.#slot(account);
-    return this.#isFresh(slot) ? slot.cached : undefined;
-  }
 
   state(account: FreshnessAccount): FreshnessState | "cooldown" {
     const slot = this.#slot(account);

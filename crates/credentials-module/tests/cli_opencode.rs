@@ -36,6 +36,23 @@ fn mode(path: &Path) -> u32 {
         & 0o777
 }
 
+fn read_raw_handle_fixture(
+    name: &str,
+    raw: &str,
+) -> Result<opencode_files::HandleFile, opencode_files::OpenCodeFilesError> {
+    let root = tmp_root(name);
+    let handles = root.join("opencode-handles.json");
+    std::fs::write(&handles, raw).expect("handle fixture");
+    std::fs::set_permissions(
+        &handles,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("mode");
+    let result = opencode_files::read_handle_file(&handles);
+    let _ = std::fs::remove_dir_all(root);
+    result
+}
+
 #[test]
 fn the_golden_tombstone_matches_the_rust_contract() {
     let golden: Value = serde_json::from_str(include_str!(
@@ -87,6 +104,76 @@ fn an_unknown_handle_shape_is_refused() {
         "unknown shape must produce a named refusal: {err}"
     );
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_handle_file_with_duplicate_providers_is_refused() {
+    let err = read_raw_handle_fixture(
+        "duplicate-handle-provider",
+        r#"{"version":1,"providers":[{"provider":"deepseek","shape":"api","serve":"opencode-claustrum","accounts":[]},{"provider":"deepseek","shape":"api","serve":"opencode-claustrum","accounts":[]}]}"#,
+    )
+    .expect_err("duplicate providers refuse");
+
+    assert!(
+        err.to_string().contains("duplicates provider"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn a_handle_file_with_duplicate_labels_within_one_provider_is_refused() {
+    let err = read_raw_handle_fixture(
+        "duplicate-handle-label",
+        r#"{"version":1,"providers":[{"provider":"deepseek","shape":"api","serve":"opencode-claustrum","accounts":[{"label":"main","handle":"ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","credential_id":"apikey:deepseek:main"},{"label":"main","handle":"ckh_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","credential_id":"apikey:deepseek:backup"}]}]}"#,
+    )
+    .expect_err("duplicate labels refuse");
+
+    assert!(
+        err.to_string().contains("duplicates account label"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn a_handle_file_with_a_malformed_capability_is_refused() {
+    let err = read_raw_handle_fixture(
+        "malformed-handle",
+        r#"{"version":1,"providers":[{"provider":"deepseek","shape":"api","serve":"opencode-claustrum","accounts":[{"label":"main","handle":"ckh_too-short","credential_id":"apikey:deepseek:main"}]}]}"#,
+    )
+    .expect_err("malformed handle refuses");
+
+    assert!(
+        err.to_string().contains("invalid handle"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn a_handle_file_with_an_empty_credential_id_is_refused() {
+    let err = read_raw_handle_fixture(
+        "empty-credential-id",
+        r#"{"version":1,"providers":[{"provider":"deepseek","shape":"api","serve":"opencode-claustrum","accounts":[{"label":"main","handle":"ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","credential_id":""}]}]}"#,
+    )
+    .expect_err("empty credential id refuses");
+
+    assert!(
+        err.to_string().contains("invalid credential id"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn a_handle_file_with_a_malformed_superseded_capability_is_refused() {
+    let err = read_raw_handle_fixture(
+        "malformed-superseded-handle",
+        r#"{"version":1,"providers":[{"provider":"deepseek","shape":"api","serve":"opencode-claustrum","accounts":[{"label":"main","handle":"ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","credential_id":"apikey:deepseek:main","superseded":["not-a-handle"]}]}]}"#,
+    )
+    .expect_err("malformed superseded handle refuses");
+
+    assert!(
+        err.to_string().contains("invalid superseded handle"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -143,13 +230,13 @@ fn a_handle_file_round_trip_preserves_order_and_0600() {
                 accounts: vec![
                     opencode_files::HandleAccount {
                         label: "first".into(),
-                        handle: "ckh_first".into(),
+                        handle: "ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
                         credential_id: "apikey:deepseek:first".into(),
                         superseded: Vec::new(),
                     },
                     opencode_files::HandleAccount {
                         label: "second".into(),
-                        handle: "ckh_second".into(),
+                        handle: "ckh_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
                         credential_id: "apikey:deepseek:second".into(),
                         superseded: Vec::new(),
                     },
@@ -161,7 +248,7 @@ fn a_handle_file_round_trip_preserves_order_and_0600() {
                 serve: "opencode-claustrum".into(),
                 accounts: vec![opencode_files::HandleAccount {
                     label: "work".into(),
-                    handle: "ckh_work".into(),
+                    handle: "ckh_ccccccccccccccccccccccccccccccccccccccccccc".into(),
                     credential_id: "oauth:anthropic:work".into(),
                     superseded: Vec::new(),
                 }],
@@ -736,7 +823,8 @@ fn the_migrate_opencode_remints_and_compares_a_lost_handle() {
     assert!(rig.migrate(&[]).status.success());
     rig.set_auth(json!({"deepseek": {"type": "api", "key": "lost-secret"}}));
     let mut handles = opencode_files::read_handle_file(&rig.handles).unwrap();
-    handles.providers[0].accounts[0].handle = "ckh_lost".into();
+    let lost_handle = format!("ckh_{}", "l".repeat(43));
+    handles.providers[0].accounts[0].handle = lost_handle.clone();
     opencode_files::write_handle_file(&rig.handles, &handles).unwrap();
     let conn = spawn_migration_route_daemon(
         &rig.root,
@@ -758,7 +846,7 @@ fn the_migrate_opencode_remints_and_compares_a_lost_handle() {
             .providers[0]
             .accounts[0]
             .handle,
-        "ckh_lost"
+        lost_handle
     );
 }
 

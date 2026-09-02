@@ -6,7 +6,8 @@ import {
   createOpencodeClaustrumPlugin,
   type ConfigHookDependencies,
 } from "../plugin";
-import { HandleFileValidationError, readHandleFile } from "../handles";
+import { CustodySplitError } from "../errors";
+import { readHandleFile } from "../handles";
 import { sentinel, tombstoneFor } from "../tombstone";
 
 const ROOT = "/tmp/opencode/custody-t6";
@@ -90,17 +91,28 @@ describe("OpenCode custody config hook", () => {
     expect(cfg.provider.deepseek.options).toEqual({ baseURL: "https://deepseek.example", headers: { "x-stock": "kept" } });
   });
 
-  test("logs CustodySplitError and injects nothing for a real local credential owned by us", async () => {
+  test("logs CustodySplitError and refuses requests for a real local credential owned by us", async () => {
     const files = await fixture("split");
     await writeHandles(files.handles, handles("deepseek"));
     await writeAuth(files.auth, { deepseek: { type: "api", key: "local-key" } });
     const logs: string[] = [];
     const cfg = config("deepseek");
+    cfg.provider.deepseek.options!.apiKey = "local-key";
+    let forwarded = 0;
 
-    await hook(cfg, { log: (line) => logs.push(line) });
+    await hook(cfg, {
+      log: (line) => logs.push(line),
+      fetch: (async () => {
+        forwarded += 1;
+        return new Response("must not forward");
+      }) as never,
+    });
 
     expect(logs.join("\n")).toContain("CustodySplitError");
-    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(cfg.provider.deepseek.options?.apiKey).toBe("local-key");
+    expect(typeof cfg.provider.deepseek.options?.fetch).toBe("function");
+    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example")).rejects.toBeInstanceOf(CustodySplitError);
+    expect(forwarded).toBe(0);
   });
 
   test("logs CustodyOrphanError and injects nothing for a tombstone without a handle entry", async () => {
@@ -223,6 +235,7 @@ describe("OpenCode custody config hook", () => {
     await hook(cfg, { log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("debug");
+    expect(logs.join("\n")).toContain("anthropic-auth");
     expect(cfg.provider.anthropic.options?.apiKey).toBeUndefined();
   });
 });
