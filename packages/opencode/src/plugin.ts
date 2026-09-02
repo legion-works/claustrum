@@ -88,6 +88,12 @@ async function readAuth(path: string, reader: (path: string) => Promise<Record<s
   return reader(path);
 }
 
+// Raw-byte scan for self-describing sentinels when the auth source cannot be parsed. Two
+// deliberate limits, coupled: (1) a JSON-escaped sentinel (`\u0063laustrum-…`) is not found, and
+// (2) no hits means no refusals so a never-migrated user with a large auth.json keeps working —
+// both are the same no-hit branch; closing (1) breaks (2). A mis-keyed sentinel refuses the
+// provider it NAMES, not the entry that carries it; tolerable only because the sentinel is
+// non-secret (availability loss, nothing exposed). Rationale: docs/opencode-custody-design.md.
 function scanTombstones(source: string, providers: Set<string>, allowTrailing = false) {
   let index = 0;
   while ((index = source.indexOf(TOMBSTONE_PREFIX, index)) !== -1) {
