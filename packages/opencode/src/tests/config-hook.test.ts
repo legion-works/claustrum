@@ -12,6 +12,7 @@ import { sentinel, tombstoneFor } from "../tombstone";
 
 const ROOT = "/tmp/opencode/custody-t6";
 const HANDLE = `ckh_${"a".repeat(43)}`;
+const AUTH_SCAN_CHUNK_BYTES = 64 * 1024;
 const savedEnv = new Map<string, string | undefined>();
 
 type TestConfig = {
@@ -325,6 +326,96 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await expectRefusal(cfg, "deepseek", /auth-read failure.*exceeds 1 MiB/);
   });
 
+  test("refuses an oversized tombstone when the handle file is absent", async () => {
+    const files = await fixture("large-auth-missing-handles");
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek"), padding: "x".repeat(1024 * 1024) });
+    const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
+
+    await hook(cfg);
+
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*1 MiB.*bounded tombstone scan/);
+  });
+
+  test("finds a tombstone after 1 MiB when its sentinel crosses a scan chunk boundary", async () => {
+    const files = await fixture("large-auth-straddling-sentinel");
+    const value = sentinel("deepseek");
+    const sentinelOffset = 1024 * 1024 + AUTH_SCAN_CHUNK_BYTES - Math.ceil(value.length / 2);
+    const source = `{"padding":"${"x".repeat(sentinelOffset - '{"padding":"'.length)}${value}","deepseek":${JSON.stringify(tombstoneFor("api", "deepseek"))}}`;
+    await writeFile(files.auth, source);
+    await chmod(files.auth, 0o600);
+    const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
+
+    await hook(cfg);
+
+    await expectRefusal(cfg, "deepseek", /bounded tombstone scan/);
+  });
+
+  test("leaves a never-migrated oversized auth source without tombstones untouched", async () => {
+    const files = await fixture("large-auth-no-tombstone");
+    await writeAuth(files.auth, { deepseek: { type: "api", key: "local-key" }, padding: "x".repeat(1024 * 1024) });
+    const cfg = config("deepseek");
+
+    await hook(cfg);
+
+    expect(cfg.provider.deepseek.options).toEqual({ baseURL: "https://deepseek.example", headers: { "x-stock": "kept" } });
+  });
+
+  test("refuses a malformed auth source containing a tombstone when the handle file is absent", async () => {
+    const files = await fixture("malformed-auth-missing-handles");
+    await writeFile(files.auth, `{"deepseek":${JSON.stringify(tombstoneFor("api", "deepseek"))}`);
+    await chmod(files.auth, 0o600);
+    const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
+
+    await hook(cfg);
+
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*invalid JSON.*bounded tombstone scan/);
+  });
+
+  test("refuses a malformed OPENCODE_AUTH_CONTENT source containing a tombstone", async () => {
+    const files = await fixture("malformed-auth-env");
+    useEnv("OPENCODE_AUTH_CONTENT", `{"deepseek":${JSON.stringify(tombstoneFor("api", "deepseek"))}`);
+    const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
+
+    await hook(cfg);
+
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*OPENCODE_AUTH_CONTENT.*bounded tombstone scan/);
+  });
+
+  test("refuses every scanned tombstone without disturbing configured providers absent from the scan", async () => {
+    const files = await fixture("large-auth-two-tombstones");
+    await writeAuth(files.auth, {
+      deepseek: tombstoneFor("api", "deepseek"),
+      xai: tombstoneFor("api", "xai"),
+      padding: "x".repeat(1024 * 1024),
+    });
+    const cfg = config("deepseek", "xai", "anthropic");
+    prepareRefusalProbe(cfg, "deepseek");
+    prepareRefusalProbe(cfg, "xai");
+
+    await hook(cfg);
+
+    await expectRefusal(cfg, "deepseek", /bounded tombstone scan/);
+    await expectRefusal(cfg, "xai", /bounded tombstone scan/);
+    expect(cfg.provider.anthropic.options).toEqual({ baseURL: "https://anthropic.example", headers: { "x-stock": "kept" } });
+  });
+
+  test("documents the escaped-sentinel scan limitation without refusing a never-migrated source", async () => {
+    const files = await fixture("escaped-tombstone-scan-hole");
+    // This escaped-sentinel hole and the never-migrated accommodation are the same no-hit branch
+    // from two sides; refusing configured providers on no-hit would silently break the latter.
+    await writeFile(files.auth, `{"deepseek":{"type":"api","key":"\\u0063laustrum-tombstone:v1:deepseek"},"padding":"${"x".repeat(1024 * 1024)}",`);
+    await chmod(files.auth, 0o600);
+    const cfg = config("deepseek");
+
+    await hook(cfg);
+
+    expect(cfg.provider.deepseek.options).toEqual({ baseURL: "https://deepseek.example", headers: { "x-stock": "kept" } });
+  });
+
   test("refuses an unparseable auth.json with a typed auth-read failure", async () => {
     const files = await fixture("invalid-auth-file");
     await writeHandles(files.handles, handles("deepseek"));
@@ -506,7 +597,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(detects).toBe(2);
   });
 
-  test("returns an inert plugin before touching custody files when CLAUSTRUM_CUSTODY_DISABLE is set", async () => {
+  test("warns that disabled custody sends tombstones to the wire while avoiding auth and daemon I/O", async () => {
     useEnv("CLAUSTRUM_CUSTODY_DISABLE", "1");
     const calls = { auth: 0, handles: 0, detect: 0 };
     const logs: string[] = [];
@@ -520,10 +611,16 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     })({} as never);
     await hooks.config?.(cfg as never);
 
-    expect(calls).toEqual({ auth: 0, handles: 0, detect: 0 });
+    expect(calls).toEqual({ auth: 0, handles: 1, detect: 0 });
     expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
     expect(logs).toHaveLength(1);
     expect(logs[0]).toContain("custody_disabled");
+    expect(logs[0]).toContain('"level":"warn"');
+    expect(logs[0]).toContain("deliberately off");
+    expect(logs[0]).toContain("WILL FAIL with a 401");
+    expect(logs[0]).toContain("ck auth migrate-opencode --restore <provider>");
+    expect(logs[0]).toContain("unsetting the switch");
+    expect(logs[0]).toContain("deepseek");
   });
 
   // OpenCode parses the flag case-sensitively. Serving only on absence or a documented disabling

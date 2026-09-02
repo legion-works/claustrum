@@ -1,3 +1,4 @@
+import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -17,11 +18,15 @@ import { FreshnessController } from "./freshness";
 import { defaultHandleFilePath, handleFileRevision, OUR_PLUGIN_ID, readHandleFile, type OpenCodeHandleFileV1 } from "./handles";
 import { createLogger, serializedLogSink, type CustodyLogger, type LogSink } from "./log";
 import { createServeFetch, type ServeClient } from "./serve";
-import { isProviderTombstone, sentinel } from "./tombstone";
+import { isProviderTombstone, sentinel, TOMBSTONE_PREFIX } from "./tombstone";
 
 type ConfigProvider = { options?: Record<string, unknown> };
 type MutableConfig = { provider?: Record<string, ConfigProvider> };
 const AUTH_FILE_MAX_BYTES = 1024 * 1024;
+const AUTH_SCAN_CHUNK_BYTES = 64 * 1024;
+const AUTH_SCAN_CARRY_BYTES = TOMBSTONE_PREFIX.length + 64;
+const SCANNED_PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const FORBIDDEN_PROVIDER_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
 export type ConfigHookDependencies = {
   handleReader?: (path: string) => Promise<OpenCodeHandleFileV1>;
@@ -55,9 +60,10 @@ async function readAuthFile(path: string): Promise<Record<string, unknown>> {
       if (error instanceof AuthFileValidationError) throw error;
       throw new AuthFileValidationError(`auth file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
     }
-    return value && typeof value === "object" && !Array.isArray(value)
-      ? value as Record<string, unknown>
-      : {};
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new AuthFileValidationError("auth file must contain an object");
+    }
+    return value as Record<string, unknown>;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     if (error instanceof AuthFileValidationError) throw error;
@@ -67,16 +73,59 @@ async function readAuthFile(path: string): Promise<Record<string, unknown>> {
 
 async function readAuth(path: string, reader: (path: string) => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
   const content = process.env.OPENCODE_AUTH_CONTENT;
-  if (content) {
+  if (content !== undefined) {
     try {
       const value: unknown = JSON.parse(content);
-      return value && typeof value === "object" && !Array.isArray(value)
-        ? value as Record<string, unknown>
-        : {};
-    } catch {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new AuthFileValidationError("OPENCODE_AUTH_CONTENT must contain an object");
+      }
+      return value as Record<string, unknown>;
+    } catch (error) {
+      if (error instanceof AuthFileValidationError) throw error;
+      throw new AuthFileValidationError(`OPENCODE_AUTH_CONTENT contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   return reader(path);
+}
+
+function scanTombstones(source: string, providers: Set<string>, allowTrailing = false) {
+  let index = 0;
+  while ((index = source.indexOf(TOMBSTONE_PREFIX, index)) !== -1) {
+    const start = index + TOMBSTONE_PREFIX.length;
+    let end = start;
+    while (end - start < 64 && /[a-z0-9._-]/.test(source[end] ?? "")) end += 1;
+    if (end > start && (allowTrailing || end < source.length)) providers.add(source.slice(start, end));
+    index = start;
+  }
+}
+
+async function scanAuthTombstones(path: string): Promise<Set<string>> {
+  const providers = new Set<string>();
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(path, { highWaterMark: AUTH_SCAN_CHUNK_BYTES });
+    let carry = "";
+    stream.on("data", (chunk: Buffer) => {
+      const source = carry + chunk.toString("latin1");
+      scanTombstones(source, providers);
+      carry = source.slice(-AUTH_SCAN_CARRY_BYTES);
+    });
+    stream.on("error", reject);
+    stream.on("end", () => {
+      scanTombstones(carry, providers, true);
+      resolve();
+    });
+  });
+  return providers;
+}
+
+async function scanAuthSource(path: string): Promise<Set<string>> {
+  const content = process.env.OPENCODE_AUTH_CONTENT;
+  if (content !== undefined) {
+    const providers = new Set<string>();
+    scanTombstones(content, providers, true);
+    return providers;
+  }
+  return scanAuthTombstones(path);
 }
 
 // Effect's Config.boolean (effect@4.0.0-beta.74 dist/Config.js:541-562, the parser behind
@@ -101,9 +150,9 @@ function logError(log: CustodyLogger, error: Error, provider: string) {
   });
 }
 
-function authReadRefusal(error: unknown): CustodyAuthReadError {
+function authReadRefusal(error: unknown, fromBoundedScan = false): CustodyAuthReadError {
   const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-  return new CustodyAuthReadError(`auth-read failure: ${cause}`);
+  return new CustodyAuthReadError(`auth-read failure: ${cause}${fromBoundedScan ? "; provider list came from a bounded tombstone scan" : ""}`);
 }
 
 export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependencies = {}): Plugin {
@@ -111,8 +160,24 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
   const authReader = dependencies.authReader ?? readAuthFile;
   const log = createLogger(dependencies.logSink ?? (dependencies.log ? serializedLogSink(dependencies.log) : undefined));
   if (process.env.CLAUSTRUM_CUSTODY_DISABLE === "1") {
-    log.info({ errorCode: "custody_disabled" });
-    return async () => ({});
+    return async () => ({
+      config: async () => {
+        try {
+          const owned = (await handleReader(defaultHandleFilePath())).providers
+            .filter((provider) => provider.serve === OUR_PLUGIN_ID)
+            .map((provider) => provider.provider);
+          log.warn({
+            errorCode: "custody_disabled",
+            errorMessage: `Custody is deliberately off; any tombstoned provider WILL FAIL with a 401 while CLAUSTRUM_CUSTODY_DISABLE=1 sends the tombstone to the wire as the key. Real credentials return only via ck auth migrate-opencode --restore <provider> or unsetting the switch. Owned providers: ${owned.join(", ") || "none"}.`,
+          });
+        } catch {
+          log.warn({
+            errorCode: "custody_disabled",
+            errorMessage: "Custody is deliberately off; any tombstoned provider WILL FAIL with a 401 while CLAUSTRUM_CUSTODY_DISABLE=1 sends the tombstone to the wire as the key. Real credentials return only via ck auth migrate-opencode --restore <provider> or unsetting the switch. Handle ownership was not read.",
+          });
+        }
+      },
+    });
   }
   const detection = dependencies.detect ?? detectClaustrumConnection;
   const clientFactory = dependencies.clientFactory ?? ClaustrumClient.connect;
@@ -162,6 +227,25 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             fetch: async () => { throw error; },
           };
         };
+        const configureAuthReadRefusals = async (error: unknown, ownedProviders: Iterable<string>) => {
+          const refusal = authReadRefusal(error, true);
+          const providers = new Set(ownedProviders);
+          try {
+            for (const provider of await scanAuthSource(defaultAuthPath())) providers.add(provider);
+          } catch (scanError) {
+            logError(log, new CustodyAuthReadError(
+              `bounded tombstone scan failed: ${scanError instanceof Error ? `${scanError.name}: ${scanError.message}` : String(scanError)}`,
+            ), "auth-scan");
+          }
+          for (const provider of providers) {
+            if ((!SCANNED_PROVIDER_ID.test(provider) || FORBIDDEN_PROVIDER_IDS.has(provider)) && !Object.hasOwn(providerConfig, provider)) {
+              logError(log, refusal, provider);
+              continue;
+            }
+            logError(log, refusal, provider);
+            configureRefusal(provider, refusal);
+          }
+        };
         let handles: OpenCodeHandleFileV1;
         try {
           handles = await handleReader(defaultHandleFilePath());
@@ -174,11 +258,7 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
           try {
             auth = await readAuth(defaultAuthPath(), authReader);
           } catch (authError) {
-            const refusal = authReadRefusal(authError);
-            for (const provider of Object.keys(providerConfig)) {
-              logError(log, refusal, provider);
-              configureRefusal(provider, refusal);
-            }
+            await configureAuthReadRefusals(authError, []);
             return;
           }
           for (const [provider, entry] of Object.entries(auth)) {
@@ -195,12 +275,10 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         try {
           auth = await readAuth(defaultAuthPath(), authReader);
         } catch (error) {
-          const refusal = authReadRefusal(error);
-          for (const handle of handles.providers) {
-            if (handle.serve !== OUR_PLUGIN_ID) continue;
-            logError(log, refusal, handle.provider);
-            configureRefusal(handle.provider, refusal);
-          }
+          await configureAuthReadRefusals(
+            error,
+            handles.providers.filter((handle) => handle.serve === OUR_PLUGIN_ID).map((handle) => handle.provider),
+          );
           return;
         }
 

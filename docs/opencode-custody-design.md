@@ -220,12 +220,40 @@ Four cells, all explicit:
 | tombstone | other owner | not ours — inject nothing, debug log only; the named owner serves it |
 | real credential | `opencode-claustrum` | `SplitCustody`: log loud; inject a REFUSING `fetch` that rejects with `CustodySplitError` before any request leaves the process (`apiKey` untouched). Serving either copy is wrong: the local key rotates the family away from the vault; the vault copy ignores what the operator just wrote. Never throw from the `config` hook itself: that takes down every provider, not the split one. |
 | real credential | absent | not ours; untouched |
+| any | any, with `CLAUSTRUM_CUSTODY_DISABLE=1` | fail-open by operator instruction; the plugin warns that tombstones go to the wire and fail with 401 until restore or re-enable |
 
 The third cell is the hazard specific to the config hook: `1485`/`1646` merge unvalidated,
 so a stale `serve` entry after `--restore` (or a hand-restored key) would otherwise inject
 the sentinel over a real credential with no tombstone left to flag it. Dedicated-plugin
 owners implement the same table for their own `serve` value (anthropic-auth: trigger =
 `isTombstone`, authorization = `serve`, same four cells, same typed errors).
+
+### Auth-read conjunction and bounded recovery
+
+The handle reader treats an absent file as an empty provider list. Separately, an auth-read
+failure refuses only providers the handle file names. Those paths are individually correct but
+their conjunction is not: an oversized or malformed auth source containing a tombstone plus an
+absent handle file used to leave no provider to refuse, so OpenCode sent the tombstone as the key.
+When the selected auth source cannot be fully read, parsed, or validated, scan its raw source in
+bounded chunks for `claustrum-tombstone:v1:<provider>` and refuse those providers, unioned with
+any readable `serve: opencode-claustrum` handles. No scan hit with no owned handle leaves a
+never-migrated user alone deliberately; refusing all configured providers there would turn a
+large local `auth.json` into an unrelated outage.
+
+A sentinel under the wrong key is not ownership proof for the key: if
+`claustrum-tombstone:v1:A` sits under key B, the scan refuses A while B (the entry actually
+carrying the tombstone) is NOT refused and 401s with the sentinel as its key. This is acceptable
+only because the sentinel is NON-SECRET: the worst case is availability loss on two providers, no
+credential exposed. The plugin deliberately does not refuse on bare prefix presence: that is a
+hand-edit-only scenario, and doing so would degrade this path to refusing owners plus all
+configured providers.
+
+The raw-byte scan does not recognize JSON escapes: `"\\u0063laustrum-tombstone:v1:deepseek"`
+parses to the sentinel but has no raw prefix. It requires an absent handle file, a parse failure,
+and a hand edit or foreign writer because the CLI writes unescaped sentinels. This known hole and
+the never-migrated accommodation are the same no-hit branch from two sides: closing the hole by
+refusing owned plus configured providers silently breaks the accommodation, so a change to either
+requires deciding both.
 
 Detect the vault, open ONE route (identity per §4), warm each account with one
 `credential.get` under a bounded await (≤100 ms); unreachable vault → caches stay cold,
