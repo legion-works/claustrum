@@ -1,1 +1,6 @@
-export { OpencodeClaustrumPlugin as default } from "./plugin";
+import { OpencodeClaustrumPlugin } from "./plugin";
+
+export default {
+  id: "opencode-claustrum",
+  server: OpencodeClaustrumPlugin,
+};

@@ -22,6 +22,14 @@ export class CustodyOrphanError extends Error {
   override name = "CustodyOrphanError";
 }
 
+export class CustodyAuthReadError extends Error {
+  override name = "CustodyAuthReadError";
+}
+
+export class CustodyNativeRuntimeError extends Error {
+  override name = "CustodyNativeRuntimeError";
+}
+
 export class CustodyExhaustionError extends Error {
   override name = "CustodyExhaustionError";
 }

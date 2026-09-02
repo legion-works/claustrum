@@ -3,7 +3,7 @@ import {
   type ServedCredential,
 } from "@cortexkit/claustrum-client";
 
-import { CustodyExhaustionError, CustodyRedirectRefusedError, CustodySplitError } from "./errors";
+import { CustodyAuthReadError, CustodyExhaustionError, CustodyRedirectRefusedError, CustodySplitError } from "./errors";
 import {
   DEFAULT_RETRY_AFTER_MS,
   FreshnessController,
@@ -42,6 +42,17 @@ type AccountRuntime = {
   account: ServeAccount;
 };
 
+const REPORT_BUDGET_MS = 100;
+
+async function reportWithinBudget(report: Promise<void>): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    report.catch(() => {}),
+    new Promise<void>((resolve) => { timeout = setTimeout(resolve, REPORT_BUDGET_MS); }),
+  ]);
+  if (timeout !== undefined) clearTimeout(timeout);
+}
+
 function cooldownFromRetryAfter(value: string | null, now: number): number {
   if (value && /^\d+$/.test(value.trim())) return Number(value.trim()) * 1_000;
   const date = value ? Date.parse(value) : Number.NaN;
@@ -77,7 +88,14 @@ export function createServeFetch(options: CreateServeFetchOptions) {
 
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const snapshot = await snapshotRequest(input, init, providerSentinel);
-    const authEntry = await options.readAuthEntry();
+    let authEntry: unknown;
+    try {
+      authEntry = await options.readAuthEntry();
+    } catch (error) {
+      throw new CustodyAuthReadError(
+        `could not read OpenCode auth entry: ${error instanceof Error ? error.name : "unknown error"}`,
+      );
+    }
     if (!isProviderTombstone(authEntry, options.provider)) {
       throw new CustodySplitError("local credential is real while custody handles remain; migrate or restore ownership");
     }
@@ -104,12 +122,12 @@ export function createServeFetch(options: CreateServeFetchOptions) {
             });
             await discard(response);
             try {
-              await options.client.reportAuthFailure({
+              await reportWithinBudget(options.client.reportAuthFailure({
                 handle: account.handle,
                 providerStatus: 401,
                 recordVersion: attempt.recordVersion,
                 reporterSource: "direct",
-              });
+              }));
             } finally {
               freshness.invalidate(account);
             }
@@ -153,7 +171,10 @@ export function createServeFetch(options: CreateServeFetchOptions) {
         }
         await discard(response);
         target = next;
-        methodOverride = response.status === 303 ? "GET" : methodOverride;
+        methodOverride = response.status === 303 ||
+          ((response.status === 301 || response.status === 302) && forwarded.method === "POST")
+          ? "GET"
+          : methodOverride;
       }
 
       continue;

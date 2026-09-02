@@ -41,10 +41,11 @@ async function hooks(input: Parameters<typeof createOpencodeClaustrumPlugin>[0])
 }
 
 describe("exported OpenCode custody plugin lifecycle", () => {
-  test("exports the plugin function from a dedicated file-plugin entrypoint", async () => {
-    const module = await import("../opencode-plugin") as unknown as { default?: unknown };
+  test("exports the OpenCode v1 plugin object from a dedicated file-plugin entrypoint", async () => {
+    const module = await import("../opencode-plugin") as unknown as { default?: { id?: unknown; server?: unknown } };
 
-    expect(typeof module.default).toBe("function");
+    expect(module.default?.id).toBe("opencode-claustrum");
+    expect(typeof module.default?.server).toBe("function");
   });
 
   test("injects an owned tombstone provider and substitutes through the real plugin fetch", async () => {

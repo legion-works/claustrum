@@ -165,34 +165,30 @@ describe("OpenCode custody serve fetch", () => {
     expect(requests).toHaveLength(3);
   });
 
-  test("follows same-origin redirects with a newly substituted manual request", async () => {
-    const requests: Request[] = [];
-    const client = clientWith();
-    const fetch = serve({
-      client,
-      upstream: async (request) => {
-        const forwarded = new Request(request);
-        requests.push(forwarded);
-        if (new URL(forwarded.url).pathname === "/v1/chat") {
-          return new Response(null, {
-            status: 302,
-            headers: { Location: "/v1/final?key=" + encodeURIComponent(SENTINEL) },
-          });
-        }
-        return new Response("upstream", { status: 200 });
-      },
-    });
+  test("rewrites POST to GET and drops its body for same-origin 301 and 302 redirects", async () => {
+    for (const status of [301, 302]) {
+      const requests: Request[] = [];
+      const fetch = serve({
+        upstream: async (request) => {
+          const forwarded = new Request(request);
+          requests.push(forwarded);
+          return requests.length === 1
+            ? new Response(null, { status, headers: { Location: "/v1/final?key=" + encodeURIComponent(SENTINEL) } })
+            : new Response("upstream", { status: 200 });
+        },
+      });
 
-    expect((await fetch(`https://upstream.example/v1/chat?key=${encodeURIComponent(SENTINEL)}`, {
-      method: "POST",
-      headers: { "X-Api-Key": SENTINEL },
-      body: "request-body",
-    })).status).toBe(200);
-    expect(client.gets).toEqual([MAIN_HANDLE]);
-    expect(requests).toHaveLength(2);
-    expect(requests[1]?.url).toContain("key=material-main");
-    expect(requests[1]?.headers.get("x-api-key")).toBe("material-main");
-    expect(requests[1]?.method).toBe("POST");
+      expect((await fetch(`https://upstream.example/v1/chat?key=${encodeURIComponent(SENTINEL)}`, {
+        method: "POST",
+        headers: { "X-Api-Key": SENTINEL },
+        body: "request-body",
+      })).status).toBe(200);
+      expect(requests).toHaveLength(2);
+      expect(requests[1]?.url).toContain("key=material-main");
+      expect(requests[1]?.headers.get("x-api-key")).toBe("material-main");
+      expect(requests[1]?.method).toBe("GET");
+      expect(await requests[1]?.text()).toBe("");
+    }
   });
 
   test("turns a same-origin 303 into a GET before forwarding", async () => {
@@ -233,6 +229,24 @@ describe("OpenCode custody serve fetch", () => {
     expect(await requests[1]?.text()).toBe("");
     expect(requests[2]?.method).toBe("GET");
     expect(await requests[2]?.text()).toBe("");
+  });
+
+  test("preserves a POST and body across same-origin 307 and 308 redirects", async () => {
+    for (const status of [307, 308]) {
+      const requests: Request[] = [];
+      const fetch = serve({
+        upstream: async (request) => {
+          requests.push(new Request(request));
+          return requests.length === 1
+            ? new Response(null, { status, headers: { Location: "/final" } })
+            : new Response("ok");
+        },
+      });
+
+      expect((await fetch("https://upstream.example/start", { method: "POST", body: "body" })).status).toBe(200);
+      expect(requests[1]?.method).toBe("POST");
+      expect(await requests[1]?.text()).toBe("body");
+    }
   });
 
   test("refuses a cross-origin redirect before an attacker receives substituted headers or can report 401", async () => {
@@ -336,6 +350,42 @@ describe("OpenCode custody serve fetch", () => {
 
     await expect(fetch(`https://upstream.example/v1/chat?key=${encodeURIComponent(SENTINEL)}`)).rejects.toBeInstanceOf(CustodySplitError);
     expect(forwarded).toBe(0);
+  });
+
+  test("wraps an auth read failure as a custody refusal before forwarding", async () => {
+    let forwarded = 0;
+    const fetch = serve({
+      readAuthEntry: () => { throw new SyntaxError("torn auth json"); },
+      upstream: async () => {
+        forwarded += 1;
+        return new Response("must not forward");
+      },
+    });
+
+    await expect(fetch("https://upstream.example/v1/chat")).rejects.toHaveProperty("name", "CustodyAuthReadError");
+    expect(forwarded).toBe(0);
+  });
+
+  test("bounds a hung auth-failure report before failing over", async () => {
+    const client = {
+      getCredential: async (handle: string) => handle === MAIN_HANDLE ? credential("main", 1) : credential("backup", 2),
+      reportAuthFailure: async () => new Promise<void>(() => {}),
+    };
+    let requests = 0;
+    const fetch = createServeFetch({
+      provider: PROVIDER,
+      accounts,
+      client,
+      readAuthEntry: () => tombstoneFor("api", PROVIDER),
+      upstreamFetch: async () => new Response("upstream", { status: ++requests === 1 ? 401 : 200 }),
+    });
+
+    const result = await Promise.race([
+      fetch("https://upstream.example/v1/chat"),
+      new Promise<Response>((_, reject) => setTimeout(() => reject(new Error("report exceeded 250ms budget")), 250)),
+    ]);
+    expect(result.status).toBe(200);
+    expect(requests).toBe(2);
   });
 
   test("names only provider and account state summaries when all accounts are exhausted", async () => {

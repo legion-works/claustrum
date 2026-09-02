@@ -147,6 +147,36 @@ describe("custody freshness", () => {
     expect(client.gets).toEqual([{ handle: MAIN_HANDLE, minTtlMs: undefined }]);
   });
 
+  test("warns once when an oauth cache serves after a recent transport failure", async () => {
+    const entries: unknown[] = [];
+    let fail = false;
+    const client = new FakeClient(async () => {
+      if (fail) throw new Error("daemon down");
+      return credential("cached");
+    });
+    const freshness = new FreshnessController({
+      provider: PROVIDER,
+      shape: "oauth",
+      accounts: [apiAccounts[0]!],
+      client,
+      log: createLogger((entry) => entries.push(entry)),
+      setInterval: () => ({ unref: () => {} }),
+      clearInterval: () => {},
+      setTimeout: (callback) => {
+        queueMicrotask(callback);
+        return {};
+      },
+    });
+
+    await freshness.tick();
+    fail = true;
+    await freshness.tick();
+    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("cached"));
+    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("cached"));
+
+    expect(entries.filter((entry) => (entry as { errorCode?: string }).errorCode === "serving_cached")).toHaveLength(1);
+  });
+
   test("warms each oauth account at most once per tick", async () => {
     const pending = deferred<ServedCredential>();
     const intervals = fakeInterval();

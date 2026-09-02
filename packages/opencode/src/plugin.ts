@@ -4,7 +4,13 @@ import { join } from "node:path";
 import { ClaustrumClient, detectClaustrumConnection } from "@cortexkit/claustrum-client";
 import type { Plugin } from "@opencode-ai/plugin";
 
-import { AuthFileValidationError, CustodyOrphanError, CustodySplitError, HandleFileValidationError } from "./errors";
+import {
+  AuthFileValidationError,
+  CustodyNativeRuntimeError,
+  CustodyOrphanError,
+  CustodySplitError,
+  HandleFileValidationError,
+} from "./errors";
 import { FreshnessController } from "./freshness";
 import { defaultHandleFilePath, handleFileRevision, OUR_PLUGIN_ID, readHandleFile, type OpenCodeHandleFileV1 } from "./handles";
 import { createLogger, serializedLogSink, type CustodyLogger, type LogSink } from "./log";
@@ -35,7 +41,7 @@ function defaultAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(dataHome, "opencode", "auth.json");
 }
 
-async function readAuth(path: string): Promise<Record<string, unknown>> {
+async function readAuthFile(path: string): Promise<Record<string, unknown>> {
   try {
     if ((await stat(path)).size > AUTH_FILE_MAX_BYTES) {
       throw new AuthFileValidationError("auth file exceeds 1 MiB");
@@ -50,6 +56,20 @@ async function readAuth(path: string): Promise<Record<string, unknown>> {
   }
 }
 
+async function readAuth(path: string, reader: (path: string) => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
+  const content = process.env.OPENCODE_AUTH_CONTENT;
+  if (content) {
+    try {
+      const value: unknown = JSON.parse(content);
+      return value && typeof value === "object" && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : {};
+    } catch {
+    }
+  }
+  return reader(path);
+}
+
 function logError(log: CustodyLogger, error: Error, provider: string) {
   log.error({
     provider,
@@ -60,8 +80,12 @@ function logError(log: CustodyLogger, error: Error, provider: string) {
 
 export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependencies = {}): Plugin {
   const handleReader = dependencies.handleReader ?? readHandleFile;
-  const authReader = dependencies.authReader ?? readAuth;
+  const authReader = dependencies.authReader ?? readAuthFile;
   const log = createLogger(dependencies.logSink ?? (dependencies.log ? serializedLogSink(dependencies.log) : undefined));
+  if (process.env.CLAUSTRUM_CUSTODY_DISABLE === "1") {
+    log.info({ errorCode: "custody_disabled" });
+    return async () => ({});
+  }
   const detection = dependencies.detect ?? detectClaustrumConnection;
   const clientFactory = dependencies.clientFactory ?? ClaustrumClient.connect;
   const upstreamFetch = dependencies.fetch ?? globalThis.fetch;
@@ -78,12 +102,19 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
   };
 
   async function connect(): Promise<ClaustrumClient> {
-    connected ??= (async () => {
+    if (connected) return connected;
+    const pending = (async () => {
       const result = await detection();
       if (result.status !== "available") throw new Error(`Claustrum connection ${result.status}`);
       return clientFactory();
     })();
-    return connected;
+    connected = pending;
+    try {
+      return await pending;
+    } catch (error) {
+      if (connected === pending) connected = undefined;
+      throw error;
+    }
   }
 
   return async () => {
@@ -92,6 +123,27 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
       config: async (input) => {
         for (const controller of controllers) controller.dispose();
         controllers = [];
+        const cfg = input as MutableConfig;
+        const providerConfig = cfg.provider ?? (cfg.provider = Object.create(null) as Record<string, ConfigProvider>);
+        const configureRefusal = (provider: string, error: Error) => {
+          const configured = Object.hasOwn(providerConfig, provider)
+            ? providerConfig[provider]!
+            : (providerConfig[provider] = {});
+          configured.options = {
+            ...(configured.options ?? {}),
+            fetch: async () => { throw error; },
+          };
+        };
+        let auth: Record<string, unknown>;
+        try {
+          auth = await readAuth(defaultAuthPath(), authReader);
+        } catch (error) {
+          log.error({
+            errorClass: error instanceof Error ? error.name : "AuthReadError",
+            errorCode: (error as NodeJS.ErrnoException).code,
+          });
+          return;
+        }
         let handles: OpenCodeHandleFileV1;
         try {
           handles = await handleReader(defaultHandleFilePath());
@@ -100,17 +152,14 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             ? error
             : new HandleFileValidationError(error instanceof Error ? error.message : String(error));
           logError(log, typed, "handle-file");
-          return;
-        }
-
-        let auth: Record<string, unknown>;
-        try {
-          auth = await authReader(defaultAuthPath());
-        } catch (error) {
-          log.error({
-            errorClass: error instanceof Error ? error.name : "AuthReadError",
-            errorCode: (error as NodeJS.ErrnoException).code,
-          });
+          for (const [provider, entry] of Object.entries(auth)) {
+            if (!isProviderTombstone(entry, provider)) continue;
+            const refusal = new CustodyOrphanError(
+              "tombstone ownership cannot be proven while the handle file is unreadable; run ck auth migrate-opencode",
+            );
+            logError(log, refusal, provider);
+            configureRefusal(provider, refusal);
+          }
           return;
         }
 
@@ -120,11 +169,9 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
           if (!byProvider.has(provider) && isProviderTombstone(auth[provider], provider)) providers.push(provider);
         }
 
-        const cfg = input as MutableConfig;
-        cfg.provider ??= Object.create(null) as Record<string, ConfigProvider>;
         for (const provider of providers) {
           const handle = byProvider.get(provider);
-            const entry = Object.hasOwn(auth, provider) ? auth[provider] : undefined;
+          const entry = Object.hasOwn(auth, provider) ? auth[provider] : undefined;
           const tombstone = isProviderTombstone(entry, provider);
           const owner = handle?.serve;
 
@@ -150,7 +197,20 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
           }
           if (owner !== OUR_PLUGIN_ID) {
             if (owner) log.debug({ provider, errorClass: "other_owner", errorCode: owner });
-            else logError(log, new CustodyOrphanError("tombstone has no serving handle; run ck auth migrate-opencode"), provider);
+            else {
+              const refusal = new CustodyOrphanError("tombstone has no serving handle; run ck auth migrate-opencode");
+              logError(log, refusal, provider);
+              configureRefusal(provider, refusal);
+            }
+            continue;
+          }
+
+          if (process.env.OPENCODE_EXPERIMENTAL_NATIVE_LLM === "1") {
+            const refusal = new CustodyNativeRuntimeError(
+              "OpenCode native LLM mode bypasses the custody fetch seam; unset OPENCODE_EXPERIMENTAL_NATIVE_LLM",
+            );
+            logError(log, refusal, provider);
+            configureRefusal(provider, refusal);
             continue;
           }
 
@@ -179,7 +239,7 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
               client,
               shape: handle!.shape,
               freshness,
-              readAuthEntry: async () => (await authReader(defaultAuthPath()))[provider],
+              readAuthEntry: async () => (await readAuth(defaultAuthPath(), authReader))[provider],
               upstreamFetch,
               log,
             }),

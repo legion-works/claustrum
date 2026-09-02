@@ -20,6 +20,7 @@ type Slot = {
   cooldownUntil?: number;
   state: FreshnessState;
   inFlight?: Promise<ServedCredential | undefined>;
+  staleCacheWarningEmitted?: boolean;
 };
 
 type IntervalHandle = { unref?: () => unknown };
@@ -98,6 +99,19 @@ export class FreshnessController {
   async resolve(account: FreshnessAccount): Promise<ServedCredential | undefined> {
     await this.#refreshHandleVersion();
     const slot = this.#slot(account);
+    if (slot.state === "transient" && this.#isFresh(slot)) {
+      if (!slot.staleCacheWarningEmitted) {
+        slot.staleCacheWarningEmitted = true;
+        this.#log?.warn({
+          provider: this.#provider,
+          label: account.label,
+          credentialId: account.credential_id,
+          state: "transient",
+          errorCode: "serving_cached",
+        });
+      }
+      return slot.cached;
+    }
     if (!this.#canWarm(slot)) return undefined;
     if (this.#isFresh(slot)) return slot.cached;
     return this.#bounded(this.#warm(account, false));
@@ -165,6 +179,7 @@ export class FreshnessController {
         slot.observedAt = this.#now();
         slot.cooldownUntil = undefined;
         slot.state = "available";
+        slot.staleCacheWarningEmitted = false;
         return served;
       })
       .catch((error: unknown) => {
@@ -223,8 +238,9 @@ export class FreshnessController {
         for (const slot of this.#slots.values()) {
           slot.cached = undefined;
           slot.observedAt = undefined;
-          slot.cooldownUntil = undefined;
-          slot.state = "available";
+           slot.cooldownUntil = undefined;
+           slot.state = "available";
+           slot.staleCacheWarningEmitted = false;
         }
       }
       this.#version = current;

@@ -134,7 +134,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(forwarded).toBe(0);
   });
 
-  test("logs CustodyOrphanError and injects nothing for a tombstone without a handle entry", async () => {
+  test("refuses requests for a tombstone without a handle entry", async () => {
     const files = await fixture("orphan");
     await writeHandles(files.handles, { version: 1, providers: [] });
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
@@ -144,7 +144,9 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await hook(cfg, { log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("CustodyOrphanError");
-    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(typeof cfg.provider.deepseek.options?.fetch).toBe("function");
+    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
+      .rejects.toThrow("migrate-opencode");
   });
 
   test("logs CustodyOrphanError and injects nothing when an owned handle has no auth.json entry", async () => {
@@ -178,8 +180,10 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(cfg.provider.deepseek.models).toEqual({ stock: { id: "stock" } });
   });
 
-  test("does not detect or connect when no handle file exists", async () => {
+  test("refuses a tombstone when the handle file cannot be read without detecting or connecting", async () => {
     const files = await fixture("missing-handles");
+    await writeFile(files.handles, "not json");
+    await chmod(files.handles, 0o600);
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
     const calls = { detect: 0, connect: 0 };
     const cfg = config("deepseek");
@@ -190,7 +194,9 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     });
 
     expect(calls).toEqual({ detect: 0, connect: 0 });
-    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(typeof cfg.provider.deepseek.options?.fetch).toBe("function");
+    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
+      .rejects.toThrow("migrate-opencode");
   });
 
   test("uses CLAUSTRUM_OPENCODE_HANDLES before the XDG default path", async () => {
@@ -328,5 +334,115 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(logs.join("\n")).toContain("debug");
     expect(logs.join("\n")).toContain("anthropic-auth");
     expect(cfg.provider.anthropic.options?.apiKey).toBeUndefined();
+  });
+
+  test("uses OPENCODE_AUTH_CONTENT before a differing auth file during config", async () => {
+    const files = await fixture("env-config-auth");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+    useEnv("OPENCODE_AUTH_CONTENT", JSON.stringify({ deepseek: { type: "api", key: "real-env-key" } }));
+    const cfg = config("deepseek");
+
+    await hook(cfg);
+
+    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(cfg.provider.deepseek.options?.fetch).toBeFunction();
+    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
+      .rejects.toBeInstanceOf(CustodySplitError);
+  });
+
+  test("re-reads OPENCODE_AUTH_CONTENT before the auth file for each served request", async () => {
+    const files = await fixture("env-request-auth");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+    useEnv("OPENCODE_AUTH_CONTENT", JSON.stringify({ deepseek: tombstoneFor("api", "deepseek") }));
+    const cfg = config("deepseek");
+    let forwarded = 0;
+
+    await hook(cfg, {
+      detect: async () => ({ status: "available", schema: 1, wireVersion: 1, endpoints: [] }),
+      clientFactory: async () => ({
+        getCredential: async () => ({ material: "vault-material", recordVersion: 1, expiresAtMs: null }),
+        reportAuthFailure: async () => {},
+      }) as never,
+      fetch: (async () => {
+        forwarded += 1;
+        return new Response("must not forward");
+      }) as never,
+    });
+    useEnv("OPENCODE_AUTH_CONTENT", JSON.stringify({ deepseek: { type: "api", key: "real-env-key" } }));
+
+    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example", {
+      headers: { Authorization: `Bearer ${sentinel("deepseek")}` },
+    })).rejects.toBeInstanceOf(CustodySplitError);
+    expect(forwarded).toBe(0);
+  });
+
+  test("reconnects after a transient connection failure and its backoff", async () => {
+    let now = 0;
+    let available = false;
+    let detects = 0;
+    const cfg = config("deepseek");
+    const hooks = await createOpencodeClaustrumPlugin({
+      handleReader: async () => handles("deepseek") as never,
+      authReader: async () => ({ deepseek: tombstoneFor("api", "deepseek") }),
+      detect: async () => {
+        detects += 1;
+        return available
+          ? { status: "available", schema: 1, wireVersion: 1, endpoints: [] }
+          : { status: "absent", path: "/tmp/claustrum.sock" };
+      },
+      clientFactory: async () => ({
+        getCredential: async () => ({ material: "vault-material", recordVersion: 1, expiresAtMs: null }),
+        reportAuthFailure: async () => {},
+      }) as never,
+      fetch: (async () => new Response("ok")) as never,
+      now: () => now,
+    })({} as never);
+    await hooks.config?.(cfg as never);
+    const fetch = cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch;
+
+    await expect(fetch("https://upstream.example", { headers: { Authorization: `Bearer ${sentinel("deepseek")}` } }))
+      .rejects.toThrow("accounts exhausted");
+    now += 60_000;
+    available = true;
+
+    expect((await fetch("https://upstream.example", { headers: { Authorization: `Bearer ${sentinel("deepseek")}` } })).status).toBe(200);
+    expect(detects).toBe(2);
+  });
+
+  test("returns an inert plugin before touching custody files when CLAUSTRUM_CUSTODY_DISABLE is set", async () => {
+    useEnv("CLAUSTRUM_CUSTODY_DISABLE", "1");
+    const calls = { auth: 0, handles: 0, detect: 0 };
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+
+    const hooks = await createOpencodeClaustrumPlugin({
+      authReader: async () => { calls.auth += 1; return { deepseek: tombstoneFor("api", "deepseek") }; },
+      handleReader: async () => { calls.handles += 1; return handles("deepseek") as never; },
+      detect: async () => { calls.detect += 1; return { status: "available", schema: 1, wireVersion: 1, endpoints: [] }; },
+      log: (line) => logs.push(line),
+    })({} as never);
+    await hooks.config?.(cfg as never);
+
+    expect(calls).toEqual({ auth: 0, handles: 0, detect: 0 });
+    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("custody_disabled");
+  });
+
+  test("refuses observed tombstones when native LLM mode bypasses the fetch seam", async () => {
+    const files = await fixture("native-llm");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+    useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", "1");
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("CustodyNativeRuntimeError");
+    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
+      .rejects.toThrow("native LLM");
   });
 });

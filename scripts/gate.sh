@@ -232,14 +232,14 @@ stream and pass the arm without ever seeing it skip."
 # follows it), and any gap between the floor and the real count is how many can go
 # before anyone is told. Measured 402 across the workspace's suites at the time of
 # writing; an earlier floor of 200 left a third of them free to disappear.
-# The current measured total is 501 (debug profile, the same `cargo test --locked --workspace`
-# this arm runs) after adding the opencode custody CLI suite and handle-file parity checks.
+# The current measured total is 493 (debug profile, the same `cargo test --locked --workspace`
+# this arm runs), including the tombstone-import refusal checks.
 # Do not measure it with `--release`: one login test deliberately fails there and the
 # pipeline still prints a number, 32 short of the truth.
 #
 # Raise this when tests are added. A failure here is normally that, not a defect --
 # but it should be a deliberate edit rather than a number nobody revisits.
-run_expect 501 "workspace unit + integration" \
+run_expect 493 "workspace unit + integration" \
   cargo test --locked --workspace
 
 # Two independent defences, because each catches what the other misses:

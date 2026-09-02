@@ -8,10 +8,10 @@ use super::{
     store_op, CliError, GlobalArgs,
 };
 use credentials_core::admin_ops::{AdminAuditOp, AdminOpBody, StoreMode, ADMIN_OP_SCHEMA_V1};
+use credentials_core::oauth::CUSTODY_TOMBSTONE_PREFIX as TOMBSTONE_PREFIX;
 use credentials_core::record::{CredentialKind, VaultRecord};
 
 const ACCOUNT: &str = "main";
-const TOMBSTONE_PREFIX: &str = "claustrum-tombstone:v1:";
 
 struct MigrationArgs {
     dry_run: bool,

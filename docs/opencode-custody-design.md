@@ -40,25 +40,27 @@ provider with in-request failover for providers the generic plugin serves.
 - `provider.ts:1439` — provider list is built from `cfg.provider` AFTER the hooks, comment:
   "includes any modifications from plugin config() hook". `1485` and `1646` merge
   `provider.options` into the SDK options bag with no re-validation in between.
-- `provider.ts:1794-1800` — `getSDK` lifts `options.fetch` into `customFetch` and wraps it for
-  EVERY provider (`google-vertex` at 1747 is the one exception, deleting it).
+- `provider.ts:1794-1800` — `getSDK` lifts `options.fetch` into `customFetch` for providers
+  whose live credential path remains the generic AI SDK seam. This is not a provider-wide
+  guarantee: provider-specific loaders, model discovery, environment credentials, transforms,
+  and native runtime paths can bypass or alter it. The generic provider allowlist is open.
 - `provider.ts:1777` — `options.apiKey` defaults to `provider.key`; a config-supplied
   `options.apiKey` wins. The SDK places that value wherever the provider expects a key.
 - `provider.ts:1643-1650` — config provider options are RE-APPLIED after every `auth.loader`
   has run, via remeda `mergeDeep` where a non-object value on the right wins (verified:
   `mergeDeep({options:{fetch:loader}}, {options:{fetch:config}}).options.fetch` → config).
   A config-hook-injected `fetch` therefore REPLACES a shipped plugin's loader-set `fetch`.
-  This is what makes built-in OAuth providers (xai, codex, copilot, snowflake) reachable
-  without controlling their plugin surface: `xai.ts:209-293` does no refresh at load, only
-  inside its own `fetch` — which never runs once ours replaces it, so the tombstone's
-  sentinel `refresh` is never spent by the shipped plugin.
+  This only makes a provider reachable when its live credential path is the generic fetch
+  seam. Do not infer reachability for xai, codex, copilot, snowflake, or any other provider
+  from config re-apply precedence alone.
 - `provider.ts:1611` `if (!stored) continue` — an `auth.json` entry is required for any
   `auth.loader` to run; dedicated plugins keep needing the tombstone for that reason.
 - `plugin/index.ts:103` — plugin exports are static; N runtime-discovered providers cannot
   be N `auth.loader`s. Hence the config hook.
-- Nothing in OpenCode autonomously writes `auth.json` (MCP tokens → `mcp-auth.json`).
-  `Auth.set` is an unlocked whole-file RMW (upstream #46128, open): `auth.json` is treated
-  as LOSSY-SHARED; nothing we put there is worth losing.
+- OpenCode reads `OPENCODE_AUTH_CONTENT` before disk auth, and workspace children inherit it;
+  custody mirrors that source order. Stock 1.18.25's `Auth.set` is a whole-file RMW. Newer
+  upstream #46131 adds flock plus atomic writes, which narrows torn writes but does not solve
+  environment snapshots or ownership disagreement; `auth.json` remains shared state.
 - Vault: `apikey:<provider>:<account>` / `oauth:<provider>:<account>` parse today; a
   non-refresh `credential.get` writes no chain row; limiter 64/60s per connection shared by
   `get`/`status`/`report_auth_failure`/`sign`/`public_key`, and a timed-out get still
@@ -214,7 +216,7 @@ Four cells, all explicit:
 | `auth.json` entry | handle file `serve` | action |
 |---|---|---|
 | tombstone | `opencode-claustrum` | inject `cfg.provider[p].options = { apiKey: SENTINEL(p), fetch }` |
-| tombstone | absent | `CustodyOrphan`: log loud, name the fix (`migrate-opencode --serve-by …`), inject nothing |
+| tombstone | absent or unreadable handle file | `CustodyOrphan`: log loud, name the fix (`migrate-opencode --serve-by …`), inject a REFUSING fetch because no live owner can be proven |
 | tombstone | other owner | not ours — inject nothing, debug log only; the named owner serves it |
 | real credential | `opencode-claustrum` | `SplitCustody`: log loud; inject a REFUSING `fetch` that rejects with `CustodySplitError` before any request leaves the process (`apiKey` untouched). Serving either copy is wrong: the local key rotates the family away from the vault; the vault copy ignores what the operator just wrote. v2.1 said "inject nothing" — live acceptance arm 2 showed that lets stock OpenCode serve the local key, so "serve neither" was not achieved. Never throw from the `config` hook itself: that takes down every provider, not the split one. |
 | real credential | absent | not ours; untouched |
@@ -303,8 +305,8 @@ cells raise typed `CustodyOrphan` / `SplitCustody` · logger capture asserting n
 4. `opencode-account add deepseek --account alt` with a dead key at priority 1 → 401 → chain
    `report_auth_failure reporter_source=direct` + `stale_nonrefreshable_latch` → failover to
    `main` completes the SAME request;
-5. handle file marks a provider `serve: "someone-else"` → this plugin injects nothing for it
-   (`CustodyOrphan` logged);
+5. handle file marks a provider `serve: "someone-else"` → this plugin injects nothing for it;
+   an absent or unreadable handle file instead receives a refusing fetch (`CustodyOrphan` logged);
 6. restore a real key into `auth.json` by hand while the handle file still says
    `serve: "opencode-claustrum"` → `SplitCustody` logged, refusing fetch injected, the real key is
    NOT sent by anyone (the request is refused before it leaves the process) and the sentinel is NOT sent.
@@ -317,19 +319,14 @@ cells raise typed `CustodyOrphan` / `SplitCustody` · logger capture asserting n
   loader on `isTombstone` before the expiry check, consumes this client, reads this handle
   file. Co-owned: the golden file and that guard PR. `migrate-opencode --serve-by
   anthropic-auth` writes the ownership.
-- **`oauth` on built-in providers whose plugin surface we do not control** (`xai`, and by
-  the same mechanism `codex`/`copilot`/`snowflake`): served by THIS plugin as
-  `serve: "opencode-claustrum"` with the `oauth` shape — the config re-apply precedence (§3)
-  replaces the shipped `fetch`, the shipped loader does no refresh outside its `fetch`, and
-  the vault's own adapter (`refresh_adapters/xai.rs` exists today) does the refresh under the
-  60 s tick. No plugin change, no fork. What it still needs before delivery: the spike's arm 2,
-  a per-provider read confirming the shipped loader has no refresh path OUTSIDE its `fetch`
-  (true for xai at `209-216`; each other built-in gets the same three-line check), and the
-  `oauth` import mapping in `migrate-opencode`. The generic failover ladder applies to these
-  (no account-scoped cache economics like anthropic's); if one ever needs richer selection
-  it gets a dedicated owner and a `serve` value, not a special case here.
+- **Provider-specific and native paths:** generic custody applies only after a per-provider
+  proof that the live credential path is the AI SDK fetch seam. xai, codex, copilot,
+  snowflake, model-discovery paths, custom loaders, and environment-backed paths are not
+  implied by config precedence. The provider allowlist is deliberately open pending operator
+  adjudication; providers needing transforms or dedicated auth get a dedicated owner.
 - **Claude Code / Codex:** different integration shape, separate spec.
-- **Upstream #46128:** independently valuable, not depended on.
+- **Upstream #46131:** flock plus atomic auth writes reduce torn reads on newer OpenCode, but
+  custody still treats environment snapshots and ownership disagreement as independent seams.
 - **Status UI / slash command:** not in v1; state changes are logged.
 
 ## 10. Risks named
@@ -340,5 +337,9 @@ cells raise typed `CustodyOrphan` / `SplitCustody` · logger capture asserting n
   the sentinel in the failure, never by serving anything.
 - The sentinel reaches the network if the plugin fails to load: a 401 whose request names
   the cause; there is no report path from a naive reader, so no spurious report.
-- `auth.json` remains lossy-shared until #46128; nothing placed there is worth losing.
+- `Provider.Info.key` is serialized through OpenCode provider API/UI payloads, so a tombstone
+  can look configured. It is non-secret; upstream redaction/status separation remains a
+  possible later improvement.
+- Native LLM mode bypasses generic provider `options.fetch` for API auth on stock 1.18.25;
+  custody detects `OPENCODE_EXPERIMENTAL_NATIVE_LLM=1` and refuses observed entries.
 - Two languages and three suites pin one tombstone shape; the golden file is the only defence.
