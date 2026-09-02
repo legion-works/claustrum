@@ -22,9 +22,26 @@ elif [[ -s "${XDG_RUNTIME_DIR:-}/subc-connection.json" ]]; then
 elif [[ -s "${HOME}/.local/share/cortexkit/run/subc-connection.json" ]]; then
   SUBC="$HOME/.local/share/cortexkit/run/subc-connection.json"
 else
-  SUBC="$(ls -1 /tmp/subc-*.connection.json 2>/dev/null | head -n 1 || true)"
+  # The daemon's last-resort location is `<tempdir>/subc-<token>.connection.json` where
+  # the token comes from a UID probe (or a sanitized USER/USERNAME, on macOS the default).
+  # A literal `ls | head -n 1` would silently pick one of N candidates and route admin
+  # operations at whichever user's daemon the shell saw first; that file is then bound
+  # to the acceptance rig's CLAUSTRUM_SUBC_CONNECTION export through the same root.
+  # REFUSE the ambiguous case so the acceptance run cannot cross users.
+  matches="$(ls -1 /tmp/subc-*.connection.json 2>/dev/null || true)"
+  count="$(printf '%s\n' "$matches" | grep -c . || true)"
+  case "$count" in
+    0) SUBC="" ;;
+    1) SUBC="$matches" ;;
+    *) printf 'ACCEPT FAIL ambiguous subc connection files in /tmp (%d candidates); set CLAUSTRUM_SUBC_CONNECTION or SUBC to choose:\n' "$count" >&2
+       printf '%s\n' "$matches" >&2
+       exit 1
+       ;;
+  esac
 fi
-SUBC="${SUBC:-${XDG_RUNTIME_DIR:-/run/user/1000}/subc-connection.json}"
+# Last-resort absent marker; matches the highest-priority production slot so the rig's
+# refusal/retry paths run against the same path `ck` would resolve.
+SUBC="${SUBC:-${XDG_RUNTIME_DIR:-}/subc-connection.json}"
 KEY_PATH=/etc/cortexkit/master.key
 
 if [[ "$(pwd -P)" != "$WT" ]]; then

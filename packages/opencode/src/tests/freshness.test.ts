@@ -112,9 +112,12 @@ describe("custody freshness", () => {
 
     expect(intervals.callbacks).toHaveLength(1);
     expect(intervals.unrefs).toHaveLength(1);
-    intervals.callbacks[0]!();
-    await Promise.resolve();
-    await Promise.resolve();
+    // Await the returned tick promise: any future rewrite of `FreshnessController.tick()`
+    // (#refreshHandleVersion + per-account #bounded/#warm chain) would otherwise change
+    // the microtask count the next two `await Promise.resolve()` calls were coupled to,
+    // making the assertions below quietly microtask-fragile.
+    const tick = intervals.callbacks[0]!();
+    await tick;
 
     expect(client.gets).toEqual([
       { handle: MAIN_HANDLE, minTtlMs: 270 * 60_000 },
@@ -258,7 +261,11 @@ describe("custody freshness", () => {
     expect(entries.filter((entry) => (entry as { errorCode?: string }).errorCode === "serving_cached")).toHaveLength(1);
   });
 
-  test("warms each oauth account at most once per tick", async () => {
+  test("expires a tick warm that times out so the next tick re-arms the account", async () => {
+    // P2: a tick that times out must clear the in-flight generation; otherwise the next
+    // tick reuses the same never-settling promise and the idle account never warms or
+    // retries. The detached original completion is fenced by `#isCurrent` against the
+    // bumped generation, so it cannot poison the slot.
     const pending = deferred<ServedCredential>();
     const intervals = fakeInterval();
     const client = new FakeClient(async () => pending.promise);
@@ -275,7 +282,11 @@ describe("custody freshness", () => {
     await freshness.tick();
     await freshness.tick();
 
+    // Two ticks, two accounts, the deadline beats the never-resolving promise each time,
+    // so each account rewarmed across the two ticks — total 4 gets, not 2.
     expect(client.gets).toEqual([
+      { handle: MAIN_HANDLE, minTtlMs: 270 * 60_000 },
+      { handle: BACKUP_HANDLE, minTtlMs: 270 * 60_000 },
       { handle: MAIN_HANDLE, minTtlMs: 270 * 60_000 },
       { handle: BACKUP_HANDLE, minTtlMs: 270 * 60_000 },
     ]);

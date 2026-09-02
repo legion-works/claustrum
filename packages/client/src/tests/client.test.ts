@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { chmod, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { SubcCallError } from '@cortexkit/subc-client'
+import { PROTOCOL_VERSION, SubcCallError } from '@cortexkit/subc-client'
 import {
   ClaustrumClient,
   detectClaustrumConnection,
@@ -154,6 +154,90 @@ describe('ClaustrumClient', () => {
 
     expect(result).toEqual(expect.objectContaining({ status: 'malformed', reason: 'connection file could not be read or validated' }))
     expect(JSON.stringify(result)).not.toContain(key)
+  })
+
+  test('default discovery mirrors the daemon order: XDG_RUNTIME_DIR, then production home, then temp glob', async () => {
+    // Daemon writes `subc-<token>.connection.json` where token derives from a uid-probe
+    // (unix), a sanitized USER/USERNAME/HOME/USERPROFILE, or `'unknown'`. On macOS where
+    // XDG_RUNTIME_DIR is unset the daemon falls into the sanitized-user branch, so its
+    // filename does NOT match the client's `subc-${uid}.connection.json` literal.
+    const tempRoot = await mkdtemp(join(tmpdir(), 'claustrum-discover-'))
+    tempDirs.push(tempRoot)
+    const originalXdg = process.env.XDG_RUNTIME_DIR
+    const originalHome = process.env.HOME
+
+    const homeDir = join(tempRoot, 'home')
+    const { mkdir } = await import('node:fs/promises')
+    await mkdir(homeDir, { recursive: true })
+
+    // Write a daemon-style file into the OS tmpdir (whatever `os.tmpdir()` returns).
+    const token = `rediscovery-${Date.now()}-${process.pid}`
+    const daemonFile = join(tmpdir(), `subc-${token}.connection.json`)
+    await writeFile(daemonFile, JSON.stringify({
+      schema: 1,
+      wire_version: PROTOCOL_VERSION,
+      endpoints: [{ host: '127.0.0.1', port: 8765 }],
+      key: Array.from({ length: 32 }, () => 1),
+      daemon_id: Array.from({ length: 16 }, () => 2),
+      pid: 1,
+      daemon_ver: 'test',
+    }))
+    await chmod(daemonFile, 0o600)
+    process.env.XDG_RUNTIME_DIR = undefined
+    process.env.HOME = homeDir
+
+    try {
+      expect(getDefaultClaustrumConnectionPath()).toBe(daemonFile)
+    } finally {
+      process.env.HOME = originalHome
+      if (originalXdg === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = originalXdg
+      await rm(daemonFile, { force: true })
+    }
+  })
+
+  test('default discovery refuses ambiguity when multiple connection files share the temp dir', async () => {
+    const originalXdg = process.env.XDG_RUNTIME_DIR
+    const originalHome = process.env.HOME
+
+    const a = join(tmpdir(), `subc-ambiguous-a-${process.pid}-${Date.now()}.connection.json`)
+    const b = join(tmpdir(), `subc-ambiguous-b-${process.pid}-${Date.now()}.connection.json`)
+    await writeFile(a, '{"schema":1}')
+    await writeFile(b, '{"schema":1}')
+
+    process.env.XDG_RUNTIME_DIR = undefined
+    const homeDir = join(tmpdir(), `claustrum-ambiguous-home-${process.pid}-${Date.now()}`)
+    const { mkdir } = await import('node:fs/promises')
+    await mkdir(homeDir, { recursive: true })
+    process.env.HOME = homeDir
+
+    try {
+      const path = getDefaultClaustrumConnectionPath()
+      expect([a, b]).not.toContain(path)
+    } finally {
+      process.env.HOME = originalHome
+      if (originalXdg === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = originalXdg
+      await rm(a, { force: true })
+      await rm(b, { force: true })
+    }
+  })
+
+  test('detection reports the connection file wire_version when it matches the client build', async () => {
+    const path = await tempPath('wire-version.json')
+    await writeFile(path, JSON.stringify({
+      schema: 1,
+      wire_version: PROTOCOL_VERSION,
+      endpoints: [{ host: '127.0.0.1', port: 8765 }],
+      key: Array.from({ length: 32 }, () => 1),
+      daemon_id: Array.from({ length: 16 }, () => 2),
+      pid: 1,
+      daemon_ver: 'mod',
+    }))
+    await chmod(path, 0o600)
+
+    const result = await detectClaustrumConnection(path)
+    expect(result).toMatchObject({ status: 'available', wireVersion: PROTOCOL_VERSION })
   })
 
   test('identity scrubs inherited SUBC_MODULE_ID and SUBC_LAUNCH_NONCE then hashes the store path', async () => {

@@ -19,10 +19,36 @@ function substituteQueryValue(value: string, sentinel: string, encodedMaterial: 
   try {
     decoded = decodeURIComponent(value);
   } catch {
-    return replaceEvery(value, sentinel, encodedMaterial);
+    return caseInsensitiveReplace(value, sentinel, encodedMaterial);
   }
   if (decoded === sentinel) return encodedMaterial;
-  return value;
+  // Even when the decoded form is not the bare sentinel (e.g. the value carries
+  // `prefix-<encoded sentinel>-suffix`), a host that unescaped percent-hex would
+  // observe the sentinel as a substring. Apply the substitution against the
+  // case-insensitive encoded form too, so neither `claustrum-tombstone%3Av1%3A...`
+  // nor `claustrum-tombstone%3av1%3a...` survives a round trip.
+  return caseInsensitiveReplace(value, sentinel, encodedMaterial);
+}
+
+// Replaces occurrences of `sentinel` and a case-insensitively-spelled percent
+// encoding of `sentinel` in `value` with `encodedMaterial`. Falls back to a
+// `replaceEvery` of the literal sentinel when encoding cannot be computed (e.g.
+// the sentinel contains a string that the `encodeURIComponent`-then-lower regex
+// disagrees on, which is rare; the literal pass keeps coverage of the by-hand
+// substitution path in that case).
+function caseInsensitiveReplace(value: string, sentinel: string, encodedMaterial: string): string {
+  const substituted = value.split(sentinel).join(encodedMaterial);
+  const encodedSentinel = encodeURIComponent(sentinel);
+  if (encodedSentinel === sentinel) return substituted;
+  // The encoded form MUST survive unescaping to the sentinel; an upstream that
+  // matches the decoded form against an allowlist would accept either %3A or %3a.
+  // Case-insensitive flag handles both hex casings since ASCII letters case-fold.
+  const re = new RegExp(escapeForRegex(encodedSentinel), "gi");
+  return substituted.replace(re, encodedMaterial);
+}
+
+function escapeForRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 export async function snapshotRequest(
@@ -77,11 +103,24 @@ export async function snapshotRequest(
         substitutedHeaders.delete("content-language");
         substitutedHeaders.delete("content-location");
       }
+      // The pathname and hash branch is checked AFTER `decodeURIComponent` so a host
+      // that unescapes percent-hex before matching the URL against its allowlist sees
+      // the same refusal that the raw-bytes check would. The substitution step above
+      // already covers the bytes; this is the belt-and-braces refusal.
+      const decodedPathOrigin = `${url.origin}${decodeURIComponent(url.pathname)}${decodeURIComponent(url.hash)}`;
       if (
-        `${url.origin}${url.pathname}${url.hash}`.includes(sentinel) ||
+        decodedPathOrigin.includes(sentinel) ||
         substitutedQuery.split("&").some((part) => {
           const separator = part.indexOf("=");
-          return separator !== -1 && part.slice(separator + 1).includes(sentinel);
+          if (separator === -1) return false;
+          const raw = part.slice(separator + 1);
+          if (raw.includes(sentinel)) return true;
+          try {
+            if (decodeURIComponent(raw).includes(sentinel)) return true;
+          } catch {
+            // Already covered by the `raw.includes` arm; fall through.
+          }
+          return false;
         }) ||
         [...substitutedHeaders.values()].some((value) => value.includes(sentinel))
       ) {

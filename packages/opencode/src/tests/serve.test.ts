@@ -179,6 +179,50 @@ describe("OpenCode custody serve fetch", () => {
     expect(url.searchParams.get("key")).toBe("material-main");
   });
 
+  test("substitutes a sentinel that surrounds other content and uses lowercase-hex escapes", async () => {
+    // The previous fix only handled values whose decoded form was exactly the sentinel.
+    // A real-world URL can carry `?note=prefix-claustrum-tombstone%3av1%3adeepseek-suffix`
+    // where the host escaped `%:` while the receiving parser unflattens both cases to
+    // `:` before the upstream sees it. Decoding this value yields `prefix-...-suffix`,
+    // NOT the bare sentinel, so the per-param exact-match branch never fires. The
+    // fallback needs case-insensitive percent-escape substitution, or a fail-closed
+    // refusal on any decoded value that still contains the sentinel.
+    const requests: Request[] = [];
+    const fetch = serve({ upstream: createUpstream([200], requests) });
+    const lowerHexSentinel = encodeURIComponent(SENTINEL).replace(/%[0-9A-F]{2}/g, (match) =>
+      match.toLowerCase(),
+    );
+    const wrapped = `prefix-${lowerHexSentinel}-suffix`;
+    expect(decodeURIComponent(wrapped)).toContain(SENTINEL);
+
+    await fetch(`https://upstream.example/v1/chat?note=${wrapped}`);
+
+    const forwarded = requests[0]?.url ?? "";
+    // The substitution must eliminate the sentinel in both the encoded and the decoded
+    // sense: the literal colon form does NOT appear, and the lower-hex form does not
+    // survive either (otherwise the upstream decodes it back to the sentinel).
+    expect(forwarded).not.toContain(lowerHexSentinel);
+    expect(new URL(forwarded).searchParams.get("note")).toBe(`prefix-material-main-suffix`);
+  });
+
+  test("refuses a sentinel embedded in the URL pathname after decode", async () => {
+    // The pathname branch previously checked only the raw `pathname` string for the
+    // sentinel. An encoded form (`claustrum-tombstone%3Av1%3Adeepseek`) survives because
+    // URL.pathname retains percent-escapes; an upstream that unflattens them before
+    // matching against its allowlist observes the sentinel as the credential.
+    const requests: Request[] = [];
+    const fetch = serve({
+      upstream: async (request) => {
+        requests.push(new Request(request));
+        return new Response("must not forward", { status: 200 });
+      },
+    });
+    await expect(
+      fetch(`https://upstream.example/v1/chat/${encodeURIComponent(SENTINEL)}/respond`),
+    ).rejects.toThrow(/sentinel/);
+    expect(requests).toHaveLength(0);
+  });
+
   test("reports the credential version used for a 401, clears its cache, and tries the next account", async () => {
     const requests: Request[] = [];
     let currentRecordVersion = 7;

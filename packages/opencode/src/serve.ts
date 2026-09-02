@@ -149,8 +149,9 @@ export function createServeFetch(options: CreateServeFetchOptions) {
         try {
           forwarded = snapshot.withMaterial(attempt.material, target, methodOverride);
         } catch (error) {
+          const detail = error instanceof Error && error.message ? error.message : String(error);
           const refusal = new CustodyRequestError(
-            `could not substitute custody credential: ${error instanceof Error ? error.name : String(error)}`,
+            `could not substitute custody credential: ${detail}`,
           );
           options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
           throw refusal;

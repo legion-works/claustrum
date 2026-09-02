@@ -283,10 +283,13 @@ the never-migrated accommodation are the same no-hit branch from two sides: clos
 refusing owned plus configured providers silently breaks the accommodation, so a change to either
 requires deciding both.
 
-Detect the vault, open ONE route (identity per §4), warm each account with one
-`credential.get` under a bounded await (≤100 ms); unreachable vault → caches stay cold,
-warming retried per request. Warm attempts are once per account per tick with per-handle
-backoff on transient failure (13 gets → 1 measured upstream when this was added).
+The vault connect (`detect` + route + identity per §4) is LAZY: it happens on the first
+request that actually needs a credential or on the oauth tick (if `setInterval` is wired),
+NOT at config-hook load. The config hook only reads handles and `auth.json`. Warming is
+retried per request: a vault that is unreachable at load keeps the cache cold; the first
+request re-attempts and warms with one `credential.get` under a bounded await (≤100 ms).
+Warm attempts are once per account per tick with per-handle backoff on transient failure
+(13 gets → 1 measured upstream when this was added).
 
 Per request:
 

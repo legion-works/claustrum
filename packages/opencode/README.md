@@ -48,21 +48,26 @@ Run `ck auth migrate-opencode` to create or repair the tombstones and handle fil
 
 ## Maintenance
 
-Keep the sweep's control-flow smoke signal on one method:
+Keep the sweep's control-flow smoke signal on two greps -- one for branches (`if (`),
+one for exits (`return` / `continue` / `catch`). Each grep returns exactly one number
+per file, so the table stays checkable by reading; the previous format used X/Y pairs
+that did not match the documented greps and could be copied forward stale.
 
 ```sh
-grep -cE '^\s*(catch|} catch)|^\s*return[; ]|^\s*continue;|^\s*if \(' packages/opencode/src/{plugin,serve}.ts
+grep -cE '^\s*if \(' packages/opencode/src/{plugin,serve}.ts
+grep -cE '^\s*(catch|} catch)|^\s*return[; ]|^\s*continue;' packages/opencode/src/{plugin,serve}.ts
 ```
 
-| revision | `plugin.ts` control-flow lines | `serve.ts` control-flow lines |
-| --- | --- | --- |
-| `eb034af` | 47/22 | 26/17 |
-| `57ce561` | 58/22 | 26/17 |
-| closing-wave worktree | 65/27 | 26/17 |
-| custody review triage | 64/27 | 27 |
-| `a3b3a6c` | 72/27 | 27 |
+| revision | `plugin.ts` branches | `plugin.ts` exits | `serve.ts` branches | `serve.ts` exits |
+| --- | --- | --- | --- | --- |
+| `eb034af` | 22 | 14 | 13 | 9 |
+| `57ce561` | 22 | 14 | 13 | 9 |
+| closing-wave worktree | 27 | 18 | 13 | 9 |
+| custody review triage | 27 | 18 | 13 | 9 |
+| `a3b3a6c` | 27 | 21 | 13 | 10 |
+| current (this commit) | 32 | 40 | 13 | 14 |
 
 A changed count without a matching sweep row is a review failure, not harmless churn.
 
-The exits/rows census cannot see a subcondition inside a counted branch. The containment property
-test is the invariant; this census remains the drift canary.
+The branches/exits census cannot see a subcondition inside a counted branch. The containment
+property test is the invariant; this census remains the drift canary.

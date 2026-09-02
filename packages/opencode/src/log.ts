@@ -23,8 +23,15 @@ export type CustodyLogger = {
   error(entry: Omit<CustodyLogEntry, "level">): void;
 };
 
+// Default sink writes each level to the stream a maintainer looks at for that level:
+// debug / info to stdout, warn / error to stderr. The previous implementation routed
+// everything to `console.error`, which made the `level` field a label rather than a
+// semantic switch -- `console.debug` against a release binary that has stripped debug
+// is the lever operators use to silence a noisy daemon, and routing those records to
+// stderr defeats the lever.
 function defaultSink(entry: CustodyLogEntry): void {
-  console.error(JSON.stringify(entry));
+  const out = entry.level === "warn" || entry.level === "error" ? console.error : console.log;
+  out(JSON.stringify(entry));
 }
 
 export function createLogger(sink: LogSink = defaultSink): CustodyLogger {

@@ -132,7 +132,11 @@ export class FreshnessController {
     await this.#refreshHandleVersion();
     await Promise.all(this.#accounts.map(async (account) => {
       const slot = this.#slot(account);
-      if (this.#canWarm(slot)) await this.#bounded(account, this.#warm(account, true), false);
+      // Expire on timeout: a hung `credential.get` must not pin the in-flight generation
+      // for every later tick -- the only consequence of leaving it bound is that the
+      // idle account never warms or retries. The detached original completion is already
+      // fenced by `#isCurrent` against the bumped generation, so it cannot poison the slot.
+      if (this.#canWarm(slot)) await this.#bounded(account, this.#warm(account, true), true);
     }));
   }
 

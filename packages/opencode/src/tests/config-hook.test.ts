@@ -360,6 +360,11 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
   });
 
   test("refuses a handle file owned by another uid through injectable stat metadata", async () => {
+    // The earlier version injected `stat` and `currentUid` only; without `lstat`/`readFile` the
+    // file's own stat comes from `descriptor.stat()` on the real file, so the test silently
+    // exercised the parent-directory branch on a uid=1000 box. Driving both branches through
+    // injectable metadata makes the file-owner path the one being asserted, and the parent-
+    // directory path an explicit injected 1000 so it does not steal the refusal.
     const files = await fixture("bad-owner");
     await writeHandles(files.handles, handles("deepseek"));
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
@@ -368,7 +373,10 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     prepareRefusalProbe(cfg, "deepseek");
     const handleReader = (path: string) => readHandleFile(path, {
       currentUid: () => 1000,
-      stat: async () => ({ isFile: () => true, isDirectory: () => true, mode: 0o100600, uid: 1001 }),
+      lstat: async () => ({ isFile: () => true, isDirectory: () => false, mode: 0o100600, uid: 1001 }),
+      // Parent-dir check sees its real shape (uid 1000) so the file-owner check is the
+      // one that fires regardless of whose uid the runner happens to be.
+      stat: async () => ({ isFile: () => false, isDirectory: () => true, mode: 0o040755, uid: 1000 }),
     });
 
     await hook(cfg, { handleReader, log: (line) => logs.push(line) });

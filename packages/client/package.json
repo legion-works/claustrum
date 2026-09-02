@@ -15,6 +15,7 @@
   "files": ["dist", "README.md"],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepack": "rm -rf dist && bun run build",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

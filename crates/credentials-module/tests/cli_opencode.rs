@@ -816,17 +816,28 @@ fn spawn_migration_route_daemon(
                     _ = &mut stopped => return,
                     accepted = listener.accept() => accepted.expect("accept"),
                 };
-                authenticate_server(
+                // Wrap every I/O on `stream` in a select against the shutdown channel so a
+                // peer that keeps a connection open without sending the expected frame cannot
+                // stall `TestDaemon::drop`'s `join()`. Returning is enough: the runtime drops
+                // `stream` and `read_frame`/`write_frame`'s keep-alive thread exits; the next
+                // panic is the offending test's message rather than a generic drop message.
+                macro_rules! shutdown_or {
+                    ($expr:expr) => {
+                        tokio::select! {
+                            _ = &mut stopped => return,
+                            result = $expr => result,
+                        }
+                    };
+                }
+                shutdown_or!(authenticate_server(
                     &mut stream,
                     &key,
                     &daemon_id,
                     "test",
                     std::time::Duration::from_secs(3),
-                )
-                .await
+                ))
                 .expect("handshake");
-                let first = read_frame(&mut stream)
-                    .await
+                let first = shutdown_or!(read_frame(&mut stream))
                     .expect("read first")
                     .expect("first frame");
                 let first_body: Value = serde_json::from_slice(&first.body).expect("first json");
@@ -844,9 +855,7 @@ fn spawn_migration_route_daemon(
                         serde_json::to_vec(&json!({"modules": []})).unwrap(),
                     )
                     .unwrap();
-                    write_frame(&mut stream, &reply)
-                        .await
-                        .expect("catalog response");
+                    shutdown_or!(write_frame(&mut stream, &reply)).expect("catalog response");
                     continue;
                 }
                 observed
@@ -862,11 +871,8 @@ fn spawn_migration_route_daemon(
                     serde_json::to_vec(&json!({"route_channel": 7, "route_epoch": 3})).unwrap(),
                 )
                 .unwrap();
-                write_frame(&mut stream, &opened)
-                    .await
-                    .expect("route response");
-                let get = read_frame(&mut stream)
-                    .await
+                shutdown_or!(write_frame(&mut stream, &opened)).expect("route response");
+                let get = shutdown_or!(read_frame(&mut stream))
                     .expect("read get")
                     .expect("get frame");
                 let get_body: Value = serde_json::from_slice(&get.body).expect("get json");
@@ -898,9 +904,7 @@ fn spawn_migration_route_daemon(
                     serde_json::to_vec(&next_response).unwrap(),
                 )
                 .unwrap();
-                write_frame(&mut stream, &reply)
-                    .await
-                    .expect("get response");
+                shutdown_or!(write_frame(&mut stream, &reply)).expect("get response");
             }
         });
     });
@@ -2058,11 +2062,60 @@ fn the_opencode_account_list_shows_non_secret_state_without_credential_get() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("main") && stdout.contains("active") && stdout.contains("v1"));
     assert!(!stdout.contains("main-secret"));
+    // The list path MUST exercise the route (catalog.list observed) -- otherwise the
+    // assertion `no credential.get` is vacuous: a regression where list started reading
+    // credential material would still pass because no daemon was consulted at all.
+    assert!(
+        observed
+            .lock()
+            .expect("observed")
+            .iter()
+            .any(|method| method == "catalog.list"),
+        "list did not exercise the route over --subc; observation={:?}",
+        observed.lock().expect("observed"),
+    );
     assert!(!observed
         .lock()
         .expect("observed")
         .iter()
         .any(|method| method == "credential.get"));
+}
+
+#[test]
+fn the_fake_daemon_drops_quickly_when_drop_runs_while_a_frame_read_is_hung() {
+    // Regression guard for `cli_opencode.rs:44`. The daemon's per-frame reads used to
+    // poll the shutdown channel only inside `listener.accept()`; a daemon blocked in
+    // `read_frame` on an accepted connection therefore could not be interrupted by
+    // `TestDaemon::drop`'s `join()`. The fix wraps each read in a select against the
+    // shutdown channel; this test makes the change observable -- the join completes in
+    // well under the seconds the bug would have spent hanging.
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let root = tmp_root("daemon-drop-hung-read");
+    std::fs::create_dir_all(&root).expect("root");
+    let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let conn =
+        spawn_migration_route_daemon(&root, observed.clone(), Arc::new(Mutex::new(Vec::new())));
+    let connection_file =
+        std::fs::read_to_string(root.join("migration-subc.json")).expect("connection file");
+    let parsed: Value = serde_json::from_str(&connection_file).expect("parse conn file");
+    let endpoint = parsed["endpoints"][0].clone();
+    let host = endpoint["host"].as_str().expect("host").to_owned();
+    let port = endpoint["port"].as_u64().expect("port") as u16;
+
+    // Connect to the daemon but do nothing -- the daemon accepts, completes the
+    // transport handshake (10 bytes back-and-forth), and is now waiting inside
+    // `read_frame` for a frame this peer never sends.
+    let _peer = TcpStream::connect((host.as_str(), port)).expect("connect");
+
+    let started = Instant::now();
+    drop(conn); // TestDaemon::drop sends the shutdown channel; the read must observe it.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "TestDaemon::drop blocked for {elapsed:?}; the per-frame read is not observing the shutdown channel"
+    );
 }
 
 #[test]
