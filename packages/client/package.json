@@ -1,6 +1,7 @@
 {
   "name": "@cortexkit/claustrum-client",
   "version": "0.1.0",
+  "description": "Policy-free TypeScript transport client for the Claustrum credential vault.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -10,6 +11,7 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "files": ["dist", "README.md"],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"
