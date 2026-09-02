@@ -1,0 +1,31 @@
+{
+  "name": "@cortexkit/opencode-claustrum",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./opencode-plugin": {
+      "import": "./dist/opencode-plugin.js",
+      "types": "./dist/opencode-plugin.d.ts"
+    },
+    "./server": {
+      "import": "./dist/opencode-plugin.js",
+      "types": "./dist/opencode-plugin.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && bun build ./src/opencode-plugin.ts --outfile ./dist/opencode-plugin.js --target=bun",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@cortexkit/claustrum-client": "workspace:*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.25"
+  }
+}
