@@ -1009,7 +1009,8 @@ fn cmd_put(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Build an `admin.store` op body.
+/// Build an admin store op, upgrading unconditional replacement to the identity-policy
+/// discriminator so an older daemon refuses semantics it cannot preserve.
 fn store_op(id: &str, record: VaultRecord, audit_op: AdminAuditOp, mode: StoreMode) -> AdminOpBody {
     match mode {
         StoreMode::ReplaceUnconditional => AdminOpBody::StoreWithIdentityPolicy {

@@ -1140,6 +1140,40 @@ fn import_and_set_identity_attach_sticky_account_metadata_without_replacing_secr
     );
     drop(store);
 
+    let mut legacy = imported_record;
+    legacy.identity.account_id = Some("acct\ncontrol".to_string());
+    let key = credentials_core::resolver::resolve(
+        &ResolverConfig {
+            data_dir: data_dir.clone(),
+            source: KeySource::OperatorPath {
+                path: key_path.clone(),
+            },
+        },
+        None,
+    )
+    .expect("resolve key for legacy envelope");
+    let envelope = credentials_core::envelope::seal(
+        &key,
+        &legacy.encode().expect("encode legacy record"),
+        &credentials_core::envelope::RecordBinding {
+            credential_id: "oauth:anthropic",
+            record_version: 1,
+        },
+    )
+    .expect("seal legacy record");
+    let conn = rusqlite::Connection::open(data_dir.join("store.db")).expect("open raw store");
+    conn.execute(
+        "UPDATE credentials SET envelope = ?1 WHERE credential_id = 'oauth:anthropic'",
+        rusqlite::params![envelope],
+    )
+    .expect("seed legacy identity");
+    let usable_legacy = run(&["usable"]);
+    let usable_legacy_stdout = String::from_utf8_lossy(&usable_legacy.stdout);
+    assert!(usable_legacy.status.success());
+    assert!(usable_legacy_stdout.contains("account=<invalid>"));
+    assert!(!usable_legacy_stdout.contains("acct\ncontrol"));
+    assert!(usable_legacy_stdout.contains("unservable identity: 1"));
+
     let store = open_record();
     let material_fixture = credentials_core::record::VaultRecord::new_oauth(
         "fixture",

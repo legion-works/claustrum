@@ -4454,6 +4454,37 @@ mod tests {
     }
 
     #[test]
+    fn set_identity_returns_a_typed_decrypt_error_for_invalid_ciphertext() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(59);
+        store
+            .create("oauth:anthropic", &oauth_record())
+            .expect("seed");
+        store
+            .with_raw_conn(|conn| {
+                conn.execute(
+                    "UPDATE credentials SET envelope = X'00' WHERE credential_id = 'oauth:anthropic'",
+                    [],
+                )
+            })
+            .expect("seed invalid ciphertext");
+        assert!(matches!(
+            store.set_identity_audited(
+                "oauth:anthropic",
+                RecordIdentity {
+                    account_id: Some("acct".to_string()),
+                    email: None,
+                    org_name: None,
+                },
+                AuditCtx::admin(AuditOp::SetIdentity),
+            ),
+            Err(StoreOpError::Decrypt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn empty_static_payload_is_rejected_before_any_write_or_audit() {
         let (_root, store) = tmp_store(42);
         let empty = VaultRecord::new_static(CredentialKind::ApiKey, "test", Vec::new(), None);
