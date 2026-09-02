@@ -1,5 +1,5 @@
 export type ReplayableRequest = {
-  withMaterial(material: string): Request;
+  withMaterial(material: string, target?: URL, methodOverride?: string): Request;
 };
 
 type RequestInitWithDuplex = RequestInit & { duplex?: "half" };
@@ -16,14 +16,13 @@ export async function snapshotRequest(
   const source = new Request(input, init);
   const body = source.body ? await source.arrayBuffer() : undefined;
   const method = source.method;
-  const redirect = source.redirect;
   const signal = source.signal;
   const headers = new Headers(source.headers);
   const duplex = (source as Request & { duplex?: "half" }).duplex;
 
   return {
-    withMaterial(material: string): Request {
-      const url = new URL(source.url);
+    withMaterial(material: string, target?: URL, methodOverride?: string): Request {
+      const url = new URL(target ?? source.url);
       const parameters = new URLSearchParams();
       for (const [key, value] of url.searchParams) {
         parameters.append(key, replaceEvery(value, sentinel, material));
@@ -39,11 +38,11 @@ export async function snapshotRequest(
       }
 
       const requestInit: RequestInitWithDuplex = {
-        method,
+        method: methodOverride ?? method,
         headers: substitutedHeaders,
-        redirect,
+        redirect: "manual",
         signal,
-        ...(body === undefined ? {} : { body: body.slice(0) }),
+        ...(body === undefined || methodOverride === "GET" ? {} : { body: body.slice(0) }),
         ...(duplex === undefined ? {} : { duplex }),
       };
       return new Request(url, requestInit);

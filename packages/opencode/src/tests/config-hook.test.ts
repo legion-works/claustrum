@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
@@ -7,7 +7,7 @@ import {
   type ConfigHookDependencies,
 } from "../plugin";
 import { CustodySplitError } from "../errors";
-import { readHandleFile } from "../handles";
+import { handleFileRevision, parseHandleFile, readHandleFile } from "../handles";
 import { sentinel, tombstoneFor } from "../tombstone";
 
 const ROOT = "/tmp/opencode/custody-t6";
@@ -31,6 +31,7 @@ afterEach(async () => {
   }
   savedEnv.clear();
   await rm(ROOT, { recursive: true, force: true });
+  delete (Object.prototype as { options?: unknown }).options;
 });
 
 async function fixture(name: string) {
@@ -79,7 +80,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
   await hooks.config?.(cfg as never);
 }
 
-describe("OpenCode custody config hook", () => {
+  describe("OpenCode custody config hook (seven ownership cells)", () => {
   test("leaves a real local credential without a handle entry untouched", async () => {
     const files = await fixture("real-unowned");
     await writeHandles(files.handles, { version: 1, providers: [] });
@@ -89,6 +90,24 @@ describe("OpenCode custody config hook", () => {
     await hook(cfg);
 
     expect(cfg.provider.deepseek.options).toEqual({ baseURL: "https://deepseek.example", headers: { "x-stock": "kept" } });
+  });
+
+  test("rejects prototype-bearing provider ids before they reach config materialization", () => {
+    expect(() => parseHandleFile(handles("__proto__"))).toThrow("invalid provider");
+  });
+
+  test("does not pollute Object.prototype when a hostile handle file names __proto__", async () => {
+    const files = await fixture("hostile-provider");
+    const hostileHandles = handles("__proto__");
+    expect(() => parseHandleFile(hostileHandles)).toThrow("invalid provider");
+    await writeHandles(files.handles, hostileHandles);
+    await writeFile(files.auth, JSON.stringify({ ["__proto__"]: tombstoneFor("api", "__proto__") }));
+    await chmod(files.auth, 0o600);
+    const cfg = { provider: {} } as TestConfig;
+
+    await hook(cfg);
+
+    expect("options" in {}).toBe(false);
   });
 
   test("logs CustodySplitError and refuses requests for a real local credential owned by us", async () => {
@@ -126,6 +145,20 @@ describe("OpenCode custody config hook", () => {
 
     expect(logs.join("\n")).toContain("CustodyOrphanError");
     expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+  });
+
+  test("logs CustodyOrphanError and injects nothing when an owned handle has no auth.json entry", async () => {
+    const files = await fixture("missing-auth-owned-handle");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeAuth(files.auth, {});
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("CustodyOrphanError");
+    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(cfg.provider.deepseek.options?.fetch).toBeUndefined();
   });
 
   test("merges sentinel and fetch into a tombstoned provider owned by us", async () => {
@@ -203,6 +236,38 @@ describe("OpenCode custody config hook", () => {
     await hook(cfg, { handleReader, log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("HandleFileValidationError");
+    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+  });
+
+  test("rejects an oversized handle file and never exposes raw handles in its revision", async () => {
+    const files = await fixture("large-handle-file");
+    await writeHandles(files.handles, { ...handles("deepseek"), padding: "x".repeat(256 * 1024) });
+
+    await expect(readHandleFile(files.handles)).rejects.toThrow("256 KiB");
+
+    await writeHandles(files.handles, handles("deepseek"));
+    expect(await handleFileRevision(files.handles)).not.toContain("ckh_");
+  });
+
+  test("rejects a symlinked handle file", async () => {
+    const files = await fixture("symlink-handle-file");
+    const target = join(ROOT, "symlink-handle-file", "target.json");
+    await writeHandles(target, handles("deepseek"));
+    await symlink(target, files.handles);
+
+    await expect(readHandleFile(files.handles)).rejects.toThrow("symlink");
+  });
+
+  test("refuses an oversized auth.json before it can configure a custody fetch", async () => {
+    const files = await fixture("large-auth-file");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek"), padding: "x".repeat(1024 * 1024) });
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("AuthFileValidationError");
     expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
   });
 

@@ -165,14 +165,75 @@ describe("OpenCode custody serve fetch", () => {
     expect(requests).toHaveLength(3);
   });
 
-  test("returns the first successful 3xx response without probing later accounts", async () => {
+  test("follows same-origin redirects with a newly substituted manual request", async () => {
     const requests: Request[] = [];
     const client = clientWith();
-    const fetch = serve({ client, upstream: createUpstream([302, 200], requests) });
+    const fetch = serve({
+      client,
+      upstream: async (request) => {
+        const forwarded = new Request(request);
+        requests.push(forwarded);
+        if (new URL(forwarded.url).pathname === "/v1/chat") {
+          return new Response(null, {
+            status: 302,
+            headers: { Location: "/v1/final?key=" + encodeURIComponent(SENTINEL) },
+          });
+        }
+        return new Response("upstream", { status: 200 });
+      },
+    });
 
-    expect((await fetch("https://upstream.example/v1/chat")).status).toBe(302);
+    expect((await fetch(`https://upstream.example/v1/chat?key=${encodeURIComponent(SENTINEL)}`, {
+      method: "POST",
+      headers: { "X-Api-Key": SENTINEL },
+      body: "request-body",
+    })).status).toBe(200);
     expect(client.gets).toEqual([MAIN_HANDLE]);
-    expect(requests).toHaveLength(1);
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.url).toContain("key=material-main");
+    expect(requests[1]?.headers.get("x-api-key")).toBe("material-main");
+    expect(requests[1]?.method).toBe("POST");
+  });
+
+  test("turns a same-origin 303 into a GET before forwarding", async () => {
+    const requests: Request[] = [];
+    const fetch = serve({
+      upstream: async (request) => {
+        const forwarded = new Request(request);
+        requests.push(forwarded);
+        return forwarded.url.endsWith("/start")
+          ? new Response(null, { status: 303, headers: { Location: "/final" } })
+          : new Response("ok");
+      },
+    });
+
+    expect((await fetch("https://upstream.example/start", { method: "POST", body: "body" })).status).toBe(200);
+    expect(requests[1]?.method).toBe("GET");
+  });
+
+  test("refuses a cross-origin redirect before an attacker receives substituted headers or can report 401", async () => {
+    const attackerRequests: Request[] = [];
+    const client = clientWith();
+    const upstream = async (request: RequestInfo | URL): Promise<Response> => {
+      const forwarded = new Request(request);
+      if (new URL(forwarded.url).origin === "https://attacker.example") {
+        attackerRequests.push(forwarded);
+        return new Response("unauthorized", { status: 401 });
+      }
+      if (forwarded.redirect !== "manual") {
+        return upstream(new Request("https://attacker.example/collect", {
+          method: forwarded.method,
+          headers: forwarded.headers,
+        }));
+      }
+      return new Response(null, { status: 302, headers: { Location: "https://attacker.example/collect" } });
+    };
+    const fetch = serve({ client, upstream });
+
+    await expect(fetch("https://upstream.example/v1/chat", { headers: { "X-Api-Key": SENTINEL } }))
+      .rejects.toThrow("custody redirect refused");
+    expect(attackerRequests).toEqual([]);
+    expect(client.reports).toEqual([]);
   });
 
   test("uses Retry-After seconds, HTTP dates, and a 60-second fallback before failing over", async () => {

@@ -3,7 +3,7 @@ import {
   type ServedCredential,
 } from "@cortexkit/claustrum-client";
 
-import { CustodyExhaustionError, CustodySplitError } from "./errors";
+import { CustodyExhaustionError, CustodyRedirectRefusedError, CustodySplitError } from "./errors";
 import {
   DEFAULT_RETRY_AFTER_MS,
   FreshnessController,
@@ -88,53 +88,75 @@ export function createServeFetch(options: CreateServeFetchOptions) {
       if (!served) continue;
 
       const attempt = { material: served.material, recordVersion: served.recordVersion };
-      const response = await options.upstreamFetch(snapshot.withMaterial(attempt.material));
-      if (response.status >= 200 && response.status < 400) return response;
-
-      if (response.status === 401) {
-        options.log?.warn({
-          provider: options.provider,
-          label: account.label,
-          credentialId: account.credential_id,
-          recordVersion: attempt.recordVersion,
-          httpStatus: 401,
-        });
-        await discard(response);
-        try {
-          await options.client.reportAuthFailure({
-            handle: account.handle,
-            providerStatus: 401,
-            recordVersion: attempt.recordVersion,
-            reporterSource: "direct",
-          });
-        } finally {
-          freshness.invalidate(account);
+      let target: URL | undefined;
+      let methodOverride: string | undefined;
+      for (let hop = 0; hop <= 5; hop += 1) {
+        const forwarded = snapshot.withMaterial(attempt.material, target, methodOverride);
+        const response = await options.upstreamFetch(forwarded);
+        if (response.status < 300 || response.status >= 400) {
+          if (response.status === 401) {
+            options.log?.warn({
+              provider: options.provider,
+              label: account.label,
+              credentialId: account.credential_id,
+              recordVersion: attempt.recordVersion,
+              httpStatus: 401,
+            });
+            await discard(response);
+            try {
+              await options.client.reportAuthFailure({
+                handle: account.handle,
+                providerStatus: 401,
+                recordVersion: attempt.recordVersion,
+                reporterSource: "direct",
+              });
+            } finally {
+              freshness.invalidate(account);
+            }
+            break;
+          }
+          if (response.status === 429) {
+            freshness.cooldown(account, cooldownFromRetryAfter(response.headers.get("Retry-After"), currentTime));
+            options.log?.warn({
+              provider: options.provider,
+              label: account.label,
+              credentialId: account.credential_id,
+              httpStatus: 429,
+            });
+            await discard(response);
+            break;
+          }
+          if (response.status === 402) {
+            freshness.cooldown(account, PAYMENT_REQUIRED_COOLDOWN_MS);
+            options.log?.warn({
+              provider: options.provider,
+              label: account.label,
+              credentialId: account.credential_id,
+              httpStatus: 402,
+            });
+            await discard(response);
+            break;
+          }
+          return response;
         }
-        continue;
-      }
-      if (response.status === 429) {
-        freshness.cooldown(account, cooldownFromRetryAfter(response.headers.get("Retry-After"), currentTime));
-        options.log?.warn({
-          provider: options.provider,
-          label: account.label,
-          credentialId: account.credential_id,
-          httpStatus: 429,
-        });
+        const location = response.headers.get("Location");
+        if (!location) return response;
+        const fromOrigin = new URL(forwarded.url).origin;
+        const next = new URL(location, forwarded.url);
+        if (next.origin !== fromOrigin) {
+          await discard(response);
+          throw new CustodyRedirectRefusedError(options.provider, fromOrigin, next.origin);
+        }
+        if (hop === 5) {
+          await discard(response);
+          throw new CustodyRedirectRefusedError(options.provider, fromOrigin, next.origin);
+        }
         await discard(response);
-        continue;
+        target = next;
+        methodOverride = response.status === 303 ? "GET" : methodOverride;
       }
-      if (response.status === 402) {
-        freshness.cooldown(account, PAYMENT_REQUIRED_COOLDOWN_MS);
-        options.log?.warn({
-          provider: options.provider,
-          label: account.label,
-          credentialId: account.credential_id,
-          httpStatus: 402,
-        });
-        await discard(response);
-        continue;
-      }
-      return response;
+
+      continue;
     }
 
     throw exhaustion(options.provider, accounts, freshness);

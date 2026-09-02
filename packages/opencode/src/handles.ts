@@ -1,10 +1,14 @@
-import { readFile, stat as nodeStat } from "node:fs/promises";
+import { lstat as nodeLstat, readFile, stat as nodeStat } from "node:fs/promises";
 import { userInfo } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 
 import { HandleFileValidationError } from "./errors";
 
 export const OUR_PLUGIN_ID = "opencode-claustrum";
+const HANDLE_FILE_MAX_BYTES = 256 * 1024;
+const PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const FORBIDDEN_IDENTIFIERS = new Set(["__proto__", "constructor", "prototype"]);
 
 export type HandleAccount = {
   label: string;
@@ -33,6 +37,10 @@ function handleIsValid(handle: unknown): handle is string {
   return typeof handle === "string" && handle.startsWith("ckh_") && handle.length === 47;
 }
 
+function identifierIsValid(value: unknown): value is string {
+  return typeof value === "string" && PROVIDER_ID.test(value) && !FORBIDDEN_IDENTIFIERS.has(value);
+}
+
 function invalid(message: string): never {
   throw new HandleFileValidationError(message);
 }
@@ -47,7 +55,7 @@ export function parseHandleFile(value: unknown): OpenCodeHandleFileV1 {
   const providers = file.providers.map((provider, index): HandleProvider => {
     if (!provider || typeof provider !== "object") invalid(`provider ${index} must be an object`);
     const item = provider as Record<string, unknown>;
-    if (typeof item.provider !== "string" || !item.provider) invalid(`provider ${index} has invalid provider`);
+    if (!identifierIsValid(item.provider)) invalid(`provider ${index} has invalid provider`);
     if (providerIds.has(item.provider)) invalid(`provider ${index} duplicates provider ${item.provider}`);
     providerIds.add(item.provider);
     if (item.shape !== "api" && item.shape !== "oauth") invalid(`provider ${index} has invalid shape`);
@@ -57,7 +65,7 @@ export function parseHandleFile(value: unknown): OpenCodeHandleFileV1 {
     }
     const labels = new Set<string>();
     for (const account of item.accounts) {
-      if (!account.label) invalid(`provider ${index} has an empty account label`);
+      if (!identifierIsValid(account.label)) invalid(`provider ${index} has an invalid account label`);
       if (labels.has(account.label)) invalid(`provider ${index} duplicates account label ${account.label}`);
       labels.add(account.label);
       if (!handleIsValid(account.handle)) invalid(`provider ${index} account ${account.label} has invalid handle`);
@@ -79,9 +87,18 @@ export function parseHandleFile(value: unknown): OpenCodeHandleFileV1 {
   return { version: 1, providers };
 }
 
-type HandleFileStat = { isFile(): boolean; mode: number; uid?: number; mtimeMs?: number };
+type HandleFileStat = {
+  isFile(): boolean;
+  isDirectory?(): boolean;
+  isSymbolicLink?(): boolean;
+  mode: number;
+  size?: number;
+  uid?: number;
+  mtimeMs?: number;
+};
 export type HandleFileIo = {
   stat?: (path: string) => Promise<HandleFileStat>;
+  lstat?: (path: string) => Promise<HandleFileStat>;
   readFile?: (path: string, encoding: "utf8") => Promise<string>;
   currentUid?: () => number | undefined;
 };
@@ -98,20 +115,33 @@ function currentUid(): number | undefined {
 
 export async function readHandleFile(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<OpenCodeHandleFileV1> {
   const stat = io.stat ?? nodeStat;
+  const lstat = io.lstat ?? nodeLstat;
   const read = io.readFile ?? readFile;
   let metadata: HandleFileStat;
   try {
-    metadata = await stat(path);
+    metadata = await lstat(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, providers: [] };
     invalid(`cannot stat handle file: ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (metadata.isSymbolicLink?.()) invalid("handle file must not be a symlink");
   if (!metadata.isFile()) invalid("handle file must be a regular file");
+  if ((metadata.size ?? 0) > HANDLE_FILE_MAX_BYTES) invalid("handle file exceeds 256 KiB");
   if ((metadata.mode & 0o777) !== 0o600) invalid("handle file mode must be exactly 0600");
   const uid = io.currentUid ?? currentUid;
   const expectedUid = uid();
   if (expectedUid !== undefined && metadata.uid !== undefined && metadata.uid !== expectedUid) {
     invalid("handle file is not owned by the current uid");
+  }
+  let parent: HandleFileStat;
+  try {
+    parent = await stat(dirname(path));
+  } catch (error) {
+    invalid(`cannot stat handle file parent: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!parent.isDirectory?.()) invalid("handle file parent must be a directory");
+  if (expectedUid !== undefined && parent.uid !== undefined && parent.uid !== expectedUid) {
+    invalid("handle file parent is not owned by the current uid");
   }
   let source: string;
   try {
@@ -130,7 +160,8 @@ export async function readHandleFile(path = defaultHandleFilePath(), io: HandleF
 export async function handleFileRevision(path = defaultHandleFilePath(), io: HandleFileIo = {}): Promise<string> {
   const stat = io.stat ?? nodeStat;
   const read = io.readFile ?? readFile;
+  await readHandleFile(path, io);
   const metadata = await stat(path);
   const source = await read(path, "utf8");
-  return `${metadata.mtimeMs ?? 0}:${source}`;
+  return `${metadata.mtimeMs ?? 0}:${createHash("sha256").update(source).digest("hex")}`;
 }

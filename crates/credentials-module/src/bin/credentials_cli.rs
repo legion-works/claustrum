@@ -562,8 +562,9 @@ fn help_verb(verb: &str) -> String {
              ck auth opencode-account remove --provider <id> --label <label> \
              [--handle-file <path>]\n\
              ck auth opencode-account list [--provider <id>] [--handle-file <path>]\n\
-             Add, remove, or list labeled api accounts in a provider already migrated by
-             migrate-opencode. Keys are read from a file or stdin, never argv. List prints
+              Add, remove, or list labeled api accounts in a provider already migrated by
+              migrate-opencode. Keys are read from a file or stdin, never argv; stdin trims one
+              terminal LF or CRLF. List prints
              labels, credential ids, lifecycle state, and record versions only."
         }
         "mint-handle" => {

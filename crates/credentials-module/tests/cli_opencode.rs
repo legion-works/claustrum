@@ -149,6 +149,101 @@ fn a_handle_file_with_a_malformed_capability_is_refused() {
 }
 
 #[test]
+fn hostile_provider_ids_and_account_labels_are_refused_by_the_rust_handle_validator() {
+    for (provider, label) in [
+        ("__proto__", "main"),
+        ("constructor", "main"),
+        ("prototype", "main"),
+        ("DeepSeek", "main"),
+        ("deepseek", "bad label"),
+    ] {
+        let raw = format!(
+            r#"{{"version":1,"providers":[{{"provider":"{provider}","shape":"api","serve":"opencode-claustrum","accounts":[{{"label":"{label}","handle":"ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","credential_id":"apikey:deepseek:main"}}]}}]}}"#
+        );
+        let err =
+            read_raw_handle_fixture("hostile-provider-id", &raw).expect_err("hostile id refuses");
+        assert!(
+            err.to_string().contains("invalid"),
+            "unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn handle_file_debug_redacts_live_and_superseded_capabilities() {
+    let file = opencode_files::HandleFile {
+        version: 1,
+        providers: vec![opencode_files::HandleProvider {
+            provider: "deepseek".into(),
+            shape: opencode_files::HandleShape::Api,
+            serve: "opencode-claustrum".into(),
+            accounts: vec![opencode_files::HandleAccount {
+                label: "main".into(),
+                handle: "ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                credential_id: "apikey:deepseek:main".into(),
+                superseded: vec!["ckh_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()],
+            }],
+        }],
+    };
+
+    let rendered = format!("{file:?}");
+    assert!(!rendered.contains("ckh_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert!(!rendered.contains("ckh_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+}
+
+#[test]
+fn custody_file_reads_are_capped_and_writes_require_a_trusted_parent_with_0600_at_create() {
+    let root = tmp_root("custody-file-caps");
+    let auth = root.join("auth.json");
+    let handles = root.join("handles.json");
+    std::fs::write(
+        &auth,
+        format!(
+            r#"{{"deepseek":{{"type":"api","key":"x"}},"padding":"{}"}}"#,
+            "x".repeat(1024 * 1024)
+        ),
+    )
+    .expect("auth fixture");
+    std::fs::write(
+        &handles,
+        format!(
+            r#"{{"version":1,"providers":[],"padding":"{}"}}"#,
+            "x".repeat(256 * 1024)
+        ),
+    )
+    .expect("handle fixture");
+    for path in [&auth, &handles] {
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("fixture mode");
+    }
+    assert!(opencode_files::read_auth_entries(&auth)
+        .expect_err("auth cap")
+        .to_string()
+        .contains("1 MiB"));
+    assert!(opencode_files::read_handle_file(&handles)
+        .expect_err("handle cap")
+        .to_string()
+        .contains("256 KiB"));
+
+    // The tempfile is unobservable after rename, so the source assertion pins the creation primitive itself.
+    let source = include_str!("../src/bin/cli_support/opencode_files.rs");
+    assert!(source.contains("OpenOptionsExt") && source.contains(".mode(0o600)"));
+    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+        .expect("unsafe parent mode");
+    let err = opencode_files::write_auth_entry(
+        &root.join("unsafe-auth.json"),
+        "deepseek",
+        json!({"type":"api","key":"x"}),
+    )
+    .expect_err("world-writable parent refuses");
+    assert!(
+        err.to_string().contains("parent directory"),
+        "unexpected error: {err}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn a_handle_file_with_an_empty_credential_id_is_refused() {
     let err = read_raw_handle_fixture(
         "empty-credential-id",
@@ -501,6 +596,18 @@ impl MigrationRig {
             .write_all(input)
             .expect("write stdin");
         child.wait_with_output().expect("wait ck-auth")
+    }
+
+    fn run_with_env(&self, args: &[&str], key: &str, value: &str) -> Output {
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .env(key, value)
+            .output()
+            .expect("run ck-auth with test seam")
     }
 
     fn migrate(&self, extra: &[&str]) -> Output {
@@ -1127,7 +1234,7 @@ fn the_opencode_account_add_key_file_stdin_does_not_echo_material() {
         json!({"deepseek": {"type": "api", "key": "main-secret"}}),
     );
     assert!(rig.migrate(&[]).status.success());
-    let material = b"stdin-secret";
+    let material = b"stdin-secret\n";
     let out = rig.run_with_stdin(
         &[
             "opencode-account",
@@ -1147,6 +1254,71 @@ fn the_opencode_account_add_key_file_stdin_does_not_echo_material() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stdout}{stderr}");
     assert!(!stdout.contains("stdin-secret") && !stderr.contains("stdin-secret"));
+    assert_eq!(
+        open_vault(&rig)
+            .get("apikey:deepseek:stdin")
+            .expect("stdin record")
+            .payload,
+        b"stdin-secret"
+    );
+}
+
+#[cfg(feature = "opencode-test-seam")]
+#[test]
+fn the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle() {
+    let rig = MigrationRig::new(
+        "account-add-handle-write-crash",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let key_file = rig.root.join("alt.key");
+    std::fs::write(&key_file, b"alt-secret").expect("key file");
+    let args = [
+        "opencode-account",
+        "add",
+        "--provider",
+        "deepseek",
+        "--label",
+        "alt",
+        "--key-file",
+        key_file.to_str().unwrap(),
+        "--handle-file",
+        rig.handles.to_str().unwrap(),
+    ];
+    let interrupted = rig.run_with_env(&args, "CK_OPENCODE_TEST_FAIL_HANDLE_WRITE", "1");
+    assert!(
+        !interrupted.status.success(),
+        "the seam must stop before the handle file write"
+    );
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let connection = spawn_migration_route_daemon(
+        &rig.root,
+        observed,
+        Arc::new(Mutex::new(vec![route_response(b"alt-secret")])),
+    );
+    let mut rerun_args = args.to_vec();
+    rerun_args.extend(["--subc", connection.to_str().unwrap()]);
+    let recovered = rig.run(&rerun_args);
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let handles = opencode_files::read_handle_file(&rig.handles).expect("recovered handles");
+    assert_eq!(
+        handles.providers[0]
+            .accounts
+            .iter()
+            .filter(|account| account.label == "alt")
+            .count(),
+        1
+    );
+    let audit = String::from_utf8_lossy(&rig.run(&["audit"]).stdout).to_ascii_lowercase();
+    assert!(
+        audit.contains("revoke_handle"),
+        "recovery must revoke the stranded capability: {audit}"
+    );
 }
 
 #[test]

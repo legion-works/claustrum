@@ -1,10 +1,10 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
 import { ClaustrumClient, detectClaustrumConnection } from "@cortexkit/claustrum-client";
 import type { Plugin } from "@opencode-ai/plugin";
 
-import { CustodyOrphanError, CustodySplitError, HandleFileValidationError } from "./errors";
+import { AuthFileValidationError, CustodyOrphanError, CustodySplitError, HandleFileValidationError } from "./errors";
 import { FreshnessController } from "./freshness";
 import { defaultHandleFilePath, handleFileRevision, OUR_PLUGIN_ID, readHandleFile, type OpenCodeHandleFileV1 } from "./handles";
 import { createLogger, serializedLogSink, type CustodyLogger, type LogSink } from "./log";
@@ -13,6 +13,7 @@ import { isProviderTombstone, sentinel } from "./tombstone";
 
 type ConfigProvider = { options?: Record<string, unknown> };
 type MutableConfig = { provider?: Record<string, ConfigProvider> };
+const AUTH_FILE_MAX_BYTES = 1024 * 1024;
 
 export type ConfigHookDependencies = {
   handleReader?: (path: string) => Promise<OpenCodeHandleFileV1>;
@@ -36,6 +37,9 @@ function defaultAuthPath(env: NodeJS.ProcessEnv = process.env): string {
 
 async function readAuth(path: string): Promise<Record<string, unknown>> {
   try {
+    if ((await stat(path)).size > AUTH_FILE_MAX_BYTES) {
+      throw new AuthFileValidationError("auth file exceeds 1 MiB");
+    }
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
     return value && typeof value === "object" && !Array.isArray(value)
       ? value as Record<string, unknown>
@@ -117,20 +121,26 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         }
 
         const cfg = input as MutableConfig;
-        cfg.provider ??= {};
+        cfg.provider ??= Object.create(null) as Record<string, ConfigProvider>;
         for (const provider of providers) {
           const handle = byProvider.get(provider);
-          const entry = auth[provider];
+            const entry = Object.hasOwn(auth, provider) ? auth[provider] : undefined;
           const tombstone = isProviderTombstone(entry, provider);
           const owner = handle?.serve;
 
           if (!tombstone) {
             if (owner === OUR_PLUGIN_ID) {
+              if (entry === undefined) {
+                logError(log, new CustodyOrphanError("handle entry has no auth.json counterpart; run ck auth migrate-opencode"), provider);
+                continue;
+              }
               const error = new CustodySplitError(
                 `local credential is real while custody handles remain; run ck auth migrate-opencode --provider ${provider} to re-tombstone, or ck auth migrate-opencode --restore ${provider} to use the local credential`,
               );
               logError(log, error, provider);
-              const configured = cfg.provider[provider] ??= {};
+              const configured = Object.hasOwn(cfg.provider, provider)
+                ? cfg.provider[provider]!
+                : (cfg.provider[provider] = {});
               configured.options = {
                 ...(configured.options ?? {}),
                 fetch: async () => { throw error; },
@@ -144,7 +154,9 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             continue;
           }
 
-          const configured = cfg.provider[provider] ??= {};
+          const configured = Object.hasOwn(cfg.provider, provider)
+            ? cfg.provider[provider]!
+            : (cfg.provider[provider] = {});
           const freshness = new FreshnessController({
             provider,
             shape: handle!.shape,

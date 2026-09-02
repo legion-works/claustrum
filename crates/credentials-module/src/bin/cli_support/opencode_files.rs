@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+const AUTH_FILE_MAX_BYTES: u64 = 1024 * 1024;
+const HANDLE_FILE_MAX_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug)]
 pub enum OpenCodeFilesError {
@@ -19,6 +21,10 @@ pub enum OpenCodeFilesError {
         source: std::io::Error,
     },
     Json(serde_json::Error),
+    InsecureParent {
+        path: PathBuf,
+        reason: &'static str,
+    },
     Invalid(String),
 }
 
@@ -27,6 +33,13 @@ impl fmt::Display for OpenCodeFilesError {
         match self {
             Self::Io { action, source } => write!(f, "{action}: {source}"),
             Self::Json(source) => write!(f, "JSON: {source}"),
+            Self::InsecureParent { path, reason } => {
+                write!(
+                    f,
+                    "parent directory {} is insecure: {reason}",
+                    path.display()
+                )
+            }
             Self::Invalid(message) => f.write_str(message),
         }
     }
@@ -46,13 +59,13 @@ pub struct TombstoneFixtures {
     pub oauth: TombstoneFixture,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandleFile {
     pub version: u64,
     pub providers: Vec<HandleProvider>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandleProvider {
     pub provider: String,
     pub shape: HandleShape,
@@ -68,13 +81,47 @@ pub enum HandleShape {
     Oauth,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandleAccount {
     pub label: String,
     pub handle: String,
     pub credential_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub superseded: Vec<String>,
+}
+
+impl fmt::Debug for HandleFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandleFile")
+            .field("version", &self.version)
+            .field("providers", &self.providers)
+            .finish()
+    }
+}
+
+impl fmt::Debug for HandleProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandleProvider")
+            .field("provider", &self.provider)
+            .field("shape", &self.shape)
+            .field("serve", &self.serve)
+            .field("accounts", &self.accounts)
+            .finish()
+    }
+}
+
+impl fmt::Debug for HandleAccount {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandleAccount")
+            .field("label", &self.label)
+            .field("handle", &"ckh_[redacted]")
+            .field("credential_id", &self.credential_id)
+            .field(
+                "superseded",
+                &format_args!("<{} ckh_[redacted]>", self.superseded.len()),
+            )
+            .finish()
+    }
 }
 
 pub fn default_auth_path() -> PathBuf {
@@ -129,13 +176,11 @@ pub fn golden_tombstone_fixtures() -> Result<TombstoneFixtures, OpenCodeFilesErr
 
 pub fn read_auth_entries(path: &Path) -> Result<BTreeMap<String, Value>, OpenCodeFilesError> {
     validate_secure_file(path)?;
-    let bytes = fs::read(path).map_err(|source| OpenCodeFilesError::Io {
-        action: "read auth file",
-        source,
-    })?;
+    let bytes = read_limited(path, AUTH_FILE_MAX_BYTES, "auth file")?;
     let entries: BTreeMap<String, Value> =
         serde_json::from_slice(&bytes).map_err(OpenCodeFilesError::Json)?;
-    for entry in entries.values() {
+    for (provider, entry) in &entries {
+        validate_identifier(provider, "provider")?;
         validate_auth_entry(entry)?;
     }
     Ok(entries)
@@ -146,11 +191,7 @@ pub fn write_auth_entry(
     provider: &str,
     entry: Value,
 ) -> Result<(), OpenCodeFilesError> {
-    if provider.is_empty() {
-        return Err(OpenCodeFilesError::Invalid(
-            "provider must not be empty".into(),
-        ));
-    }
+    validate_identifier(provider, "provider")?;
     validate_auth_entry(&entry)?;
     let mut entries = if path.exists() {
         read_auth_entries(path)?
@@ -178,10 +219,7 @@ pub fn verify_auth_written(
 
 pub fn read_handle_file(path: &Path) -> Result<HandleFile, OpenCodeFilesError> {
     validate_secure_file(path)?;
-    let bytes = fs::read(path).map_err(|source| OpenCodeFilesError::Io {
-        action: "read handle file",
-        source,
-    })?;
+    let bytes = read_limited(path, HANDLE_FILE_MAX_BYTES, "handle file")?;
     let file: HandleFile = serde_json::from_slice(&bytes).map_err(OpenCodeFilesError::Json)?;
     validate_handle_file(&file)?;
     Ok(file)
@@ -220,7 +258,7 @@ fn validate_handle_file(file: &HandleFile) -> Result<(), OpenCodeFilesError> {
     }
     let mut provider_ids = BTreeSet::new();
     for (index, provider) in file.providers.iter().enumerate() {
-        if provider.provider.is_empty() {
+        if !identifier_is_valid(&provider.provider) {
             return Err(OpenCodeFilesError::Invalid(format!(
                 "provider {index} has invalid provider"
             )));
@@ -241,9 +279,9 @@ fn validate_handle_file(file: &HandleFile) -> Result<(), OpenCodeFilesError> {
         }
         let mut labels = BTreeSet::new();
         for account in &provider.accounts {
-            if account.label.is_empty() {
+            if !identifier_is_valid(&account.label) {
                 return Err(OpenCodeFilesError::Invalid(format!(
-                    "provider {index} has an empty account label"
+                    "provider {index} has an invalid account label"
                 )));
             }
             if !labels.insert(&account.label) {
@@ -283,6 +321,27 @@ fn valid_handle(handle: &str) -> bool {
     handle.starts_with("ckh_") && handle.len() == 47
 }
 
+fn identifier_is_valid(value: &str) -> bool {
+    !matches!(value, "__proto__" | "constructor" | "prototype")
+        && !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b'-' => index > 0,
+            _ => false,
+        })
+}
+
+fn validate_identifier(value: &str, kind: &str) -> Result<(), OpenCodeFilesError> {
+    if identifier_is_valid(value) {
+        Ok(())
+    } else {
+        Err(OpenCodeFilesError::Invalid(format!(
+            "{kind} must match [a-z0-9][a-z0-9._-]{{0,63}}"
+        )))
+    }
+}
+
 fn write_atomic(path: &Path, bytes: &[u8], secure_parent: bool) -> Result<(), OpenCodeFilesError> {
     let parent = path
         .parent()
@@ -292,6 +351,7 @@ fn write_atomic(path: &Path, bytes: &[u8], secure_parent: bool) -> Result<(), Op
         action: "create parent directory",
         source,
     })?;
+    validate_secure_parent(parent)?;
     if secure_parent {
         set_mode(parent, 0o700)?;
     }
@@ -305,6 +365,20 @@ fn write_atomic(path: &Path, bytes: &[u8], secure_parent: bool) -> Result<(), Op
         TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| -> Result<(), OpenCodeFilesError> {
+        #[cfg(unix)]
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)
+                .map_err(|source| OpenCodeFilesError::Io {
+                    action: "create temporary file",
+                    source,
+                })?
+        };
+        #[cfg(not(unix))]
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -363,6 +437,57 @@ fn validate_secure_file(path: &Path) -> Result<(), OpenCodeFilesError> {
             return Err(OpenCodeFilesError::Invalid(
                 "file mode must be exactly 0600".into(),
             ));
+        }
+    }
+    Ok(())
+}
+
+fn read_limited(path: &Path, max_bytes: u64, kind: &str) -> Result<Vec<u8>, OpenCodeFilesError> {
+    let metadata = fs::metadata(path).map_err(|source| OpenCodeFilesError::Io {
+        action: "stat file for read limit",
+        source,
+    })?;
+    if metadata.len() > max_bytes {
+        let limit = if max_bytes == AUTH_FILE_MAX_BYTES {
+            "1 MiB".into()
+        } else {
+            format!("{} KiB", max_bytes / 1024)
+        };
+        return Err(OpenCodeFilesError::Invalid(format!(
+            "{kind} exceeds {limit}",
+        )));
+    }
+    fs::read(path).map_err(|source| OpenCodeFilesError::Io {
+        action: "read file",
+        source,
+    })
+}
+
+fn validate_secure_parent(path: &Path) -> Result<(), OpenCodeFilesError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| OpenCodeFilesError::Io {
+        action: "stat parent directory",
+        source,
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(OpenCodeFilesError::Invalid(
+            "parent directory must be a directory".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != current_uid()? {
+            return Err(OpenCodeFilesError::InsecureParent {
+                path: path.into(),
+                reason: "not owned by the current uid",
+            });
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o002 != 0 && mode & 0o1000 == 0 {
+            return Err(OpenCodeFilesError::InsecureParent {
+                path: path.into(),
+                reason: "world-writable without sticky bit",
+            });
         }
     }
     Ok(())

@@ -48,15 +48,11 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
             "provider {provider} has an unsupported handle shape; migrate-opencode supports api entries"
         )));
     }
-    if provider_entry
+    let existing_account = provider_entry
         .accounts
         .iter()
-        .any(|account| account.label == label)
-    {
-        return Err(CliError::Usage(format!(
-            "account label '{label}' already exists for provider {provider}"
-        )));
-    }
+        .find(|account| account.label == label)
+        .cloned();
     let insert_at = before
         .as_deref()
         .map(|wanted| {
@@ -79,16 +75,65 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
         ));
     }
     let id = format!("apikey:{provider}:{label}");
-    commit_admin(
-        global,
-        store_op(
-            &id,
-            VaultRecord::new_static(CredentialKind::ApiKey, "opencode", material, None),
-            AdminAuditOp::Import,
-            StoreMode::Create,
-        ),
-    )?;
-    let handle = opencode_migration::mint_handle(global, &id)?;
+    if let Some(account) = existing_account {
+        if global.subc_conn.is_none() {
+            return Err(CliError::Usage(format!(
+                "account label '{label}' already exists for provider {provider}"
+            )));
+        }
+        if account.credential_id != id {
+            return Err(CliError::Io(
+                "existing handle account points at another credential".into(),
+            ));
+        }
+        let existing = opencode_migration::get_material(global, &account.handle)?
+            .ok_or_else(|| CliError::Io("existing account handle was revoked".into()))?;
+        if existing != material {
+            return Err(CliError::Usage(format!(
+                "existing credential {id} differs; remove the account before replacing it"
+            )));
+        }
+        opencode_migration::finalize_superseded(global, &mut handles, &provider, &handle_path)?;
+        println!(
+            "provider={provider} label={label} credential_id={id} identical handle_file={}",
+            handle_path.display()
+        );
+        return Ok(());
+    }
+
+    let exists = super::parse_inventory(&super::request_admin_status(global)?)?
+        .iter()
+        .any(|(_, _, candidate)| candidate == &id);
+    let handle = if exists {
+        let verification_handle = opencode_migration::mint_handle(global, &id)?;
+        let existing = opencode_migration::get_material(global, &verification_handle)?
+            .ok_or_else(|| CliError::Io("fresh capability was revoked before comparison".into()))?;
+        if existing != material {
+            return Err(CliError::Usage(format!(
+                "existing credential {id} differs; remove the account before replacing it"
+            )));
+        }
+        opencode_migration::revoke_all_handles(global, &id)?;
+        opencode_migration::mint_handle(global, &id)?
+    } else {
+        commit_admin(
+            global,
+            store_op(
+                &id,
+                VaultRecord::new_static(CredentialKind::ApiKey, "opencode", material, None),
+                AdminAuditOp::Import,
+                StoreMode::Create,
+            ),
+        )?;
+        opencode_migration::mint_handle(global, &id)?
+    };
+
+    #[cfg(feature = "opencode-test-seam")]
+    if std::env::var("CK_OPENCODE_TEST_FAIL_HANDLE_WRITE").as_deref() == Ok("1") {
+        return Err(CliError::Io(
+            "OpenCode files: handle file write interrupted; re-run converges from the stored credential".into(),
+        ));
+    }
 
     let provider_entry = handles
         .providers
@@ -97,7 +142,7 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
         .expect("provider validated before store");
     let account = opencode_files::HandleAccount {
         label: label.clone(),
-        handle,
+        handle: handle.clone(),
         credential_id: id.clone(),
         superseded: Vec::new(),
     };
@@ -106,7 +151,10 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     } else {
         provider_entry.accounts.push(account);
     }
-    opencode_migration::write_and_verify_handles(&handle_path, &handles)?;
+    if let Err(error) = opencode_migration::write_and_verify_handles(&handle_path, &handles) {
+        let _ = opencode_migration::revoke_handle(global, &handle);
+        return Err(error);
+    }
     opencode_migration::finalize_superseded(global, &mut handles, &provider, &handle_path)?;
     println!(
         "provider={provider} label={label} credential_id={id} added handle_file={}",
@@ -201,11 +249,21 @@ fn list(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
 }
 
 fn validate_label(label: &str) -> Result<(), CliError> {
-    if label.is_empty() {
-        return Err(CliError::Usage("account label must not be empty".into()));
-    }
     if label.contains(':') {
         return Err(CliError::Usage("account label must not contain ':'".into()));
+    }
+    if label.is_empty()
+        || label.len() > 64
+        || matches!(label, "__proto__" | "constructor" | "prototype")
+        || !label.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'.' | b'_' | b'-' => index > 0,
+            _ => false,
+        })
+    {
+        return Err(CliError::Usage(
+            "account label must match [a-z0-9][a-z0-9._-]{0,63}".into(),
+        ));
     }
     Ok(())
 }
@@ -216,9 +274,18 @@ fn read_key_material(path: &str) -> Result<Vec<u8>, CliError> {
         std::io::stdin()
             .read_to_end(&mut material)
             .map_err(|error| CliError::Io(format!("read key material from stdin: {error}")))?;
+        trim_terminal_newline(&mut material);
         return Ok(material);
     }
     std::fs::read(path).map_err(|error| CliError::Io(format!("read key file {path}: {error}")))
+}
+
+fn trim_terminal_newline(material: &mut Vec<u8>) {
+    if material.ends_with(b"\r\n") {
+        material.truncate(material.len() - 2);
+    } else if material.ends_with(b"\n") {
+        material.pop();
+    }
 }
 
 fn handle_path(args: &[String]) -> PathBuf {

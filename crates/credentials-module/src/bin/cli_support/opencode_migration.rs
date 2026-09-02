@@ -246,7 +246,6 @@ fn migrate_one(
     }
     opencode_files::verify_auth_written(&args.auth_file, provider, &tombstone)
         .map_err(files_error)?;
-    let _ = superseded;
     finalize_superseded(global, &mut handles, provider, &args.handle_file)?;
     println!(
         "provider={provider} credential_id={id} {outcome} handle_file={} tombstone=api",
@@ -569,7 +568,29 @@ pub(crate) fn mint_handle(global: &GlobalArgs, id: &str) -> Result<String, CliEr
     .ok_or_else(|| CliError::Io("mint did not return a handle".into()))
 }
 
-fn get_material(global: &GlobalArgs, handle: &str) -> Result<Option<Vec<u8>>, CliError> {
+pub(crate) fn revoke_handle(global: &GlobalArgs, handle: &str) -> Result<(), CliError> {
+    commit_admin(
+        global,
+        AdminOpBody::RevokeHandle {
+            v: ADMIN_OP_SCHEMA_V1,
+            handle: handle.into(),
+        },
+    )?;
+    Ok(())
+}
+
+pub(crate) fn revoke_all_handles(global: &GlobalArgs, id: &str) -> Result<(), CliError> {
+    commit_admin(
+        global,
+        AdminOpBody::RevokeAllHandles {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: id.into(),
+        },
+    )?;
+    Ok(())
+}
+
+pub(crate) fn get_material(global: &GlobalArgs, handle: &str) -> Result<Option<Vec<u8>>, CliError> {
     let connection = global.subc_conn.as_deref().ok_or_else(|| {
         CliError::Usage("migrate-opencode needs --subc for capability reads".into())
     })?;
