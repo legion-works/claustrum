@@ -14,6 +14,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const CUSTODY_TOMBSTONE_PREFIX: &str = "claustrum-tombstone:v1:";
+
+fn is_custody_tombstone(value: &str) -> bool {
+    value.starts_with(CUSTODY_TOMBSTONE_PREFIX)
+}
+
 /// A canonical OAuth credential: the provider-agnostic fields a refresh exchange
 /// needs, plus the current tokens. Importers map each source format into this;
 /// refresh adapters read and update it.
@@ -162,6 +168,9 @@ impl OAuthCredential {
             .filter(|s| !s.is_empty())
             .ok_or(ImportError::MissingField("refresh"))?;
         let access_token = entry.access.unwrap_or_default();
+        if is_custody_tombstone(&refresh_token) || is_custody_tombstone(&access_token) {
+            return Err(ImportError::CustodyTombstone);
+        }
         Ok(OAuthCredential {
             access_token,
             refresh_token,
@@ -320,6 +329,9 @@ pub fn import_api_key(
                 .and_then(|k| k.as_str())
                 .filter(|s| !s.is_empty())
                 .ok_or(ImportError::MissingField("key"))?;
+            if is_custody_tombstone(key) {
+                return Err(ImportError::CustodyTombstone);
+            }
             Ok(key.as_bytes().to_vec())
         }
         other => Err(ImportError::UnknownSource(other.to_string())),
@@ -337,6 +349,8 @@ pub enum ImportError {
     MissingField(&'static str),
     /// The requested provider key was not present in a multi-provider auth file.
     ProviderNotFound(String),
+    /// Claustrum's tombstone is an ownership marker, never importable credential material.
+    CustodyTombstone,
 }
 
 impl std::fmt::Display for ImportError {
@@ -350,6 +364,10 @@ impl std::fmt::Display for ImportError {
             ImportError::ProviderNotFound(p) => {
                 write!(f, "provider '{p}' not found in auth file")
             }
+            ImportError::CustodyTombstone => write!(
+                f,
+                "refusing Claustrum tombstone material; run ck auth migrate-opencode or ck auth migrate-opencode --restore"
+            ),
         }
     }
 }
@@ -463,6 +481,19 @@ mod tests {
             import_api_key("opencode", nokey, "x"),
             Err(ImportError::MissingField("key"))
         ));
+    }
+
+    #[test]
+    fn import_refuses_claustrum_tombstone_material() {
+        let api = br#"{"deepseek":{"type":"api","key":"claustrum-tombstone:v1:deepseek"}}"#;
+        let error =
+            import_api_key("opencode", api, "deepseek").expect_err("tombstone api key must refuse");
+        assert!(error.to_string().contains("migrate-opencode"));
+
+        let oauth = br#"{"anthropic":{"type":"oauth","refresh":"claustrum-tombstone:v1:anthropic","access":"claustrum-tombstone:v1:anthropic","expires":0}}"#;
+        let error = OAuthCredential::import_provider("opencode", oauth, "anthropic")
+            .expect_err("tombstone oauth tokens must refuse");
+        assert!(error.to_string().contains("migrate-opencode"));
     }
 
     #[test]
