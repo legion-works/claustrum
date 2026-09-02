@@ -1,3 +1,5 @@
+import { CustodyRequestError } from "./errors";
+
 export type ReplayableRequest = {
   withMaterial(material: string, target?: URL, methodOverride?: string): Request;
 };
@@ -124,7 +126,14 @@ export async function snapshotRequest(
         }) ||
         [...substitutedHeaders.values()].some((value) => value.includes(sentinel))
       ) {
-        throw new Error("custody sentinel remains in a forwarded request");
+        // The error carries a structured `code` so callers and tests can branch on the
+        // refusal without parsing `message`. The string rendered into the operator log
+        // (and the wrapper's `message`) is whatever the serve path chose -- NOT this
+        // literal -- so a future change that adds context here cannot silently widen
+        // what the upstream-fetch catch renders.
+        throw new CustodyRequestError("custody sentinel remains in a forwarded request", {
+          code: "sentinel_in_request",
+        });
       }
 
       const requestInit: RequestInitWithDuplex = {

@@ -11,7 +11,7 @@ import {
   type FreshnessAccount,
 } from "./freshness";
 import type { CustodyLogger } from "./log";
-import { snapshotRequest } from "./request";
+import { snapshotRequest, type ReplayableRequest } from "./request";
 import { isProviderTombstone, sentinel } from "./tombstone";
 
 export type ServeAccount = FreshnessAccount;
@@ -37,6 +37,16 @@ export type CreateServeFetchOptions = {
   freshness?: FreshnessController;
   verifyOwnership?: () => Promise<void>;
   log?: CustodyLogger;
+  // Test seam: replace the production snapshot when the test wants to drive
+  // the substitution-failure catch arm with a controlled error (e.g. a
+  // canary-message `withMaterial` throw) without a live daemon or a hand-
+  // crafted URL. The default is the production snapshot; callers outside the
+  // package should not pass this.
+  snapshotRequest?: (
+    input: RequestInfo | URL,
+    init: RequestInit | undefined,
+    sentinel: string,
+  ) => Promise<ReplayableRequest>;
 };
 
 type AccountRuntime = {
@@ -87,6 +97,10 @@ function exhaustion(provider: string, accounts: AccountRuntime[], freshness: Fre
 export function createServeFetch(options: CreateServeFetchOptions) {
   const providerSentinel = sentinel(options.provider);
   const now = options.now ?? Date.now;
+  const snap = options.snapshotRequest
+    ? options.snapshotRequest
+    : (input: RequestInfo | URL, init: RequestInit | undefined) =>
+        snapshotRequest(input, init, providerSentinel);
   const accounts: AccountRuntime[] = options.accounts.map((account) => ({ account }));
   const freshness = options.freshness ?? new FreshnessController({
     provider: options.provider,
@@ -100,7 +114,7 @@ export function createServeFetch(options: CreateServeFetchOptions) {
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     let snapshot;
     try {
-      snapshot = await snapshotRequest(input, init, providerSentinel);
+      snapshot = await snap(input, init, providerSentinel);
     } catch (error) {
       const refusal = new CustodyRequestError(
         `could not prepare custody request: ${error instanceof Error ? error.name : String(error)}`,
@@ -149,10 +163,23 @@ export function createServeFetch(options: CreateServeFetchOptions) {
         try {
           forwarded = snapshot.withMaterial(attempt.material, target, methodOverride);
         } catch (error) {
-          const detail = error instanceof Error && error.message ? error.message : String(error);
-          const refusal = new CustodyRequestError(
-            `could not substitute custody credential: ${detail}`,
-          );
+          // SECURITY: render `error.name` only -- never `error.message`. The substitution
+          // step works on the URL the peer submitted; its thrown message can carry
+          // matching bits (encoded sentinel in pathname / hash / post-substitution
+          // header) that an operator log line would echo verbatim. The sibling
+          // wrappers at lines 106, 116, 133, 165, 235 use the same name-only policy,
+          // and this branch must not widen it. A test that wants to distinguish the
+          // cause asserts on `error instanceof CustodyRequestError` plus the
+          // structured `code` on the typed error -- not on message text.
+          const refusal = error instanceof CustodyRequestError
+            ? new CustodyRequestError(
+                `could not substitute custody credential: ${error.name}`,
+                { code: error.code, cause: error.cause ?? error },
+              )
+            : new CustodyRequestError(
+                `could not substitute custody credential: ${error instanceof Error ? error.name : String(error)}`,
+                { cause: error },
+              );
           options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
           throw refusal;
         }

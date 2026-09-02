@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { ClaustrumCredentialError, type ServedCredential } from "@cortexkit/claustrum-client";
 
-import { CustodySplitError } from "../errors";
+import { CustodyRequestError, CustodySplitError } from "../errors";
 import { snapshotRequest } from "../request";
 import { createServeFetch } from "../serve";
 import { sentinel, tombstoneFor } from "../tombstone";
@@ -210,6 +210,12 @@ describe("OpenCode custody serve fetch", () => {
     // sentinel. An encoded form (`claustrum-tombstone%3Av1%3Adeepseek`) survives because
     // URL.pathname retains percent-escapes; an upstream that unflattens them before
     // matching against its allowlist observes the sentinel as the credential.
+    //
+    // The refusal is asserted on the typed error class plus the structured `code`
+    // (request.ts carries `code: 'sentinel_in_request'`). Asserting on message text
+    // would force the serve-path catch to widen what it renders into the operator
+    // log; the canary at serve.test.ts:472a below is the contract that catches that
+    // regression -- never relax this assertion into a `rejects.toThrow(/sentinel/)`.
     const requests: Request[] = [];
     const fetch = serve({
       upstream: async (request) => {
@@ -217,9 +223,10 @@ describe("OpenCode custody serve fetch", () => {
         return new Response("must not forward", { status: 200 });
       },
     });
-    await expect(
-      fetch(`https://upstream.example/v1/chat/${encodeURIComponent(SENTINEL)}/respond`),
-    ).rejects.toThrow(/sentinel/);
+    const caught = await fetch(`https://upstream.example/v1/chat/${encodeURIComponent(SENTINEL)}/respond`)
+      .catch((error: unknown) => error);
+    expect(caught).toBeInstanceOf(CustodyRequestError);
+    expect((caught as CustodyRequestError).code).toBe("sentinel_in_request");
     expect(requests).toHaveLength(0);
   });
 
@@ -483,6 +490,36 @@ describe("OpenCode custody serve fetch", () => {
 
     await expect(fetch("https://upstream.example/v1/chat")).rejects.toThrow("could not verify custody handle ownership: Error");
     expect(JSON.stringify(entries)).not.toContain("MATERIAL-CANARY");
+  });
+
+  test("does not expose substitution-failure error messages", async () => {
+    // The substitution catch (serve.ts ~152) wraps errors thrown by
+    // `snapshot.withMaterial`. A future widening of that catch to interpolate
+    // `error.message` instead of `error.name` would leak canary material into
+    // the operator log. The seam `snapshotRequest` lets this test feed a stub
+    // whose `withMaterial` throws a canary-bearing message; assertion covers
+    // BOTH the thrown wrapper AND every captured log line.
+    const entries: unknown[] = [];
+    const canary = `MATERIAL-CANARY ${SENTINEL}`;
+    const fetch = createServeFetch({
+      provider: PROVIDER,
+      accounts: [accounts[0]!],
+      client: clientWith(),
+      readAuthEntry: () => tombstoneFor("api", PROVIDER),
+      upstreamFetch: async () => new Response("must not forward", { status: 200 }),
+      log: { debug() {}, info() {}, warn() {}, error(entry) { entries.push(entry); } },
+      snapshotRequest: async () => ({
+        withMaterial: () => {
+          throw new Error(canary);
+        },
+      }),
+    });
+
+    const caught = await fetch("https://upstream.example/v1/chat").catch((error: unknown) => error);
+    expect(caught).toBeInstanceOf(CustodyRequestError);
+    // Thrown wrapper renders name only -- the canary does not surface in `message`.
+    expect((caught as Error).message).not.toContain(canary);
+    expect(JSON.stringify(entries)).not.toContain(canary);
   });
 
   test("puts a 402 account on a one-hour cooldown before trying the next account", async () => {
