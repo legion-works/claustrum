@@ -6,6 +6,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 
 import { CustodyOrphanError, CustodySplitError, HandleFileValidationError } from "./errors";
 import { defaultHandleFilePath, OUR_PLUGIN_ID, readHandleFile, type OpenCodeHandleFileV1 } from "./handles";
+import { createServeFetch, type ServeClient } from "./serve";
 import { isProviderTombstone, sentinel } from "./tombstone";
 
 type ConfigProvider = { options?: Record<string, unknown> };
@@ -36,10 +37,6 @@ async function readAuth(path: string): Promise<Record<string, unknown>> {
   }
 }
 
-function placeholderFetch(): never {
-  throw new Error("NotImplemented");
-}
-
 function logError(log: (line: string) => void, error: Error, provider: string) {
   log(`${error.name}: provider=${provider} ${error.message}`);
 }
@@ -51,8 +48,24 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
   // Config must not open the vault; the request path owns connection lifecycle.
   const detection = dependencies.detect ?? detectClaustrumConnection;
   const clientFactory = dependencies.clientFactory ?? ClaustrumClient.connect;
-  void detection;
-  void clientFactory;
+  let connected: Promise<ClaustrumClient> | undefined;
+  const client: ServeClient = {
+    async getCredential(handle) {
+      return (await connect()).getCredential(handle);
+    },
+    async reportAuthFailure(input) {
+      await (await connect()).reportAuthFailure(input);
+    },
+  };
+
+  async function connect(): Promise<ClaustrumClient> {
+    connected ??= (async () => {
+      const result = await detection();
+      if (result.status !== "available") throw new Error(`Claustrum connection ${result.status}`);
+      return clientFactory();
+    })();
+    return connected;
+  }
 
   return async () => ({
     config: async (input) => {
@@ -103,7 +116,14 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         configured.options = {
           ...(configured.options ?? {}),
           apiKey: sentinel(provider),
-          fetch: placeholderFetch,
+          fetch: createServeFetch({
+            provider,
+            accounts: handle!.accounts,
+            client,
+            readAuthEntry: async () => (await authReader(defaultAuthPath()))[provider],
+            upstreamFetch: globalThis.fetch,
+            log,
+          }),
         };
       }
     },
