@@ -29,6 +29,12 @@ const AUTH_SCAN_CARRY_BYTES = TOMBSTONE_PREFIX.length + 64;
 const SCANNED_PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const FORBIDDEN_PROVIDER_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
+type AuthFileDescriptor = {
+  stat(): Promise<{ size: number }>;
+  readFile(options: { encoding: "utf8" }): Promise<string>;
+  close(): Promise<void>;
+};
+
 export type ConfigHookDependencies = {
   handleReader?: (path: string) => Promise<OpenCodeHandleFileV1>;
   authReader?: (path: string) => Promise<Record<string, unknown>>;
@@ -49,9 +55,12 @@ function defaultAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(dataHome, "opencode", "auth.json");
 }
 
-async function readAuthFile(path: string): Promise<Record<string, unknown>> {
+export async function readAuthFile(
+  path: string,
+  openFile: (path: string) => Promise<AuthFileDescriptor> = (candidate) => open(candidate, "r"),
+): Promise<Record<string, unknown>> {
   try {
-    const descriptor = await open(path, "r");
+    const descriptor = await openFile(path);
     let value: unknown;
     try {
       if ((await descriptor.stat()).size > AUTH_FILE_MAX_BYTES) {

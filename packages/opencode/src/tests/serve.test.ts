@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { ClaustrumCredentialError, type ServedCredential } from "@cortexkit/claustrum-client";
 
 import { CustodySplitError } from "../errors";
+import { snapshotRequest } from "../request";
 import { createServeFetch } from "../serve";
 import { sentinel, tombstoneFor } from "../tombstone";
 
@@ -140,6 +141,12 @@ describe("OpenCode custody serve fetch", () => {
     await fetch(`https://upstream.example/v1/chat?${encodeURIComponent(SENTINEL)}=${encodeURIComponent(SENTINEL)}`);
 
     expect(new URL(requests[0]?.url ?? "").search).toBe(`?${encodeURIComponent(SENTINEL)}=material-main`);
+  });
+
+  test("allows a sentinel-looking query parameter name with no credential value", async () => {
+    const replay = await snapshotRequest(`https://upstream.example/v1/chat?${SENTINEL}`, undefined, SENTINEL);
+
+    expect(replay.withMaterial("material-main").url).toContain(`?${SENTINEL}`);
   });
 
   test("percent-encodes substituted query material while preserving untouched query bytes", async () => {

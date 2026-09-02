@@ -53,7 +53,10 @@ export async function snapshotRequest(
       }
       if (
         `${url.origin}${url.pathname}${url.hash}`.includes(sentinel) ||
-        substitutedQuery.split("&").some((part) => part.slice(part.indexOf("=") + 1).includes(sentinel)) ||
+        substitutedQuery.split("&").some((part) => {
+          const separator = part.indexOf("=");
+          return separator !== -1 && part.slice(separator + 1).includes(sentinel);
+        }) ||
         [...substitutedHeaders.values()].some((value) => value.includes(sentinel))
       ) {
         throw new Error("custody sentinel remains in a forwarded request");

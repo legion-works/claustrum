@@ -403,6 +403,7 @@ describe("custody freshness", () => {
         providers: [{ provider: PROVIDER, shape: "oauth", serve: "opencode-claustrum", accounts: [apiAccounts[0]!] }],
       }),
       authReader: async () => ({ [PROVIDER]: tombstoneFor("oauth", PROVIDER) }),
+      detect: async () => ({ status: "available", schema: 1, wireVersion: 1, endpoints: [] }),
       clientFactory: async () => client as never,
       setInterval: intervals.setInterval,
       clearInterval: intervals.clearInterval,

@@ -116,7 +116,7 @@ run_check "format" cargo fmt $FMT_PKGS -- --check
 run_check "bun frozen install" "$BUN" install --frozen-lockfile
 run_check "bun typecheck" "$BUN" run typecheck
 run_check "bun build" "$BUN" run build
-run_check "bun tests" "$BUN" test packages
+run_check "bun tests (hermetic)" "$BUN" run test:hermetic
 
 run_check "clippy" \
   cargo clippy --locked --workspace --all-targets -- -D warnings

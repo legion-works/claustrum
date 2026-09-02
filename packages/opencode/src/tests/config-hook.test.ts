@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   createOpencodeClaustrumPlugin,
+  readAuthFile,
   type ConfigHookDependencies,
 } from "../plugin";
 import { CustodySplitError, HandleFileValidationError } from "../errors";
@@ -457,6 +458,16 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
 
     expect(logs.join("\n")).toContain("CustodyAuthReadError");
     await expectRefusal(cfg, "deepseek", /auth-read failure.*AuthFileValidationError.*custody auth source refused/);
+  });
+
+  test("bounds auth content against the descriptor stat before reading it", async () => {
+    let reads = 0;
+    await expect(readAuthFile("/tmp/auth.json", async () => ({
+      stat: async () => ({ size: 1024 * 1024 + 1 }),
+      readFile: async () => { reads += 1; return "{}"; },
+      close: async () => {},
+    }))).rejects.toThrow("exceeds 1 MiB");
+    expect(reads).toBe(0);
   });
 
   test("refuses an oversized tombstone when the handle file is absent", async () => {

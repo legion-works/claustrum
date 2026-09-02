@@ -1016,6 +1016,112 @@ fn the_migrate_opencode_migrates_safe_providers_while_refusing_unsafe_shapes() {
     assert_eq!(auth["amazon-bedrock"]["key"], "bedrock-secret");
 }
 
+fn assert_no_minted_handle_or_audit_row(rig: &MigrationRig, credential_id: &str) {
+    drop(open_vault(rig));
+    let conn = rusqlite::Connection::open(rig.vault.join("store.db")).expect("open scratch vault");
+    let live_handles: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM handles WHERE credential_id = ?1 AND revoked = 0",
+            rusqlite::params![credential_id],
+            |row| row.get(0),
+        )
+        .expect("count live handles");
+    let mints: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE credential_id = ?1 AND op = 'mint_handle'",
+            rusqlite::params![credential_id],
+            |row| row.get(0),
+        )
+        .expect("count mint audits");
+    assert_eq!(live_handles, 0, "reserved material must not mint a handle");
+    assert_eq!(
+        mints, 0,
+        "reserved material must not create a mint audit row"
+    );
+}
+
+#[test]
+fn the_migrate_opencode_skips_reserved_api_material_while_migrating_other_providers() {
+    let reserved = "claustrum-tombstone:v1:legitimate";
+    let rig = MigrationRig::new(
+        "migration-reserved-mixed",
+        json!({
+            "deepseek": {"type": "api", "key": reserved},
+            "groq": {"type": "api", "key": "groq-secret"}
+        }),
+    );
+
+    let out = rig.migrate(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("provider=deepseek refused reserved prefix=claustrum-tombstone:v1:"));
+    assert!(stdout.contains("provider=groq credential_id=apikey:groq:main"));
+    let auth: Value =
+        serde_json::from_slice(&std::fs::read(&rig.auth).expect("auth")).expect("auth json");
+    assert_eq!(auth["deepseek"]["key"], reserved);
+    assert_eq!(auth["groq"]["key"], "claustrum-tombstone:v1:groq");
+    assert_no_minted_handle_or_audit_row(&rig, "apikey:deepseek:main");
+}
+
+#[test]
+fn the_migrate_opencode_provider_filter_skips_reserved_api_material() {
+    let reserved = "claustrum-tombstone:v1:legitimate";
+    let rig = MigrationRig::new(
+        "migration-reserved-filter",
+        json!({"deepseek": {"type": "api", "key": reserved}}),
+    );
+
+    let out = rig.migrate(&["--provider", "deepseek"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout)
+        .contains("provider=deepseek refused reserved prefix=claustrum-tombstone:v1:"));
+    let auth: Value =
+        serde_json::from_slice(&std::fs::read(&rig.auth).expect("auth")).expect("auth json");
+    assert_eq!(auth["deepseek"]["key"], reserved);
+    assert_no_minted_handle_or_audit_row(&rig, "apikey:deepseek:main");
+}
+
+#[test]
+fn opencode_account_add_refuses_reserved_api_material_before_minting() {
+    let rig = MigrationRig::new(
+        "account-add-reserved",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let key_file = rig.root.join("reserved.key");
+    std::fs::write(&key_file, b"claustrum-tombstone:v1:altlegit").expect("key file");
+
+    let out = rig.run(&[
+        "opencode-account",
+        "add",
+        "--provider",
+        "deepseek",
+        "--label",
+        "alt",
+        "--key-file",
+        key_file.to_str().expect("key path"),
+        "--handle-file",
+        rig.handles.to_str().expect("handle path"),
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("reserved prefix=claustrum-tombstone:v1:"));
+    let handles = opencode_files::read_handle_file(&rig.handles).expect("handles");
+    assert!(handles.providers[0]
+        .accounts
+        .iter()
+        .all(|account| account.label != "alt"));
+    assert_no_minted_handle_or_audit_row(&rig, "apikey:deepseek:alt");
+}
+
 #[test]
 fn opencode_account_add_refuses_a_provider_forced_across_the_fetch_seam() {
     let rig = MigrationRig::new(

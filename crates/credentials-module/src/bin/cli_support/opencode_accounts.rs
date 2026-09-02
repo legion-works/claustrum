@@ -7,6 +7,7 @@ use super::{
     GlobalArgs,
 };
 use credentials_core::admin_ops::{AdminAuditOp, AdminOpBody, StoreMode, ADMIN_OP_SCHEMA_V1};
+use credentials_core::oauth::CUSTODY_TOMBSTONE_PREFIX;
 use credentials_core::record::{CredentialKind, VaultRecord};
 
 pub(crate) fn cmd_opencode_account(global: &GlobalArgs, raw: &[String]) -> Result<(), CliError> {
@@ -82,6 +83,11 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
         return Err(CliError::Usage(
             "--key-file contains no key material".into(),
         ));
+    }
+    if material.starts_with(CUSTODY_TOMBSTONE_PREFIX.as_bytes()) {
+        return Err(CliError::Usage(format!(
+            "refusing reserved prefix={CUSTODY_TOMBSTONE_PREFIX} in --key-file"
+        )));
     }
     let id = format!("apikey:{provider}:{label}");
     if let Some(account) = existing_account {

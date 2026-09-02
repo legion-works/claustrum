@@ -108,7 +108,7 @@ jobs:
 
       - name: Bun test packages
         if: matrix.os == 'ubuntu'
-        run: bun test packages
+        run: bun run test:hermetic
 
       # This repo path-deps the private cortexkit/subconscious (subc wire) and
       # cortexkit/commons (storage libs) siblings. The default GITHUB_TOKEN is
@@ -307,7 +307,7 @@ jobs:
         run: bun run typecheck
 
       - name: Bun test packages
-        run: bun test packages
+        run: bun run test:hermetic
 
       - name: State what this job did NOT check
         run: |

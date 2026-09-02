@@ -274,6 +274,10 @@ fn migrate_providers(global: &GlobalArgs, args: &MigrationArgs) -> Result<(), Cl
             continue;
         }
         let material = api_material(entry, &provider)?;
+        if material.starts_with(TOMBSTONE_PREFIX.as_bytes()) {
+            println!("provider={provider} refused reserved prefix={TOMBSTONE_PREFIX}");
+            continue;
+        }
         migrate_one(global, args, &provider, material)?;
     }
     Ok(())
