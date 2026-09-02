@@ -1,7 +1,7 @@
 {
   "version": 1,
   "derived_from": {
-    "repo": "sst/opencode",
+    "repo": "anomalyco/opencode",
     "commit": "dc4449df0d",
     "derivation": "grep `auth?.type === \"api\"` across provider/provider.ts and plugin/, attribute by walking the custom() map keys backwards from each hit, cross-reference the oauth-gate list",
     "scope": "providers consuming a type:\"api\" key outside options.fetch in provider/provider.ts and plugin/ as of the named commit; a consumer elsewhere in the tree would be missed — this is the method's edge, not a proof over all of opencode",
@@ -18,7 +18,7 @@
     },
     "api-metadata": {
       "why": "provider reads auth.metadata for api entries; a metadata-less tombstone breaks it",
-      "if_forced": "the provider reads auth.metadata that a tombstone does not carry; it fails at load"
+      "if_forced": "the provider reads auth.metadata (e.g. azure resourceName) that a tombstone does not carry, so it fails to construct at load — a different symptom from api-env/api-discovery, which construct and then 401 on the sentinel; still availability-only, the sentinel is non-secret"
     }
   },
   "providers": {
