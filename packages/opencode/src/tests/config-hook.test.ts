@@ -79,6 +79,76 @@ function config(...providers: string[]): TestConfig {
   };
 }
 
+type AuthSource = { env?: string; disk?: string };
+
+// Mirror provenance: Auth.all/Auth.read in packages/opencode/src/auth/index.ts and the API-key
+// loop in provider/provider.ts:1592-1600 at sst/opencode@dc4449df0d. Maintained by delta per
+// OpenCode base update alongside opencode-provider-shapes.json.
+function opencodeWouldLoad(source: AuthSource): Set<string> {
+  const parse = (content: string | undefined): unknown => {
+    if (content === undefined) return {};
+    try {
+      return JSON.parse(content);
+    } catch {
+      return {};
+    }
+  };
+  const validDiskEntry = (entry: unknown) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+    const candidate = entry as Record<string, unknown>;
+    if (candidate.type === "api") return Object.keys(candidate).length === 2 && typeof candidate.key === "string";
+    return candidate.type === "oauth" && Object.keys(candidate).length === 4 &&
+      typeof candidate.refresh === "string" && typeof candidate.access === "string" && typeof candidate.expires === "number";
+  };
+  const diskEntries = () => {
+    const disk = parse(source.disk);
+    if (!disk || typeof disk !== "object" || Array.isArray(disk)) return [];
+    return Object.entries(disk).filter(([, entry]) => validDiskEntry(entry));
+  };
+  let entries: [string, unknown][];
+  if (source.env) {
+    try {
+      const env = JSON.parse(source.env);
+      // The host throws at Object.entries(null) before a provider load; no refusal is required.
+      entries = env === null ? [] : Object.entries(env);
+    } catch {
+      entries = diskEntries();
+    }
+  } else {
+    entries = diskEntries();
+  }
+  return new Set(
+    entries.flatMap(([provider, entry]) =>
+      (entry as { type?: unknown; key?: unknown; access?: unknown; refresh?: unknown } | null)?.type === "api" &&
+        (entry as { key?: unknown }).key === sentinel(provider) ||
+      (entry as { type?: unknown; access?: unknown; refresh?: unknown } | null)?.type === "oauth" &&
+        ((entry as { access?: unknown }).access === sentinel(provider) || (entry as { refresh?: unknown }).refresh === sentinel(provider))
+        ? [provider]
+        : [],
+    ),
+  );
+}
+
+function maximumProviderId(prefix: string, index: number) {
+  return `${prefix}-${String(index).padStart(5, "0")}-${"x".repeat(48)}`;
+}
+
+function tombstoneSource(prefix: string, count: number, deepseekAt?: number) {
+  return JSON.stringify(Object.fromEntries(
+    Array.from({ length: count }, (_, index) => {
+      const provider = index === deepseekAt ? "deepseek" : maximumProviderId(prefix, index);
+      return [provider, tombstoneFor("api", provider)];
+    }),
+  ));
+}
+
+async function refusalSet(cfg: TestConfig): Promise<Set<string>> {
+  // The property fixture never supplies an owned handle, so the hook can install fetch only to refuse.
+  return new Set(Object.entries(cfg.provider)
+    .filter(([, provider]) => typeof provider.options?.fetch === "function")
+    .map(([provider]) => provider));
+}
+
 function prepareRefusalProbe(cfg: TestConfig, provider: string) {
   const options = cfg.provider[provider]?.options;
   if (!options) throw new Error(`missing test provider ${provider}`);
@@ -501,6 +571,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     { name: "absent", value: undefined, selected: "disk" },
     { name: "empty", value: "", selected: "disk" },
     { name: "malformed", value: "{", selected: "disk" },
+    { name: "non-object", value: "[]", selected: "none" },
     { name: "valid", value: JSON.stringify({ deepseek: { type: "api", key: "env-real-key" } }), selected: "env" },
   ] as const) {
     for (const disk of ["tombstone", "real"] as const) {
@@ -515,12 +586,16 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
         useEnv("OPENCODE_AUTH_CONTENT", env.value);
         const cfg = config("deepseek");
         prepareRefusalProbe(cfg, "deepseek");
+        const originalFetch = cfg.provider.deepseek.options?.fetch;
 
         await hook(cfg);
 
         const selectedIsTombstone = env.selected === "disk" && disk === "tombstone";
         if (selectedIsTombstone) {
           expect(cfg.provider.deepseek.options?.apiKey).toBe(sentinel("deepseek"));
+        } else if (env.selected === "none") {
+          expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+          expect(cfg.provider.deepseek.options?.fetch).toBe(originalFetch);
         } else {
           await expectRefusal(cfg, "deepseek", /local credential is real/);
         }
@@ -528,19 +603,58 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     }
   }
 
-  test("caps a malformed many-hit scan and refuses configured providers once the cap is reached", async () => {
-    const files = await fixture("auth-scan-hit-cap");
+  test("refuses a superset of every tombstone provider OpenCode would load on every auth and handle path", async () => {
+    const diskTombstone = JSON.stringify({ deepseek: tombstoneFor("api", "deepseek") });
+    const oversized = tombstoneSource("oversized", 10_000);
+    const manyHits = tombstoneSource("many-hit", 10_000, 257);
+    const malformedEntry = JSON.stringify({ deepseek: { type: "api", key: sentinel("deepseek"), extra: true } });
+    const sources: Array<{ name: string; source: AuthSource }> = [
+      { name: "disk tombstone", source: { disk: diskTombstone } },
+      { name: "malformed env", source: { env: "{", disk: diskTombstone } },
+      { name: "non-object env", source: { env: "[]", disk: diskTombstone } },
+      { name: "null env", source: { env: "null", disk: diskTombstone } },
+      { name: "malformed disk entry", source: { disk: malformedEntry } },
+      { name: "malformed env entry", source: { env: malformedEntry, disk: diskTombstone } },
+      { name: "oversized auth", source: { disk: oversized } },
+      { name: "many-hit auth with deepseek after 257 tombstones", source: { disk: manyHits } },
+    ];
+    const handleStates = ["present", "absent", "unreadable"] as const;
+    expect(opencodeWouldLoad({ disk: malformedEntry }).has("deepseek")).toBe(false);
+    expect(opencodeWouldLoad({ env: malformedEntry, disk: diskTombstone }).has("deepseek")).toBe(true);
+
+    for (const { name, source } of sources) {
+      for (const handleState of handleStates) {
+        const files = await fixture(`containment-${name}-${handleState}`);
+        if (handleState === "present") await writeHandles(files.handles, { version: 1, providers: [] });
+        if (handleState === "unreadable") {
+          await writeFile(files.handles, "not json");
+          await chmod(files.handles, 0o600);
+        }
+        if (source.disk !== undefined) {
+          await writeFile(files.auth, source.disk);
+          await chmod(files.auth, 0o600);
+        }
+        useEnv("OPENCODE_AUTH_CONTENT", source.env);
+        const cfg = { provider: {} } as TestConfig;
+
+        await hook(cfg, { log: () => {} });
+
+        const refusals = await refusalSet(cfg);
+        expect([...opencodeWouldLoad(source)].every((provider) => refusals.has(provider))).toBe(true);
+      }
+    }
+  });
+
+  test("streams every malformed many-hit tombstone into the refusal set", async () => {
+    const files = await fixture("auth-scan-many-hits");
     const hits = Array.from({ length: 300 }, (_, index) => sentinel(`provider-${index}`)).join(" ");
     await writeFile(files.auth, `{${JSON.stringify(hits)}`);
     await chmod(files.auth, 0o600);
-    const logs: string[] = [];
-    const cfg = config("deepseek");
-    prepareRefusalProbe(cfg, "deepseek");
+    const cfg = { provider: {} } as TestConfig;
 
-    await hook(cfg, { log: (line) => logs.push(line) });
+    await hook(cfg, { log: () => {} });
 
-    expect(logs.join("\n")).toContain("tombstone scan hit cap");
-    await expectRefusal(cfg, "deepseek", /bounded tombstone scan/);
+    expect(await refusalSet(cfg)).toEqual(new Set(Array.from({ length: 300 }, (_, index) => `provider-${index}`)));
   });
 
   test("refuses exactly the three observed providers when a malformed scan stays below the cap", async () => {

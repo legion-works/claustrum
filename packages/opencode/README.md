@@ -59,7 +59,11 @@ grep -cE '^\s*(catch|} catch)|^\s*return[; ]|^\s*continue;|^\s*if \(' packages/o
 | `eb034af` | 47/22 | 26/17 |
 | `57ce561` | 58/22 | 26/17 |
 | closing-wave worktree | 65/27 | 26/17 |
+| round-five worktree | 63/30 | 26/17 |
 
 The five added plugin rows cover the env parse fallthrough, scan I/O failure, final-chunk hit,
 identifier boundary, and hit-cap fallback. A changed exit count without a matching sweep row is a
 review failure, not harmless churn.
+
+The exits/rows census cannot see a subcondition inside a counted branch. The containment property
+test is the invariant; this census remains the drift canary.

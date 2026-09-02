@@ -25,7 +25,6 @@ type MutableConfig = { provider?: Record<string, ConfigProvider> };
 const AUTH_FILE_MAX_BYTES = 1024 * 1024;
 const AUTH_SCAN_CHUNK_BYTES = 64 * 1024;
 const AUTH_SCAN_CARRY_BYTES = TOMBSTONE_PREFIX.length + 64;
-const AUTH_SCAN_MAX_HITS = 256;
 const SCANNED_PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const FORBIDDEN_PROVIDER_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -78,7 +77,7 @@ async function readAuth(path: string, reader: (path: string) => Promise<Record<s
     try {
       const value: unknown = JSON.parse(content);
       if (!value || typeof value !== "object" || Array.isArray(value)) {
-        throw new AuthFileValidationError("OPENCODE_AUTH_CONTENT must contain an object");
+        return {};
       }
       return value as Record<string, unknown>;
     } catch {}
@@ -92,7 +91,7 @@ async function readAuth(path: string, reader: (path: string) => Promise<Record<s
 // both are the same no-hit branch; closing (1) breaks (2). A mis-keyed sentinel refuses the
 // provider it NAMES, not the entry that carries it; tolerable only because the sentinel is
 // non-secret (availability loss, nothing exposed). Rationale: docs/opencode-custody-design.md.
-function scanTombstones(source: string, providers: Set<string>, allowTrailing = false): boolean {
+function scanTombstones(source: string, onHit: (provider: string) => void, allowTrailing = false) {
   let index = 0;
   while ((index = source.indexOf(TOMBSTONE_PREFIX, index)) !== -1) {
     const start = index + TOMBSTONE_PREFIX.length;
@@ -100,48 +99,48 @@ function scanTombstones(source: string, providers: Set<string>, allowTrailing = 
     while (end - start < 64 && /[a-z0-9._-]/.test(source[end] ?? "")) end += 1;
     if (end > start && (allowTrailing || end < source.length)) {
       const provider = source.slice(start, end);
-      if (!providers.has(provider) && providers.size >= AUTH_SCAN_MAX_HITS) return true;
-      providers.add(provider);
+      onHit(provider);
     }
     index = start;
   }
-  return false;
 }
 
-type TombstoneScan = { providers: Set<string>; capped: boolean };
-
-async function scanAuthTombstones(path: string): Promise<TombstoneScan> {
-  const providers = new Set<string>();
-  let capped = false;
+async function scanAuthTombstones(path: string, onHit: (provider: string) => void): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const stream = createReadStream(path, { highWaterMark: AUTH_SCAN_CHUNK_BYTES });
     let carry = "";
     stream.on("data", (chunk: Buffer) => {
       const source = carry + chunk.toString("latin1");
-      if (!capped) capped = scanTombstones(source, providers);
+      scanTombstones(source, onHit);
       carry = source.slice(-AUTH_SCAN_CARRY_BYTES);
     });
     stream.on("error", reject);
     stream.on("end", () => {
-      if (!capped) capped = scanTombstones(carry, providers, true);
+      scanTombstones(carry, onHit, true);
       resolve();
     });
   });
-  return { providers, capped };
 }
 
-async function scanAuthSource(path: string): Promise<TombstoneScan> {
+async function scanAuthSource(path: string, onHit: (provider: string) => void): Promise<void> {
   const content = process.env.OPENCODE_AUTH_CONTENT;
   if (content) {
     try {
       const value: unknown = JSON.parse(content);
-      if (!value || typeof value !== "object" || Array.isArray(value)) throw new AuthFileValidationError("OPENCODE_AUTH_CONTENT must contain an object");
     } catch {
-      return scanAuthTombstones(path);
+      return scanAuthTombstones(path, onHit);
     }
-    return { providers: new Set<string>(), capped: false };
+    return;
   }
-  return scanAuthTombstones(path);
+  return scanAuthTombstones(path, onHit);
+}
+
+function carriesTombstoneKey(entry: unknown, provider: string): boolean {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return false;
+  const candidate = entry as Record<string, unknown>;
+  const value = sentinel(provider);
+  return candidate.type === "api" && candidate.key === value ||
+    candidate.type === "oauth" && (candidate.access === value || candidate.refresh === value);
 }
 
 // Effect's Config.boolean (effect@4.0.0-beta.74 dist/Config.js:541-562, the parser behind
@@ -235,6 +234,10 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         const cfg = input as MutableConfig;
         const providerConfig = cfg.provider ?? (cfg.provider = Object.create(null) as Record<string, ConfigProvider>);
         const configureRefusal = (provider: string, error: Error) => {
+          // A raw scan can name a provider only in a note or a mis-keyed entry. Creating that
+          // provider makes it visible to OpenCode, but preserves the required host-load superset;
+          // cfg.provider is therefore the only hit storage: O(unique ids), like the host's own
+          // provider entries. This is availability/UI direction only because the sentinel is non-secret.
           const configured = Object.hasOwn(providerConfig, provider)
             ? providerConfig[provider]!
             : (providerConfig[provider] = {});
@@ -246,33 +249,22 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         const configureAuthReadRefusals = async (error: unknown, ownedProviders: Iterable<string>) => {
           const refusal = authReadRefusal(error, true);
           const providers = new Set(ownedProviders);
-          try {
-            const scanned = await scanAuthSource(defaultAuthPath());
-            if (scanned.capped) {
-              // This malformed-source path is unlike the never-migrated no-hit case: a cap proves
-              // there are more tombstones than we can name, so refusing configured providers is safer.
-              for (const provider of Object.keys(providerConfig)) providers.add(provider);
-              log.warn({
-                provider: "auth-scan",
-                errorCode: "tombstone_scan_hit_cap",
-                errorMessage: `tombstone scan hit cap ${AUTH_SCAN_MAX_HITS}; refusing owned and configured providers`,
-              });
-            } else {
-              for (const provider of scanned.providers) providers.add(provider);
+          const refuse = (provider: string) => {
+            if ((!SCANNED_PROVIDER_ID.test(provider) || FORBIDDEN_PROVIDER_IDS.has(provider)) && !Object.hasOwn(providerConfig, provider)) {
+              logError(log, refusal, provider);
+              return;
             }
+            logError(log, refusal, provider);
+            configureRefusal(provider, refusal);
+          };
+          try {
+            await scanAuthSource(defaultAuthPath(), refuse);
           } catch (scanError) {
             logError(log, new CustodyAuthReadError(
               `bounded tombstone scan failed: ${scanError instanceof Error ? `${scanError.name}: ${scanError.message}` : String(scanError)}`,
             ), "auth-scan");
           }
-          for (const provider of providers) {
-            if ((!SCANNED_PROVIDER_ID.test(provider) || FORBIDDEN_PROVIDER_IDS.has(provider)) && !Object.hasOwn(providerConfig, provider)) {
-              logError(log, refusal, provider);
-              continue;
-            }
-            logError(log, refusal, provider);
-            configureRefusal(provider, refusal);
-          }
+          for (const provider of providers) refuse(provider);
         };
         let handles: OpenCodeHandleFileV1;
         try {
@@ -290,7 +282,7 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             return;
           }
           for (const [provider, entry] of Object.entries(auth)) {
-            if (!isProviderTombstone(entry, provider)) continue;
+            if (!carriesTombstoneKey(entry, provider)) continue;
             const refusal = new CustodyOrphanError(
               `handle file unavailable: ${typed.message}; tombstone ownership cannot be proven; run ck auth migrate-opencode`,
             );
@@ -313,16 +305,23 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
         const byProvider = new Map(handles.providers.map((provider) => [provider.provider, provider]));
         const providers = [...byProvider.keys()];
         for (const provider of Object.keys(auth)) {
-          if (!byProvider.has(provider) && isProviderTombstone(auth[provider], provider)) providers.push(provider);
+          if (!byProvider.has(provider) && carriesTombstoneKey(auth[provider], provider)) providers.push(provider);
         }
 
         for (const provider of providers) {
           const handle = byProvider.get(provider);
           const entry = Object.hasOwn(auth, provider) ? auth[provider] : undefined;
           const tombstone = isProviderTombstone(entry, provider);
+          const consumesTombstone = carriesTombstoneKey(entry, provider);
           const owner = handle?.serve;
 
           if (!tombstone) {
+            if (consumesTombstone) {
+              const refusal = new CustodyOrphanError("tombstone key is not a canonical custody entry; refusing before OpenCode can load it");
+              logError(log, refusal, provider);
+              configureRefusal(provider, refusal);
+              continue;
+            }
             if (owner === OUR_PLUGIN_ID) {
               if (entry === undefined) {
                 logError(log, new CustodyOrphanError("handle entry has no auth.json counterpart; run ck auth migrate-opencode"), provider);
