@@ -1106,6 +1106,8 @@ impl EncryptedStore {
     /// than the token, so re-importing rotated tokens must not erase account labelling.
     /// This preservation assumes the incoming token belongs to the SAME ACCOUNT as the
     /// retained label; when the adapter can derive both account ids, a mismatch is refused.
+    /// A derivation result of `None` preserves the label: an undecodable token cannot
+    /// contradict it, while refusing would block every non-JWT OpenAI credential.
     /// An undecryptable existing envelope is treated as no identity so repair still
     /// replaces corrupted material. Passing false makes an empty incoming identity an
     /// explicit clear.
@@ -4223,6 +4225,34 @@ mod tests {
             store.get("oauth:anthropic").expect("read").identity,
             existing.identity
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_preserves_identity_when_openai_account_derivation_fails() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(59);
+        let existing = openai_record("acct-retained", b"old-token").with_identity(RecordIdentity {
+            account_id: Some("acct-retained".to_string()),
+            email: Some("retained@example.com".to_string()),
+            org_name: None,
+        });
+        store.create("oauth:openai", &existing).expect("create");
+        let mut incoming = openai_record("unused", b"opaque-new-token");
+        incoming.oauth.as_mut().expect("OAuth").access_token = "not-a-jwt".to_string();
+
+        store
+            .overwrite_unconditional_audited(
+                "oauth:openai",
+                &incoming,
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("an undecodable incoming token cannot contradict the retained label");
+
+        let after = store.get("oauth:openai").expect("read replacement");
+        assert_eq!(after.payload, b"opaque-new-token");
+        assert_eq!(after.identity, existing.identity);
         let _ = std::fs::remove_dir_all(&root);
     }
 

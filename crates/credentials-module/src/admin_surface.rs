@@ -327,6 +327,7 @@ fn store_err(e: StoreOpError) -> AdminOutcome {
         StoreOpError::CasMismatch => "version/hash mismatch (concurrent change)".to_string(),
         StoreOpError::AlreadyExists => "credential already exists".to_string(),
         StoreOpError::Fenced { .. } => "fenced out by a newer writer".to_string(),
+        e @ StoreOpError::AccountIdentityMismatch { .. } => e.to_string(),
         other => format!("store error: {other}"),
     };
     AdminOutcome::Refused(reason)
@@ -435,6 +436,32 @@ mod tests {
             "mode": { "kind": "create" },
         })
         .to_string()
+    }
+
+    fn openai_record(account_id: &str, payload: &[u8]) -> VaultRecord {
+        use base64::Engine as _;
+
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let claims = serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": account_id },
+        });
+        let claims =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        let access_token = format!("{header}.{claims}.sig");
+        VaultRecord::new_oauth(
+            "opencode",
+            "openai",
+            credentials_core::oauth::OAuthCredential {
+                access_token,
+                refresh_token: format!("refresh-{account_id}"),
+                expires_at_ms: Some(4_102_444_800_000),
+                token_url: "https://example.invalid/token".to_string(),
+                client_id: Some("identity-test-client".to_string()),
+                scopes: vec!["scope-a".to_string(), "scope-b".to_string()],
+            },
+            payload.to_vec(),
+        )
     }
 
     #[tokio::test]
@@ -601,6 +628,38 @@ mod tests {
             "authenticated imports must enforce the same store identity boundary"
         );
         assert!(r.store.get("oauth:anthropic").is_err());
+    }
+
+    #[tokio::test]
+    async fn connected_identity_mismatch_refusal_renders_both_accounts_and_remedies() {
+        let r = rig(14);
+        r.admin.record_bind(5, Principal::Direct);
+        let existing = openai_record("acct-retained", b"old-token").with_identity(RecordIdentity {
+            account_id: Some("acct-retained".to_string()),
+            email: Some("retained@example.com".to_string()),
+            org_name: None,
+        });
+        r.store
+            .create("oauth:openai", &existing)
+            .expect("seed OAuth record");
+        let op = AdminOpBody::StoreWithIdentityPolicy {
+            v: ADMIN_OP_SCHEMA_V1,
+            id: "oauth:openai".to_string(),
+            record: Box::new(openai_record("acct-incoming", b"new-token")),
+            audit_op: credentials_core::admin_ops::AdminAuditOp::Import,
+            clear_identity: false,
+        };
+        let body = String::from_utf8(op.to_bytes().expect("encode op")).expect("UTF-8 JSON");
+        let (tag, _) = challenge_and_sign(&r, 5, &body);
+
+        let AdminOutcome::Refused(message) = r.admin.execute(5, body.as_bytes(), &tag).await else {
+            panic!("account mismatch must surface as admin_refused");
+        };
+        assert!(!message.starts_with("store error: "), "{message}");
+        assert!(message.contains("acct-retained"), "{message}");
+        assert!(message.contains("acct-incoming"), "{message}");
+        assert!(message.contains("--account-id <new>"), "{message}");
+        assert!(message.contains("--clear-identity"), "{message}");
     }
 
     #[tokio::test]
