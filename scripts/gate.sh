@@ -122,7 +122,7 @@ run_check "clippy" \
   cargo clippy --locked --workspace --all-targets -- -D warnings
 run_check "clippy (seam features)" \
   cargo clippy --locked --workspace --all-targets \
-    --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools,opencode-test-seam -- -D warnings
+    --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools -- -D warnings
 
 # Run a cargo invocation and require at least `min` tests to have PASSED, and that
 # no arm announced a skip.
@@ -291,14 +291,13 @@ run_expect 5 "master-key rotation crash cuts" \
   cargo test --locked -p credentials-core --features rotate-test-seam --test rotate_crash_cut
 run_expect 2 "login crash cut" \
   cargo test --locked -p credentials-core --features login-test-seam --test login_crash_cut
-# The migration seam proves a durable file transaction does not revoke a prior
-# capability until the tombstone itself has been reread. It is feature-gated so a
-# normal `cli_opencode` run cannot silently pass without compiling the interruption.
+# These debug-only seams prove the custody cleanup paths without making an
+# environment-triggered interruption reachable in a release binary.
 run_expect 1 "opencode tombstone reread crash cut" \
-  cargo test --locked -p credentials-module --features opencode-test-seam \
+  cargo test --locked -p credentials-module \
     --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
 run_expect 1 "opencode account handle-write crash cut" \
-  cargo test --locked -p credentials-module --features opencode-test-seam \
+  cargo test --locked -p credentials-module \
     --test cli_opencode the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle
 # Rebuild the shipped CLI with default features so every later check and the caller use
 # the production release artifact rather than a test-profile seam build.
@@ -312,11 +311,11 @@ run_expect 1 "migration tools" \
   --test key_verify_takes_nothing
 
 # The release-artifact assertion CI runs as its own step: the debug-only
-# validation bypass must be absent from a --release binary. Ignored by default
+# test escape hatches must be absent from a --release binary. Ignored by default
 # because it builds one.
-run_expect 1 "release artifact (bypass absent)" \
+run_expect 1 "release artifact (test seams absent)" \
   cargo test --locked -p credentials-module --test cli_admin \
-  validation_bypass_is_absent -- --ignored --nocapture
+  test_escape_hatches_are_absent -- --ignored --nocapture
 
 # PROVE the scope claim rather than asserting it. "Every check CI runs" rots the
 # moment CI grows an arm, and that is exactly how it broke: CI gained an inbound

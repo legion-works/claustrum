@@ -242,7 +242,7 @@ jobs:
       # Without this the gated binaries would rot unnoticed until the next rename, which
       # is the worst moment to discover they no longer compile.
       - name: Clippy (conformance seams)
-        run: cargo clippy --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools,opencode-test-seam -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam,migration-tools -- -D warnings
 
       - name: Test
         run: cargo test --locked --workspace --all-targets
@@ -253,13 +253,13 @@ jobs:
       # lease-lock release) and compile to nothing on Windows, so the step is harmless
       # there.
       - name: Security-conformance suite (crash-safety seams)
-        run: cargo test --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam,opencode-test-seam
+        run: cargo test --locked --workspace --all-targets --features kill9-test-seam,rotate-test-seam,login-test-seam
 
       - name: OpenCode custody crash cuts
         if: matrix.os == 'ubuntu'
         run: |
-          cargo test --locked -p credentials-module --features opencode-test-seam --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
-          cargo test --locked -p credentials-module --features opencode-test-seam --test cli_opencode the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle
+          cargo test --locked -p credentials-module --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
+          cargo test --locked -p credentials-module --test cli_opencode the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle
 
       # Run the #[ignore]'d real-daemon e2e (incl. the on-the-wire malicious-client
       # harness) under a real supervised subc-core. This is the ONLY layer that
@@ -277,14 +277,14 @@ jobs:
           CRED_REQUIRE_DAEMON: "1"
         run: cargo test --locked -p credentials-module --test real_daemon_e2e -- --ignored --test-threads=1
 
-      # Assert the api-key validation bypass is absent from a REAL release binary. It
+      # Assert test-only environment hatches are absent from a REAL release binary. It
       # is #[ignore]'d because it builds the release profile, so without this step it
       # would never run and the guarantee would be nominal. Ubuntu-only: the property
       # is about the source gate, which is platform-independent, and the release build
       # is the expensive part.
       - name: Release-artifact assertions (ship gate)
         if: matrix.os == 'ubuntu'
-        run: cargo test --locked -p credentials-module --test cli_admin validation_bypass_is_absent -- --ignored
+        run: cargo test --locked -p credentials-module --test cli_admin test_escape_hatches_are_absent -- --ignored
 
   # WHAT A FORK PR CAN ACTUALLY BE TOLD, given that the job above cannot run for it.
   #

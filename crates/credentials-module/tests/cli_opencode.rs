@@ -730,7 +730,7 @@ fn open_vault(rig: &MigrationRig) -> EncryptedStore {
     EncryptedStore::open(sqlite, key).expect("open scratch vault")
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 fn assert_minted_handle_was_revoked(rig: &MigrationRig, credential_id: &str) {
     let conn = rusqlite::Connection::open(rig.vault.join("store.db")).expect("open scratch vault");
     let live_handles: i64 = conn
@@ -1357,7 +1357,7 @@ fn the_migrate_opencode_handle_write_failure_leaves_the_real_auth_entry_untouche
     assert_eq!(auth["deepseek"]["key"], "write-secret");
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_migrate_opencode_revokes_a_mint_when_the_first_handle_persist_fails() {
     let rig = MigrationRig::new(
@@ -1369,7 +1369,7 @@ fn the_migrate_opencode_revokes_a_mint_when_the_first_handle_persist_fails() {
     assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_migrate_opencode_revokes_a_mint_when_a_missing_handle_persist_fails() {
     let rig = MigrationRig::new(
@@ -1392,7 +1392,7 @@ fn the_migrate_opencode_revokes_a_mint_when_a_missing_handle_persist_fails() {
     assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_migrate_opencode_revokes_a_remint_when_lost_handle_persist_fails() {
     let rig = MigrationRig::new(
@@ -1425,7 +1425,7 @@ fn the_migrate_opencode_revokes_a_remint_when_lost_handle_persist_fails() {
     assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_migrate_opencode_restore_revokes_a_remint_when_handle_persist_fails() {
     let rig = MigrationRig::new(
@@ -1459,7 +1459,7 @@ fn the_migrate_opencode_restore_revokes_a_remint_when_handle_persist_fails() {
     assert_minted_handle_was_revoked(&rig, "apikey:deepseek:main");
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_migrate_opencode_names_the_audit_and_revoke_remedies_when_cleanup_fails() {
     let rig = MigrationRig::new(
@@ -1489,7 +1489,7 @@ fn the_migrate_opencode_names_the_audit_and_revoke_remedies_when_cleanup_fails()
     assert!(stderr.contains("ck auth revoke-all-handles apikey:deepseek:main"));
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun() {
     let rig = MigrationRig::new(
@@ -1777,7 +1777,7 @@ fn the_opencode_account_add_key_file_stdin_does_not_echo_material() {
     );
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle() {
     let rig = MigrationRig::new(
@@ -1836,7 +1836,7 @@ fn the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_ha
     );
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_opencode_account_add_revokes_its_verification_handle_when_existing_material_differs() {
     let rig = MigrationRig::new(
@@ -1883,7 +1883,7 @@ fn the_opencode_account_add_revokes_its_verification_handle_when_existing_materi
     assert_minted_handle_was_revoked(&rig, "apikey:deepseek:alt");
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_opencode_account_add_revokes_its_verification_handle_when_material_read_fails() {
     let rig = MigrationRig::new(
@@ -1925,7 +1925,7 @@ fn the_opencode_account_add_revokes_its_verification_handle_when_material_read_f
     assert_minted_handle_was_revoked(&rig, "apikey:deepseek:alt");
 }
 
-#[cfg(feature = "opencode-test-seam")]
+#[cfg(debug_assertions)]
 #[test]
 fn the_opencode_account_add_names_remedies_when_verification_cleanup_fails() {
     let rig = MigrationRig::new(

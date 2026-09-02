@@ -6,6 +6,7 @@
 //! credential, mint a handle, list + verify the audit chain. Also proves the
 //! single-writer lease makes admin writes mutually exclusive with a held lease.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -1458,11 +1459,10 @@ fn admin_write_refused_while_lease_held() {
 
 /// The validation bypass must not exist in a shipped binary.
 ///
-/// `validate_key` has a test-only short circuit so this file's `login --provider zai`
-/// test can run without a provider to talk to. On the operator's path an `Invalid`
-/// result is the ONLY thing that stops a bad key being stored, so an env var that
-/// turns that refusal into a store -- while printing "API key is valid." -- must be
-/// compiled out. It is gated on `debug_assertions`.
+/// Test-only environment hatches must be compiled out of the operator binary. Some
+/// simulate failed persistence and cleanup; one turns an invalid API key into a stored
+/// credential while printing "API key is valid." Shipping any of them would put an
+/// environment-controlled fault or validation bypass in the custody path.
 ///
 /// Asserted against a real release build rather than by reading the `#[cfg]`, because
 /// the claim is about the artifact: a later edit could move the gate, widen it, or add
@@ -1475,8 +1475,12 @@ fn admin_write_refused_while_lease_held() {
 /// a clean result.
 #[test]
 #[ignore = "builds the release profile; run explicitly or in the release gate"]
-fn validation_bypass_is_absent_from_a_release_build() {
+fn test_escape_hatches_are_absent_from_a_release_build() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
     let built = Command::new(env!("CARGO"))
         .args([
             "build",
@@ -1496,11 +1500,7 @@ fn validation_bypass_is_absent_from_a_release_build() {
         String::from_utf8_lossy(&built.stderr)
     );
 
-    let exe = manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root")
-        .join("target/release/ck-auth");
+    let exe = workspace.join("target/release/ck-auth");
     let bytes = std::fs::read(&exe).expect("read the release ck-auth");
 
     let find = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
@@ -1509,12 +1509,38 @@ fn validation_bypass_is_absent_from_a_release_build() {
     assert!(
         find("API key validation failed"),
         "positive control absent -- the scan cannot see strings it should find, so the \
-         bypass check below would pass vacuously"
+         escape-hatch checks below would pass vacuously"
     );
 
+    const HATCH_PATTERN: &str = r#""(CK_[A-Z0-9_]*_TEST_[A-Z0-9_]*|CORTEXKIT_TEST_[A-Z0-9_]*)""#;
+    let source_scan = Command::new("grep")
+        .args(["-rhaoE", "--include=*.rs", HATCH_PATTERN, "crates"])
+        .current_dir(workspace)
+        .output()
+        .expect("scan source for test escape-hatch literals");
     assert!(
-        !find("CORTEXKIT_TEST_BYPASS_VALIDATION"),
-        "the validation bypass env var is present in the release ck-auth binary"
+        source_scan.status.success(),
+        "source escape-hatch scan failed: {}",
+        String::from_utf8_lossy(&source_scan.stderr)
+    );
+    let hatches: BTreeSet<String> = String::from_utf8(source_scan.stdout)
+        .expect("source escape-hatch literals are utf-8")
+        .lines()
+        .map(|literal| literal.trim_matches('"').to_owned())
+        .collect();
+    assert!(
+        hatches.len() >= 5,
+        "source escape-hatch population unexpectedly shrank to {}: {hatches:?}",
+        hatches.len()
+    );
+
+    // This can only enroll literal names; a name assembled by concatenation is invisible.
+    // That fails no less safely than the old hardcoded list, while every new literal hatch
+    // now arms the release guard without relying on someone to update a second inventory.
+    let leaked: Vec<_> = hatches.into_iter().filter(|hatch| find(hatch)).collect();
+    assert!(
+        leaked.is_empty(),
+        "test escape-hatch env vars are present in the release ck-auth binary: {leaked:?}"
     );
 }
 

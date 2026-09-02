@@ -412,7 +412,7 @@ fn migrate_one(
     let tombstone = api_tombstone(provider);
     opencode_files::write_auth_entry(&args.auth_file, provider, tombstone.clone())
         .map_err(files_error)?;
-    #[cfg(feature = "opencode-test-seam")]
+    #[cfg(debug_assertions)]
     if std::env::var("CK_OPENCODE_TEST_FAIL_TOMBSTONE_REREAD").as_deref() == Ok("1") {
         return Err(CliError::Io(
             "OpenCode files: auth entry did not persist exactly; re-run converges from the written tombstone"
@@ -726,7 +726,7 @@ pub(crate) fn write_and_verify_handles(
     path: &Path,
     handles: &opencode_files::HandleFile,
 ) -> Result<(), CliError> {
-    #[cfg(feature = "opencode-test-seam")]
+    #[cfg(debug_assertions)]
     if std::env::var("CK_OPENCODE_TEST_FAIL_HANDLE_WRITE").as_deref() == Ok("1") {
         return Err(CliError::Io(
             "OpenCode files: handle file write interrupted; re-run converges from the stored credential"
@@ -800,7 +800,7 @@ pub(crate) fn with_scoped_handle<T>(
 }
 
 pub(crate) fn revoke_handle(global: &GlobalArgs, handle: &str) -> Result<(), CliError> {
-    #[cfg(feature = "opencode-test-seam")]
+    #[cfg(debug_assertions)]
     if std::env::var("CK_OPENCODE_TEST_FAIL_REVOKE").as_deref() == Ok("1") {
         return Err(CliError::Io(
             "OpenCode test seam: handle revoke interrupted".into(),
@@ -828,7 +828,7 @@ pub(crate) fn revoke_all_handles(global: &GlobalArgs, id: &str) -> Result<(), Cl
 }
 
 pub(crate) fn get_material(global: &GlobalArgs, handle: &str) -> Result<Option<Vec<u8>>, CliError> {
-    #[cfg(feature = "opencode-test-seam")]
+    #[cfg(debug_assertions)]
     if std::env::var("CK_OPENCODE_TEST_FAIL_GET_MATERIAL").as_deref() == Ok("1") {
         return Err(CliError::Io(
             "OpenCode test seam: material read interrupted".into(),
