@@ -6,7 +6,25 @@ CK_AUTH="$WT/target/release/ck-auth"
 umask 077
 ROOT="$(mktemp -d)"
 PROVIDER=synthetic
-SUBC=/run/user/1000/subc-connection.json
+# Derive the subc connection path the way `ck` itself does, so the acceptance rig
+# works on hosts whose runtime dir is not `/run/user/1000`. Order matches
+# crates/credentials-module/src/bin/credentials_cli.rs `discover_subc_connection_file`:
+#   1. explicit `CLAUSTRUM_SUBC_CONNECTION` / `SUBC` overrides (operator pin),
+#   2. `$XDG_RUNTIME_DIR/subc-connection.json` (the standard location),
+#   3. `$HOME/.local/share/cortexkit/run/subc-connection.json` (production fallback),
+#   4. `<tempdir>/subc-*.connection.json` (last-resort, globbed for the daemon token).
+if [[ -n "${CLAUSTRUM_SUBC_CONNECTION:-}" ]]; then
+  SUBC="$CLAUSTRUM_SUBC_CONNECTION"
+elif [[ -n "${SUBC:-}" ]]; then
+  SUBC="$SUBC"
+elif [[ -s "${XDG_RUNTIME_DIR:-}/subc-connection.json" ]]; then
+  SUBC="$XDG_RUNTIME_DIR/subc-connection.json"
+elif [[ -s "${HOME}/.local/share/cortexkit/run/subc-connection.json" ]]; then
+  SUBC="$HOME/.local/share/cortexkit/run/subc-connection.json"
+else
+  SUBC="$(ls -1 /tmp/subc-*.connection.json 2>/dev/null | head -n 1 || true)"
+fi
+SUBC="${SUBC:-${XDG_RUNTIME_DIR:-/run/user/1000}/subc-connection.json}"
 KEY_PATH=/etc/cortexkit/master.key
 
 if [[ "$(pwd -P)" != "$WT" ]]; then

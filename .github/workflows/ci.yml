@@ -107,8 +107,25 @@ jobs:
         run: bun run typecheck
 
       - name: Bun test packages
-        if: matrix.os == 'ubuntu'
-        run: bun run test:hermetic
+        # The Unix-only files below use POSIX mode bits (0o600 / 0o640 / 0o777) that
+        # `chmod()` cannot express on Windows and that `handles.ts` validates against;
+        # the `/proc/self/fd` descriptor-closure probe is Linux-only. They would
+        # either no-op the write and fail the mode check, or read a directory that
+        # does not exist there. The platform-agnostic subset still exercises wire
+        # codecs, sentinel substitution, the four-cell injection table, freshness,
+        # oauth tick, exhaustion, and split-custody refusal — the bulk of the suite.
+        # Unix-only files excluded on Windows:
+        #   - packages/opencode/src/tests/config-hook.test.ts (chmod mode bits, /proc/self/fd)
+        #   - packages/opencode/src/tests/serve.test.ts (chmod mode bits for handles fixture)
+        run: |
+          if [[ "${{ matrix.os }}" == "windows" ]]; then
+            bun test packages/opencode/src/tests/freshness.test.ts \
+                     packages/opencode/src/tests/lifecycle.test.ts \
+                     packages/opencode/src/tests/contracts.test.ts \
+                     packages/client
+          else
+            bun run test:hermetic
+          fi
 
       # This repo path-deps the private cortexkit/subconscious (subc wire) and
       # cortexkit/commons (storage libs) siblings. The default GITHUB_TOKEN is

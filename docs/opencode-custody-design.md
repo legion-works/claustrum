@@ -137,6 +137,7 @@ Dependency direction: anthropic-auth will depend on this client; never the rever
 ```
 ck auth migrate-opencode [--auth-file <p>] [--handle-file <p>] [--provider <id>]...
                          [--serve-by <plugin-id>] [--replace] [--dry-run]
+                         [--force-shape]
 ck auth migrate-opencode --restore <provider>
 ck auth opencode-account add    <provider> --account <label> --key-file <path|-> [--before <label>]
 ck auth opencode-account remove <provider> --account <label>

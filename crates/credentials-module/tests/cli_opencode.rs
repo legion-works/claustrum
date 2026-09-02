@@ -874,14 +874,28 @@ fn spawn_migration_route_daemon(
                     .lock()
                     .expect("observed")
                     .push(get_body["method"].as_str().unwrap_or_default().into());
-                let response = responses.lock().expect("responses").remove(0);
+                // Pop each response with an explicit expectation. A test that under-supplies
+                // responses fails at the offending request rather than at daemon-thread teardown,
+                // which would otherwise be a generic message in TestDaemon::drop's join().
+                let request_method = get_body["method"].as_str().unwrap_or_default().to_string();
+                let next_response = {
+                    let mut guard = responses.lock().expect("responses");
+                    if guard.is_empty() {
+                        panic!(
+                            "fake daemon received credential.get method={request_method} but the \
+                             test supplied no scripted response; extend the test's responses vec \
+                             or pass an empty Vec for read-only commands"
+                        );
+                    }
+                    guard.remove(0)
+                };
                 let reply = Frame::build(
                     FrameType::Response,
                     Flags::new(false, Priority::Interactive, false),
                     7,
                     3,
                     get.header.corr,
-                    serde_json::to_vec(&response).unwrap(),
+                    serde_json::to_vec(&next_response).unwrap(),
                 )
                 .unwrap();
                 write_frame(&mut stream, &reply)

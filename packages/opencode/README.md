@@ -59,7 +59,8 @@ grep -cE '^\s*(catch|} catch)|^\s*return[; ]|^\s*continue;|^\s*if \(' packages/o
 | `eb034af` | 47/22 | 26/17 |
 | `57ce561` | 58/22 | 26/17 |
 | closing-wave worktree | 65/27 | 26/17 |
-| custody review triage | 64 | 27 |
+| custody review triage | 64/27 | 27 |
+| R3 finisher | 73/27 | 27 |
 
 A changed count without a matching sweep row is a review failure, not harmless churn.
 

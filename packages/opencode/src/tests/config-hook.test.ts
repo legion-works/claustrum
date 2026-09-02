@@ -470,6 +470,51 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(reads).toBe(0);
   });
 
+  test("refuses an auth descriptor that grows past the 1 MiB cap between fstat and read", async () => {
+    // TOCTOU: a writer that grows auth.json after the size check but before the
+    // content read must not slip a tombstone past the cap. The bounded descriptor
+    // read stops at cap+1 and refuses without ever returning the full payload.
+    let reads = 0;
+    let buffered = Buffer.alloc(0);
+    await expect(readAuthFile("/tmp/auth.json", async () => {
+      const chunk = Buffer.alloc(2 * 1024 * 1024, 0x78); // 2 MiB of `x` would exceed
+      return {
+        stat: async () => ({ size: 256 }), // initial fstat lies small
+        readFile: async () => { reads += 1; return chunk.toString("utf8"); },
+        read: (buffer, offset, length, position) => {
+          reads += 1;
+          const remaining = chunk.length - position;
+          if (remaining <= 0) return { bytesRead: 0 };
+          const slice = chunk.subarray(position, position + Math.min(length, remaining));
+          buffer.set(slice, offset);
+          buffered = Buffer.concat([buffered, slice]);
+          return { bytesRead: slice.length };
+        },
+        close: async () => {},
+      };
+    })).rejects.toThrow("exceeds 1 MiB");
+    expect(reads).toBeGreaterThan(0);
+    expect(buffered.length).toBeLessThanOrEqual(2 * 1024 * 1024);
+  });
+
+  test("parses auth content read through the bounded descriptor when it fits the cap", async () => {
+    const payload = JSON.stringify({ deepseek: { type: "api", key: "real-key" } });
+    const bytes = Buffer.from(payload, "utf8");
+    const parsed = await readAuthFile("/tmp/auth.json", async () => ({
+      stat: async () => ({ size: bytes.length }),
+      readFile: async () => { throw new Error("must use bounded read"); },
+      read: (buffer, offset, length, position) => {
+        const remaining = bytes.length - position;
+        if (remaining <= 0) return { bytesRead: 0 };
+        const slice = bytes.subarray(position, position + Math.min(length, remaining));
+        buffer.set(slice, offset);
+        return { bytesRead: slice.length };
+      },
+      close: async () => {},
+    }));
+    expect(parsed).toEqual({ deepseek: { type: "api", key: "real-key" } });
+  });
+
   test("refuses an oversized tombstone when the handle file is absent", async () => {
     const files = await fixture("large-auth-missing-handles");
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek"), padding: "x".repeat(1024 * 1024) });

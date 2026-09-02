@@ -8,6 +8,23 @@ function replaceEvery(value: string, sentinel: string, material: string): string
   return value.split(sentinel).join(material);
 }
 
+// A query value can carry the sentinel in a case the encoded form produces: `encodeURIComponent`
+// uppercases hex digits, but `decodeURIComponent` is case-insensitive, so a host or proxy that
+// re-encodes with lowercase hex (`%3av1` instead of `%3Av1`) would let the tombstone slip
+// past the raw substitution. Per-param: decode the value, compare to the sentinel,
+// substitute, then re-encode ONLY that value with `encodeURIComponent`. Untouched params
+// stay byte-identical (a non-substitution cannot change their bytes).
+function substituteQueryValue(value: string, sentinel: string, encodedMaterial: string): string {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    return replaceEvery(value, sentinel, encodedMaterial);
+  }
+  if (decoded === sentinel) return encodedMaterial;
+  return value;
+}
+
 export async function snapshotRequest(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
@@ -33,7 +50,16 @@ export async function snapshotRequest(
           if (separator === -1) return part;
           const name = part.slice(0, separator);
           const value = part.slice(separator + 1);
-          return `${name}=${replaceEvery(replaceEvery(value, sentinel, encodedMaterial), encodedSentinel, encodedMaterial)}`;
+          // Per-param substitution: decode, compare to the canonical sentinel,
+          // re-encode only when the decoded value matches. Untouched values are
+          // returned byte-for-byte; the inner `replaceEvery` defends against the
+          // sentinel appearing unencoded inside a value that ALSO matches one of
+          // its percent-escaped forms.
+          const substituted = substituteQueryValue(value, sentinel, encodedMaterial);
+          if (substituted === value) {
+            return `${name}=${replaceEvery(replaceEvery(value, sentinel, encodedMaterial), encodedSentinel, encodedMaterial)}`;
+          }
+          return `${name}=${substituted}`;
         })
         .join("&");
       url.search = substitutedQuery;

@@ -98,10 +98,22 @@ type HandleFileStat = {
   uid?: number;
   mtimeMs?: number;
 };
+type HandleFileReadResult = { bytesRead: number };
+type HandleFileDescriptor = {
+  stat(): Promise<HandleFileStat>;
+  readFile(options: { encoding: "utf8" }): Promise<string>;
+  read?(buffer: Uint8Array, offset: number, length: number, position: number): HandleFileReadResult | Promise<HandleFileReadResult>;
+  close(): Promise<void>;
+};
 export type HandleFileIo = {
   stat?: (path: string) => Promise<HandleFileStat>;
   lstat?: (path: string) => Promise<HandleFileStat>;
   readFile?: (path: string, encoding: "utf8") => Promise<string>;
+  // Injectable descriptor: when supplied, the handle reader uses a bounded read into a
+  // cap+1 buffer instead of `readFile()`. The cap check then catches a TOCTOU write that
+  // grows the file between fstat and read; the unbounded path is preserved for callers
+  // that pre-trust the source.
+  open?: (path: string) => Promise<HandleFileDescriptor>;
   currentUid?: () => number | undefined;
 };
 
@@ -164,8 +176,25 @@ async function readHandleSnapshot(path = defaultHandleFilePath(), io: HandleFile
     }
     let source: string;
     try {
-      source = descriptor ? await descriptor.readFile({ encoding: "utf8" }) : await read(path, "utf8");
+      if (descriptor) {
+        // Bounded read on the already-fstat'd descriptor closes the TOCTOU window a
+        // size-only check leaves open: a writer that grows the file between fstat and
+        // readFile would otherwise drive the read past the cap. cap+1 bytes are read;
+        // anything beyond refuses before the full descriptor is consumed.
+        const buffer = Buffer.alloc(HANDLE_FILE_MAX_BYTES + 1);
+        let total = 0;
+        while (total < HANDLE_FILE_MAX_BYTES + 1) {
+          const chunk = await descriptor.read!(buffer, total, buffer.length - total, total);
+          if (chunk.bytesRead === 0) break;
+          total += chunk.bytesRead;
+        }
+        if (total > HANDLE_FILE_MAX_BYTES) invalid("handle file exceeds 256 KiB");
+        source = buffer.subarray(0, total).toString("utf8");
+      } else {
+        source = await read(path, "utf8");
+      }
     } catch (error) {
+      if (error instanceof HandleFileValidationError) throw error;
       invalid(`cannot read handle file: ${error instanceof Error ? error.message : String(error)}`);
     }
     let value: unknown;

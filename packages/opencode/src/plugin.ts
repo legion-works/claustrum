@@ -29,9 +29,11 @@ const AUTH_SCAN_CARRY_BYTES = TOMBSTONE_PREFIX.length + 64;
 const SCANNED_PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const FORBIDDEN_PROVIDER_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
+type AuthFileReadResult = { bytesRead: number };
 type AuthFileDescriptor = {
   stat(): Promise<{ size: number }>;
   readFile(options: { encoding: "utf8" }): Promise<string>;
+  read?(buffer: Uint8Array, offset: number, length: number, position: number): AuthFileReadResult | Promise<AuthFileReadResult>;
   close(): Promise<void>;
 };
 
@@ -55,6 +57,16 @@ function defaultAuthPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(dataHome, "opencode", "auth.json");
 }
 
+function decodeAuthObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new AuthFileValidationError("auth file must contain an object");
+  }
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).flatMap(([provider, entry]) => {
+    const decoded = decodeHostAuthEntry(entry);
+    return decoded ? [[provider, decoded]] : [];
+  }));
+}
+
 export async function readAuthFile(
   path: string,
   openFile: (path: string) => Promise<AuthFileDescriptor> = (candidate) => open(candidate, "r"),
@@ -63,23 +75,42 @@ export async function readAuthFile(
     const descriptor = await openFile(path);
     let value: unknown;
     try {
-      if ((await descriptor.stat()).size > AUTH_FILE_MAX_BYTES) {
-        throw new AuthFileValidationError("auth file exceeds 1 MiB");
+      const statSize = (await descriptor.stat()).size;
+      // The stat-then-read pair is a TOCTOU window: a writer that grows the file
+      // between the two reads can drive the read past the cap. A bounded `read()`
+      // into a cap+1 buffer closes the window — exactly cap bytes is parsed, and
+      // one byte more than the cap is rejected up front without consuming the entire
+      // descriptor. Real FileHandle (node:fs/promises.open) exposes `read()`; tests
+      // inject one too. The legacy `readFile` path is preserved for descriptors that
+      // do not — its cap check is the size on the initial stat, which is the same
+      // TOCTOU hole the bounded path exists to close.
+      if (descriptor.read) {
+        if (statSize > AUTH_FILE_MAX_BYTES) {
+          throw new AuthFileValidationError("auth file exceeds 1 MiB");
+        }
+        const buffer = Buffer.alloc(AUTH_FILE_MAX_BYTES + 1);
+        let total = 0;
+        while (total < AUTH_FILE_MAX_BYTES + 1) {
+          const chunk = await descriptor.read(buffer, total, buffer.length - total, total);
+          if (chunk.bytesRead === 0) break;
+          total += chunk.bytesRead;
+        }
+        if (total > AUTH_FILE_MAX_BYTES) throw new AuthFileValidationError("auth file exceeds 1 MiB");
+        const text = buffer.subarray(0, total).toString("utf8");
+        value = parseSecretJson(text, "auth file");
+      } else {
+        if (statSize > AUTH_FILE_MAX_BYTES) {
+          throw new AuthFileValidationError("auth file exceeds 1 MiB");
+        }
+        value = parseSecretJson(await descriptor.readFile({ encoding: "utf8" }), "auth file");
       }
-      value = parseSecretJson(await descriptor.readFile({ encoding: "utf8" }), "auth file");
     } catch (error) {
       if (error instanceof AuthFileValidationError) throw error;
       throw new AuthFileValidationError(`auth file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       await descriptor.close();
     }
-    if (!value || typeof value !== "object" || Array.isArray(value)) {
-      throw new AuthFileValidationError("auth file must contain an object");
-    }
-    return Object.fromEntries(Object.entries(value as Record<string, unknown>).flatMap(([provider, entry]) => {
-      const decoded = decodeHostAuthEntry(entry);
-      return decoded ? [[provider, decoded]] : [];
-    }));
+    return decodeAuthObject(value);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     if (error instanceof AuthFileValidationError) throw error;

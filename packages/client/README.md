@@ -12,7 +12,9 @@ credential caching, refresh, account scheduling, and retry policy.
 • `credential.get` is bimodal: resident records return in microseconds, while an
   expiry-skew refresh can take seconds. Request paths should peek cached state,
   not call `get` speculatively.
-• `permanent` with `not_found` means the handle was revoked.
+• `permanent` with `not_found` means the handle is unknown OR revoked — uniform refusal
+  by design (the vault cannot enumerate which). Treat it as gone either way: re-run
+  `ck auth migrate-opencode` to mint a fresh handle; the prior record, if any, is kept.
 • `auth_required` means the record is latched and needs reauthentication.
 • Unknown server error classes are bounded to `transient`; callers must retry them
   rather than treating a forward-compatible class as permanent.

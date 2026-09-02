@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 
 import { type ServedCredential } from "@cortexkit/claustrum-client";
 
@@ -8,6 +8,31 @@ import { tombstoneFor } from "../tombstone";
 const PROVIDER = "deepseek";
 const MAIN_HANDLE = `ckh_${"a".repeat(43)}`;
 const BACKUP_HANDLE = `ckh_${"b".repeat(43)}`;
+
+// The plugin reads OPENCODE_AUTH_CONTENT, OPENCODE_EXPERIMENTAL_NATIVE_LLM, and
+// CLAUSTRUM_CUSTODY_DISABLE at runtime. Each overrides the injected authReader/handleReader
+// dependencies and would silently reroute the assertion: OPENCODE_AUTH_CONTENT bypasses the
+// injected authReader, CLAUSTRUM_CUSTODY_DISABLE=1 swaps in a no-op config hook, and
+// OPENCODE_EXPERIMENTAL_NATIVE_LLM refuses the provider. Clear the three vars per-test so
+// the lifecycle suite exercises the injected dependencies deterministically — same pattern
+// config-hook.test.ts uses.
+const savedEnv = new Map<string, string | undefined>();
+const ENV_KEYS = ["OPENCODE_AUTH_CONTENT", "OPENCODE_EXPERIMENTAL_NATIVE_LLM", "CLAUSTRUM_CUSTODY_DISABLE"] as const;
+
+function useEnv(key: string, value: string | undefined) {
+  if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
+
+afterEach(() => {
+  for (const [key, value] of savedEnv) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  savedEnv.clear();
+  for (const key of ENV_KEYS) delete process.env[key];
+});
 
 type TestConfig = {
   provider: Record<string, {
@@ -34,13 +59,93 @@ function config(): TestConfig {
   };
 }
 
+// Construct the plugin WITHOUT clearing the three env vars, so the test that exercises
+// isolation can set them BEFORE calling this. Other tests use `hooks()` which clears.
+async function createIsolatedHooks(input: Parameters<typeof createOpencodeClaustrumPlugin>[0]) {
+  return createOpencodeClaustrumPlugin(input)({} as never) as Promise<{
+    config?: (cfg: unknown) => Promise<void>;
+  }>;
+}
+
 async function hooks(input: Parameters<typeof createOpencodeClaustrumPlugin>[0]) {
+  for (const key of ENV_KEYS) useEnv(key, undefined);
   return createOpencodeClaustrumPlugin(input)({} as never) as Promise<{
     config?: (cfg: unknown) => Promise<void>;
   }>;
 }
 
 describe("exported OpenCode custody plugin lifecycle", () => {
+  test("isolates OPENCODE_AUTH_CONTENT, OPENCODE_EXPERIMENTAL_NATIVE_LLM, and CLAUSTRUM_CUSTODY_DISABLE per-test", async () => {
+    // If any of the three vars survived from a previous run, the plugin would take a
+    // different branch — authReader bypassed, native mode refusal, or the no-op custody-
+    // disabled hook — and the injected dependencies would silently never be exercised.
+    // This file isolates the three in `useEnv`/`afterEach`; verify the isolation
+    // works against env the runner pre-sets to junk.
+    useEnv("OPENCODE_AUTH_CONTENT", '{"deepseek":{"type":"api","key":"env-real-key"}}');
+    useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", "true");
+    useEnv("CLAUSTRUM_CUSTODY_DISABLE", "1");
+
+    // (1) CLAUSTRUM_CUSTODY_DISABLE=1 short-circuits: the hook reads handles only to
+    // enumerate owned providers for the warning; authReader is never called because
+    // OPENCODE_AUTH_CONTENT and OPENCODE_EXPERIMENTAL_NATIVE_LLM never reach the
+    // injection path. The "no-op" property is "no fetch installed" — which is what
+    // proves the disabled branch was taken and the other two vars did NOT steer the
+    // outcome.
+    let authCalls = 0;
+    let handleCalls = 0;
+    const nativeHooks = await createIsolatedHooks({
+      handleReader: async () => {
+        handleCalls += 1;
+        return {
+          version: 1,
+          providers: [{ provider: PROVIDER, shape: "api", serve: "opencode-claustrum", accounts: [{ label: "main", handle: MAIN_HANDLE, credential_id: "id" }] }],
+        };
+      },
+      authReader: async () => { authCalls += 1; return { [PROVIDER]: tombstoneFor("api", PROVIDER) }; },
+      detect: async () => ({ status: "available", schema: 1, wireVersion: 1, endpoints: [] }),
+      clientFactory: async () => ({
+        getCredential: async () => credential("vault-material", 1),
+        reportAuthFailure: async () => {},
+      }) as never,
+      fetch: ((async () => new Response("upstream", { status: 200 })) as unknown) as typeof globalThis.fetch,
+      log: () => {},
+    });
+    const nativeCfg = config();
+    await nativeHooks.config?.(nativeCfg);
+    expect(authCalls).toBe(0);
+    expect(handleCalls).toBe(1);
+    expect(nativeCfg.provider[PROVIDER].options.apiKey).toBeUndefined();
+    expect(nativeCfg.provider[PROVIDER].options.fetch).toBeUndefined();
+
+    // (2) After unsetting CLAUSTRUM_CUSTODY_DISABLE but keeping OPENCODE_EXPERIMENTAL_NATIVE_LLM
+    // and OPENCODE_AUTH_CONTENT set to a tombstone-shaped content (so the auth-source
+    // override is exercised), the native mode refusal must drive the choice — the
+    // injected dependencies are observable because CLAUSTRUM_CUSTODY_DISABLE no longer
+    // short-circuits the path. authReader is intentionally rigged to throw — if
+    // OPENCODE_AUTH_CONTENT leaks, this is the failure mode.
+    useEnv("CLAUSTRUM_CUSTODY_DISABLE", undefined);
+    useEnv("OPENCODE_AUTH_CONTENT", JSON.stringify({ [PROVIDER]: tombstoneFor("api", PROVIDER) }));
+    const liveHooks = await createIsolatedHooks({
+      handleReader: async () => ({
+        version: 1,
+        providers: [{ provider: PROVIDER, shape: "api", serve: "opencode-claustrum", accounts: [{ label: "main", handle: MAIN_HANDLE, credential_id: "id" }] }],
+      }),
+      authReader: async () => { throw new Error("must use OPENCODE_AUTH_CONTENT"); },
+      detect: async () => ({ status: "available", schema: 1, wireVersion: 1, endpoints: [] }),
+      clientFactory: async () => ({
+        getCredential: async () => credential("vault-material", 1),
+        reportAuthFailure: async () => {},
+      }) as never,
+      fetch: ((async () => new Response("upstream", { status: 200 })) as unknown) as typeof globalThis.fetch,
+      log: () => {},
+    });
+    const liveCfg = config();
+    await liveHooks.config?.(liveCfg);
+    expect(liveCfg.provider[PROVIDER].options.apiKey).toBeUndefined();
+    expect(typeof liveCfg.provider[PROVIDER].options.fetch).toBe("function");
+    await expect((liveCfg.provider[PROVIDER].options.fetch as typeof globalThis.fetch)("https://upstream.test"))
+      .rejects.toThrow(/native LLM mode/);
+  });
   test("exports the OpenCode v1 plugin object from a dedicated file-plugin entrypoint", async () => {
     const module = await import("../opencode-plugin") as unknown as { default?: { id?: unknown; server?: unknown } };
 

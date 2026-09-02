@@ -163,6 +163,22 @@ describe("OpenCode custody serve fetch", () => {
     expect(url.searchParams.get("x")).toBe(material);
   });
 
+  test("substitutes a sentinel carried in a lowercase-hex percent-escaped query value", async () => {
+    const requests: Request[] = [];
+    const fetch = serve({ upstream: createUpstream([200], requests) });
+    // Lowercase-hex percent escapes of the sentinel are semantically identical to the
+    // canonical uppercase form under decodeURIComponent; the substitution must catch both.
+    const lowercaseSentinel = encodeURIComponent(SENTINEL).replace(/%[0-9A-F]{2}/g, (match) =>
+      match.toLowerCase(),
+    );
+    expect(lowercaseSentinel).not.toBe(encodeURIComponent(SENTINEL));
+
+    await fetch(`https://upstream.example/v1/chat?key=${lowercaseSentinel}`);
+
+    const url = new URL(requests[0]?.url ?? "");
+    expect(url.searchParams.get("key")).toBe("material-main");
+  });
+
   test("reports the credential version used for a 401, clears its cache, and tries the next account", async () => {
     const requests: Request[] = [];
     let currentRecordVersion = 7;
