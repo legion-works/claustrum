@@ -37,8 +37,8 @@ describe("custody wire contracts", () => {
     expect(parsed).toEqual(source);
     expect(parsed.providers.map((provider) => provider.provider)).toEqual(["deepseek", "anthropic"]);
     expect(parsed.providers[0]?.accounts.map((account) => account.label)).toEqual(["main", "backup"]);
-    expect(parsed.providers[0]?.accounts[0]?.handle).toBe("ckh_deepseek_main");
-    expect(parsed.providers[0]?.accounts[1]?.superseded).toEqual(["ckh_deepseek_prior"]);
+    expect(parsed.providers[0]?.accounts[0]?.handle).toBe(`ckh_${"a".repeat(43)}`);
+    expect(parsed.providers[0]?.accounts[1]?.superseded).toEqual([`ckh_${"c".repeat(43)}`]);
     expect(() =>
       parseHandleFile({
         version: 1,

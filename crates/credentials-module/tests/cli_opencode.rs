@@ -17,35 +17,14 @@ mod route_client;
 
 use serde_json::{json, Value};
 
+mod common;
+use common::tmp_root;
+
 fn cli() -> Command {
     match std::env::var_os("CRED_CLI_BIN") {
         Some(path) => Command::new(path),
         None => Command::new(env!("CARGO_BIN_EXE_ck-auth")),
     }
-}
-
-/// See `cli_admin.rs::tmp_root` for the collision refusal rationale this mirrors.
-fn tmp_root(tag: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!(
-        "ck-opencode-{tag}-{}-{}-{nanos}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir(&root).unwrap_or_else(|e| {
-        panic!(
-            "temp root {} could not be created fresh ({e}); refusing to reuse a stale vault",
-            root.display()
-        )
-    });
-    root
 }
 
 fn mode(path: &Path) -> u32 {
@@ -84,6 +63,29 @@ fn an_auth_file_with_a_mode_other_than_0600_is_refused() {
 
     let err = opencode_files::read_auth_entries(&auth).expect_err("insecure mode refuses");
     assert!(err.to_string().contains("0600"), "unexpected error: {err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn an_unknown_handle_shape_is_refused() {
+    let root = tmp_root("unknown-handle-shape");
+    let handles = root.join("opencode-handles.json");
+    std::fs::write(
+        &handles,
+        r#"{"version":1,"providers":[{"provider":"deepseek","shape":"unknown","serve":"opencode-claustrum","accounts":[]}]}"#,
+    )
+    .expect("handle file");
+    std::fs::set_permissions(
+        &handles,
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("mode");
+
+    let err = opencode_files::read_handle_file(&handles).expect_err("unknown shape refuses");
+    assert!(
+        err.to_string().contains("unknown variant"),
+        "unknown shape must produce a named refusal: {err}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }
 

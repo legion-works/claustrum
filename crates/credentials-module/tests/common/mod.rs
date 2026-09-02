@@ -28,6 +28,51 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// A fresh directory for one test, unique across PROCESSES and not merely within one.
+///
+/// The previous version keyed on `pid + tag + seq` and called `create_dir_all`, which
+/// is unique within a process and NOT across processes: Windows recycles PIDs from a
+/// small pool, the seam CI step runs several `cargo test` invocations in sequence, and
+/// `create_dir_all` on an existing path SUCCEEDS. So a later binary could inherit an
+/// earlier one's `pid+tag+seq` and silently adopt its leftover vault -- a `store.db`
+/// sealed under one master key beside a key file holding another.
+///
+/// That is the shape of the flake this replaced: `an_antigravity_import_...` failed on
+/// Windows with "no master key slot holds the key this vault is sealed under", from a
+/// DOCS-ONLY commit, and the same tree passed on re-run. Leftovers accumulate only
+/// from tests that panic (cleanup runs at the end, and a panic skips it), which is why
+/// it is rare and why an occurrence needs an earlier failure to set it up.
+///
+/// Two changes, and the second is the one that earns its keep:
+///
+/// - a nanosecond component, so two processes cannot derive the same path;
+/// - `create_dir` rather than `create_dir_all`, so a collision REFUSES instead of
+///   reusing. If this ever fires, the hypothesis above is confirmed by name rather
+///   than re-derived from a symptom three layers downstream. If the antigravity flake
+///   recurs WITHOUT this firing, the hypothesis is wrong and the next investigation
+///   starts somewhere genuinely different.
+pub fn tmp_root(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let d = std::env::temp_dir().join(format!(
+        "ck-cred-cli-{}-{}-{}-{nanos:09}",
+        process::id(),
+        tag,
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&d).unwrap_or_else(|e| {
+        panic!(
+            "temp root {} could not be created fresh ({e}). AlreadyExists here means a \
+             path collision across processes, and reusing it would hand this test a \
+             stale vault whose store and key file disagree.",
+            d.display()
+        )
+    });
+    d
+}
+
 /// A temp path unique across PROCESSES, not merely within one.
 ///
 /// The doc comment here used to promise "no collision across tests", which the

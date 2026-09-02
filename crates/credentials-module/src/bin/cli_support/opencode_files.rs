@@ -224,6 +224,9 @@ fn validate_handle_file(file: &HandleFile) -> Result<(), OpenCodeFilesError> {
                 "provider {index} has invalid provider"
             )));
         }
+        match provider.shape {
+            HandleShape::Api | HandleShape::Oauth => {}
+        }
         if provider.serve.is_empty() {
             return Err(OpenCodeFilesError::Invalid(format!(
                 "provider {index} requires serve"
