@@ -45,7 +45,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// Two changes, and the second is the one that earns its keep:
 ///
-/// - a nanosecond component, so two processes cannot derive the same path;
+/// - a nanosecond component, making concurrent path collisions vanishingly unlikely;
 /// - `create_dir` rather than `create_dir_all`, so a collision REFUSES instead of
 ///   reusing. If this ever fires, the hypothesis above is confirmed by name rather
 ///   than re-derived from a symptom three layers downstream. If the antigravity flake

@@ -1,4 +1,5 @@
-import { lstat as nodeLstat, readFile, stat as nodeStat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat as nodeLstat, open as nodeOpen, readFile, stat as nodeStat } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { createHash } from "node:crypto";
@@ -118,8 +119,14 @@ export async function readHandleFile(path = defaultHandleFilePath(), io: HandleF
   const lstat = io.lstat ?? nodeLstat;
   const read = io.readFile ?? readFile;
   let metadata: HandleFileStat;
+  let descriptor: Awaited<ReturnType<typeof nodeOpen>> | undefined;
   try {
-    metadata = await lstat(path);
+    if (io.lstat || io.readFile) {
+      metadata = await lstat(path);
+    } else {
+      descriptor = await nodeOpen(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      metadata = await descriptor.stat();
+    }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, providers: [] };
     invalid(`cannot stat handle file: ${error instanceof Error ? error.message : String(error)}`);
@@ -148,9 +155,11 @@ export async function readHandleFile(path = defaultHandleFilePath(), io: HandleF
   }
   let source: string;
   try {
-    source = await read(path, "utf8");
+    source = descriptor ? await descriptor.readFile({ encoding: "utf8" }) : await read(path, "utf8");
   } catch (error) {
     invalid(`cannot read handle file: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    await descriptor?.close();
   }
   try {
     return parseHandleFile(JSON.parse(source));

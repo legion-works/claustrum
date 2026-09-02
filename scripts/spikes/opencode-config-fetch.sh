@@ -7,7 +7,7 @@
 set -euo pipefail
 
 umask 077
-ROOT=/tmp/opencode/oc-spike
+ROOT="$(mktemp -d /tmp/opencode/oc-spike.XXXXXX)"
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_DATA_HOME="$ROOT/data"
 export XDG_CACHE_HOME="$ROOT/cache"
@@ -24,6 +24,7 @@ cleanup() {
     kill "$STUB_PID" >/dev/null 2>&1 || true
     wait "$STUB_PID" >/dev/null 2>&1 || true
   fi
+  rm -rf "$ROOT"
   exit "$status"
 }
 trap cleanup EXIT
@@ -231,9 +232,9 @@ import pathlib
 import sys
 
 header_lines = pathlib.Path(sys.argv[2]).read_text().splitlines() if pathlib.Path(sys.argv[2]).exists() else []
-request_lines = [line for line in header_lines if "Generate a title for this conversation:" not in json.loads(line).get("body", "")]
+request_lines = [line for line in header_lines if json.loads(line).get("path") in ("/v1/chat/completions", "/v1/responses")]
 for provider, sentinel in (("deepseek", "claustrum-tombstone:v1:deepseek"), ("xai", "claustrum-tombstone:v1:xai")):
-    matches = [line for line in request_lines if sentinel in line]
+    matches = [line for line in request_lines if sentinel in json.loads(line).get("headers", {}).get("authorization", "")]
     auth = ""
     for line in matches:
         headers = json.loads(line)["headers"]

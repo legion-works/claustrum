@@ -205,6 +205,7 @@ describe("OpenCode custody serve fetch", () => {
 
     expect((await fetch("https://upstream.example/start", { method: "POST", body: "body" })).status).toBe(200);
     expect(requests[1]?.method).toBe("GET");
+    expect(requests[1]?.headers.get("content-length")).toBeNull();
   });
 
   test("keeps the GET and empty body after a 303 followed by a 307", async () => {
@@ -289,13 +290,29 @@ describe("OpenCode custody serve fetch", () => {
         ], requests),
       });
 
-      expect((await fetch("https://upstream.example/v1/chat")).status).toBe(200);
+      expect((await fetch("https://upstream.example/v1/chat", { headers: { "X-Api-Key": SENTINEL } })).status).toBe(200);
       time += 1_000;
-      expect((await fetch("https://upstream.example/v1/chat")).status).toBe(200);
+      expect((await fetch("https://upstream.example/v1/chat", { headers: { "X-Api-Key": SENTINEL } })).status).toBe(200);
 
       expect(client.gets).toEqual([MAIN_HANDLE, BACKUP_HANDLE]);
       expect(requests).toHaveLength(3);
+      expect(requests[2]?.headers.get("x-api-key")).toBe("material-backup");
     }
+  });
+
+  test("does not log credential-bearing upstream error messages", async () => {
+    const entries: unknown[] = [];
+    const fetch = createServeFetch({
+      provider: PROVIDER,
+      accounts: [accounts[0]!],
+      client: clientWith(),
+      readAuthEntry: () => tombstoneFor("api", PROVIDER),
+      upstreamFetch: async () => { throw new Error("MATERIAL-CANARY https://upstream.example/?key=MATERIAL-CANARY"); },
+      log: { debug() {}, info() {}, warn() {}, error(entry) { entries.push(entry); } },
+    });
+
+    await expect(fetch(`https://upstream.example/?key=${encodeURIComponent(SENTINEL)}`)).rejects.toThrow("upstream request failed");
+    expect(JSON.stringify(entries)).not.toContain("MATERIAL-CANARY");
   });
 
   test("puts a 402 account on a one-hour cooldown before trying the next account", async () => {

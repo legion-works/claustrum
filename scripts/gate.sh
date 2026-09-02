@@ -35,6 +35,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+BUN="${BUN:-$(command -v bun || true)}"
+[[ -n "$BUN" ]] || { printf 'GATE FAILED: bun not found; set BUN or add bun to PATH\n' >&2; exit 1; }
 
 # A FAILURE MUST SURVIVE `| tail -1`.
 #
@@ -111,10 +113,10 @@ FMT_PKGS=$(cargo metadata --no-deps --format-version 1 \
 # shellcheck disable=SC2086
 run_check "format" cargo fmt $FMT_PKGS -- --check
 
-run_check "bun frozen install" /home/icetea/.bun/bin/bun install --frozen-lockfile
-run_check "bun typecheck" /home/icetea/.bun/bin/bun run typecheck
-run_check "bun build" /home/icetea/.bun/bin/bun run build
-run_check "bun tests" /home/icetea/.bun/bin/bun test packages
+run_check "bun frozen install" "$BUN" install --frozen-lockfile
+run_check "bun typecheck" "$BUN" run typecheck
+run_check "bun build" "$BUN" run build
+run_check "bun tests" "$BUN" test packages
 
 run_check "clippy" \
   cargo clippy --locked --workspace --all-targets -- -D warnings

@@ -346,6 +346,12 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             }
             continue;
           }
+          if (handle!.shape !== (entry as { type?: unknown }).type) {
+            const refusal = new CustodySplitError("custody handle shape disagrees with auth entry; run ck auth migrate-opencode");
+            logError(log, refusal, provider);
+            configureRefusal(provider, refusal);
+            continue;
+          }
 
           // The native runtime reads `provider.options.apiKey` directly instead of this fetch
           // seam. Its case-sensitive flag parser therefore gets an allowlist, not a best guess.
@@ -393,9 +399,10 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
                     `could not verify custody handle ownership: ${error instanceof Error ? error.message : String(error)}`,
                   );
                 }
-                if (current.providers.find((candidate) => candidate.provider === provider)?.serve !== OUR_PLUGIN_ID) {
+                const currentProvider = current.providers.find((candidate) => candidate.provider === provider);
+                if (currentProvider?.serve !== OUR_PLUGIN_ID || JSON.stringify(currentProvider) !== JSON.stringify(handle)) {
                   throw new CustodyOwnershipError(
-                    `custody handle ownership changed for provider=${provider}; reload OpenCode after ck auth migrate-opencode`,
+                    `custody handle record changed for provider=${provider}; reload OpenCode after ck auth migrate-opencode`,
                   );
                 }
               },

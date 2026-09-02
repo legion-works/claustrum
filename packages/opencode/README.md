@@ -48,22 +48,20 @@ Run `ck auth migrate-opencode` to create or repair the tombstones and handle fil
 
 ## Maintenance
 
-Keep the sweep's exit/row smoke signal on one method:
+Keep the sweep's control-flow smoke signal on one method:
 
 ```sh
 grep -cE '^\s*(catch|} catch)|^\s*return[; ]|^\s*continue;|^\s*if \(' packages/opencode/src/{plugin,serve}.ts
 ```
 
-| revision | `plugin.ts` exits/rows | `serve.ts` exits/rows |
+| revision | `plugin.ts` control-flow lines | `serve.ts` control-flow lines |
 | --- | --- | --- |
 | `eb034af` | 47/22 | 26/17 |
 | `57ce561` | 58/22 | 26/17 |
 | closing-wave worktree | 65/27 | 26/17 |
-| round-five worktree | 63/30 | 26/17 |
+| custody review triage | 64 | 27 |
 
-The five added plugin rows cover the env parse fallthrough, scan I/O failure, final-chunk hit,
-identifier boundary, and hit-cap fallback. A changed exit count without a matching sweep row is a
-review failure, not harmless churn.
+A changed count without a matching sweep row is a review failure, not harmless churn.
 
 The exits/rows census cannot see a subcondition inside a counted branch. The containment property
 test is the invariant; this census remains the drift canary.

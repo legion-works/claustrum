@@ -93,7 +93,6 @@ describe('ClaustrumClient', () => {
 
     expect(configuredCalls).toEqual([configured])
     expect(defaultCalls).toEqual([getDefaultClaustrumConnectionPath()])
-    expect(defaultCalls[0]).toBe(`/run/user/${process.getuid?.()}/subc-connection.json`)
   })
 
   test('detection is inert for absent and malformed files', async () => {

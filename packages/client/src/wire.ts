@@ -98,7 +98,7 @@ function decodeStatus(response: unknown, logUnknownClass: (errorClass: string) =
   const recordVersion = asRecordVersion(result?.record_version)
   if (
     typeof result?.ready !== 'boolean' ||
-    (result?.last_error_code !== null && typeof result?.last_error_code !== 'string') ||
+    (result?.last_error_code !== undefined && result?.last_error_code !== null && typeof result?.last_error_code !== 'string') ||
     typeof result?.lease_held !== 'boolean' ||
     recordVersion === undefined ||
     (result?.stale_pending !== undefined && typeof result.stale_pending !== 'boolean')
@@ -107,7 +107,7 @@ function decodeStatus(response: unknown, logUnknownClass: (errorClass: string) =
   }
   return {
     ready: result.ready,
-    lastErrorCode: result.last_error_code,
+    lastErrorCode: result.last_error_code ?? null,
     leaseHeld: result.lease_held,
     recordVersion,
     ...(result.stale_pending === undefined ? {} : { stalePending: result.stale_pending }),
@@ -204,7 +204,11 @@ export class ClaustrumClient {
       })
     } catch (error) {
       if (this.#shouldReconnect(error)) {
-        await this.#reconnect()
+        try {
+          await this.#reconnect()
+        } catch (reconnectError) {
+          throw this.#asTransportError(reconnectError)
+        }
         try {
           return await this.#client.call(CLAUSTRUM_MODULE_ID, method, params, {
             identity: this.#identity,
@@ -248,6 +252,10 @@ export class ClaustrumClient {
       handshakeTimeoutMs: this.#handshakeTimeoutMs,
     })
       .then((client) => {
+        if (this.#closed) {
+          client.close()
+          throw new Error('Claustrum client is closed')
+        }
         const previous = this.#client
         this.#client = client
         previous.close()

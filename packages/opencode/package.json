@@ -6,16 +6,16 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     },
     "./opencode-plugin": {
-      "import": "./dist/opencode-plugin.js",
-      "types": "./dist/opencode-plugin.d.ts"
+      "types": "./dist/opencode-plugin.d.ts",
+      "import": "./dist/opencode-plugin.js"
     },
     "./server": {
-      "import": "./dist/opencode-plugin.js",
-      "types": "./dist/opencode-plugin.d.ts"
+      "types": "./dist/serve.d.ts",
+      "import": "./dist/serve.js"
     }
   },
   "scripts": {

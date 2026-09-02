@@ -1,5 +1,3 @@
-import golden from "../golden/tombstone.json";
-
 import type { OpenCodeHandleFileV1 } from "./handles";
 import type { OpenCodeAuthEntry } from "./tombstone";
 
@@ -11,5 +9,19 @@ export type GoldenTombstone = {
   };
 };
 
-export const goldenTombstone = golden as unknown as GoldenTombstone;
+export const goldenTombstone: GoldenTombstone = {
+  version: 1,
+  fixtures: {
+    api: { provider: "deepseek", entry: { type: "api", key: "claustrum-tombstone:v1:deepseek" } },
+    oauth: {
+      provider: "anthropic",
+      entry: {
+        type: "oauth",
+        refresh: "claustrum-tombstone:v1:anthropic",
+        access: "claustrum-tombstone:v1:anthropic",
+        expires: 0,
+      },
+    },
+  },
+};
 export type { OpenCodeHandleFileV1 };

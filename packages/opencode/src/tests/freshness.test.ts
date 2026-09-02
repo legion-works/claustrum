@@ -123,7 +123,8 @@ describe("custody freshness", () => {
 
   test("bounds a cold warm to 100ms while the get continues detached", async () => {
     const pending = deferred<ServedCredential>();
-    const client = new FakeClient(async () => pending.promise);
+    let calls = 0;
+    const client = new FakeClient(async () => ++calls === 1 ? pending.promise : credential("fresh"));
     let timeoutCallback: (() => void) | undefined;
     const freshness = controller({
       client,
@@ -145,6 +146,25 @@ describe("custody freshness", () => {
     pending.resolve(credential("eventual-material"));
     expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("eventual-material"));
     expect(client.gets).toEqual([{ handle: MAIN_HANDLE, minTtlMs: undefined }]);
+  });
+
+  test("does not cache a warm that completed after its handle revision changed", async () => {
+    let version = "one";
+    const pending = deferred<ServedCredential>();
+    let calls = 0;
+    const client = new FakeClient(async () => ++calls === 1 ? pending.promise : credential("fresh"));
+    const freshness = controller({ client, handleVersion: () => version });
+
+    const first = freshness.resolve(apiAccounts[0]!);
+    await Promise.resolve();
+    version = "two";
+    await freshness.resolve(apiAccounts[0]!);
+    pending.resolve(credential("stale"));
+    await first;
+    await Promise.resolve();
+
+    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("fresh"));
+    expect(client.gets).toHaveLength(2);
   });
 
   test("warns once when an oauth cache serves after a recent transport failure", async () => {

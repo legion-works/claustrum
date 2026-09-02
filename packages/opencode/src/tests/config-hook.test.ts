@@ -366,13 +366,13 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     prepareRefusalProbe(cfg, "deepseek");
     const handleReader = (path: string) => readHandleFile(path, {
       currentUid: () => 1000,
-      stat: async () => ({ isFile: () => true, mode: 0o100600, uid: 1001 }),
+      stat: async () => ({ isFile: () => true, isDirectory: () => true, mode: 0o100600, uid: 1001 }),
     });
 
     await hook(cfg, { handleReader, log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("HandleFileValidationError");
-    await expectRefusal(cfg, "deepseek", /parent must be a directory/);
+    await expectRefusal(cfg, "deepseek", /not owned by the current uid/);
   });
 
   test("rejects a world-writable non-sticky handle parent but accepts a uid-owned 0755 parent", async () => {

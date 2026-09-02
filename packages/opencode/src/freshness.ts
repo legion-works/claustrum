@@ -82,7 +82,15 @@ export class FreshnessController {
     if (this.#shape === "oauth") {
       const set = options.setInterval ?? ((callback, ms) => globalThis.setInterval(callback, ms) as unknown as IntervalHandle);
       const clear = options.clearInterval ?? ((timer) => globalThis.clearInterval(timer as unknown as ReturnType<typeof setInterval>));
-      this.#timer = set(() => { void this.tick(); }, OAUTH_TICK_MS);
+      this.#timer = set(() => {
+        void this.tick().catch((error) => {
+          this.#log?.error({
+            provider: this.#provider,
+            errorClass: error instanceof Error ? error.name : "FreshnessTickError",
+            errorMessage: "credential freshness tick failed",
+          });
+        });
+      }, OAUTH_TICK_MS);
       this.#timer.unref?.();
       this.#clearInterval = clear;
     }
@@ -174,8 +182,10 @@ export class FreshnessController {
     if (!force && this.#isFresh(slot)) return Promise.resolve(slot.cached);
     if (slot.inFlight) return slot.inFlight;
     const minTtlMs = this.#shape === "oauth" ? this.#minTtlMs : undefined;
+    const version = this.#version;
     const inFlight = this.#client.getCredential(account.handle, minTtlMs)
       .then((served) => {
+        if (version !== this.#version) return undefined;
         slot.cached = served;
         slot.observedAt = this.#now();
         slot.cooldownUntil = undefined;
@@ -240,8 +250,9 @@ export class FreshnessController {
       const current = await this.#handleVersion();
       if (this.#version !== undefined && current !== this.#version) {
         for (const slot of this.#slots.values()) {
-          slot.cached = undefined;
-          slot.observedAt = undefined;
+           slot.cached = undefined;
+           slot.observedAt = undefined;
+           slot.inFlight = undefined;
            slot.cooldownUntil = undefined;
            slot.state = "available";
            slot.staleCacheWarningEmitted = false;

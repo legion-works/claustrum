@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { userInfo } from 'node:os'
+import { tmpdir, userInfo } from 'node:os'
+import { join } from 'node:path'
 
 export type ClaustrumEndpoint = {
   host: string
@@ -29,11 +31,18 @@ function isEndpoint(value: unknown): value is ClaustrumEndpoint {
 
 export function getDefaultClaustrumConnectionPath(): string {
   const uid = process.getuid?.() ?? userInfo().uid
-  return `/run/user/${uid}/subc-connection.json`
+  const runtime = process.env.XDG_RUNTIME_DIR?.trim()
+  const candidates = [
+    ...(runtime ? [join(runtime, 'subc-connection.json')] : []),
+    join(userInfo().homedir, '.local', 'share', 'cortexkit', 'run', 'subc-connection.json'),
+    join(tmpdir(), `subc-${uid}.connection.json`),
+  ]
+  // Keep the client aligned with `ck`: runtime, production data home, then temp fallback.
+  return candidates.find(existsSync) ?? candidates[0] ?? `/run/user/${uid}/subc-connection.json`
 }
 
 export function resolveClaustrumConnectionPath(explicit?: string): string {
-  return explicit ?? process.env.CLAUSTRUM_SUBC_CONNECTION ?? getDefaultClaustrumConnectionPath()
+  return explicit?.trim() || process.env.CLAUSTRUM_SUBC_CONNECTION?.trim() || getDefaultClaustrumConnectionPath()
 }
 
 export async function detectClaustrumConnection(
@@ -57,9 +66,9 @@ export async function detectClaustrumConnection(
   if (
     !isRecord(value) ||
     typeof value.schema !== 'number' ||
-    !Number.isFinite(value.schema) ||
+    !Number.isSafeInteger(value.schema) || value.schema < 0 ||
     typeof value.wire_version !== 'number' ||
-    !Number.isFinite(value.wire_version) ||
+    !Number.isSafeInteger(value.wire_version) || value.wire_version < 0 ||
     !Array.isArray(value.endpoints) ||
     value.endpoints.length === 0 ||
     !value.endpoints.every(isEndpoint)

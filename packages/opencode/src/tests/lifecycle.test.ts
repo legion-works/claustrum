@@ -136,9 +136,8 @@ describe("exported OpenCode custody plugin lifecycle", () => {
     expect(forwarded).toBe(0);
   });
 
-  test("leaves a pre-existing provider option byte-identical when handle validation fails", async () => {
+  test("preserves existing options and injects a refusing fetch when handle validation fails", async () => {
     const cfg = config();
-    const before = JSON.stringify(cfg.provider[PROVIDER].options);
     const pluginHooks = await hooks({
       handleReader: async () => { throw new Error("invalid handle file"); },
       authReader: async () => ({ [PROVIDER]: tombstoneFor("api", PROVIDER) }),
@@ -148,6 +147,9 @@ describe("exported OpenCode custody plugin lifecycle", () => {
 
     await pluginHooks.config?.(cfg);
 
-    expect(JSON.stringify(cfg.provider[PROVIDER].options)).toBe(before);
+    expect(cfg.provider[PROVIDER].options.baseURL).toBe("https://upstream.test");
+    expect(cfg.provider[PROVIDER].options.headers).toEqual({ "x-stock": "kept" });
+    await expect((cfg.provider[PROVIDER].options.fetch as typeof globalThis.fetch)("https://upstream.test"))
+      .rejects.toThrow("migrate-opencode");
   });
 });

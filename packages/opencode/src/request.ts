@@ -23,15 +23,24 @@ export async function snapshotRequest(
   return {
     withMaterial(material: string, target?: URL, methodOverride?: string): Request {
       const url = new URL(target ?? source.url);
-      const parameters = new URLSearchParams();
-      for (const [key, value] of url.searchParams) {
-        parameters.append(key, replaceEvery(value, sentinel, material));
-      }
-      url.search = parameters.toString();
+      const encodedSentinel = encodeURIComponent(sentinel);
+      const encodedMaterial = encodeURIComponent(material);
+      const query = url.search.slice(1);
+      url.search = query
+        .split("&")
+        .map((part) => part.includes(sentinel)
+          ? replaceEvery(part, sentinel, material)
+          : replaceEvery(part, encodedSentinel, encodedMaterial))
+        .join("&");
 
       const substitutedHeaders = new Headers();
       for (const [name, value] of headers) {
         substitutedHeaders.set(name, replaceEvery(value, sentinel, material));
+      }
+      if (methodOverride === "GET") {
+        substitutedHeaders.delete("content-length");
+        substitutedHeaders.delete("content-type");
+        substitutedHeaders.delete("transfer-encoding");
       }
       if (url.toString().includes(sentinel) || [...substitutedHeaders.values()].some((value) => value.includes(sentinel))) {
         throw new Error("custody sentinel remains in a forwarded request");
@@ -42,6 +51,13 @@ export async function snapshotRequest(
         headers: substitutedHeaders,
         redirect: "manual",
         signal,
+        cache: source.cache,
+        credentials: source.credentials,
+        integrity: source.integrity,
+        keepalive: source.keepalive,
+        mode: source.mode,
+        referrer: source.referrer,
+        referrerPolicy: source.referrerPolicy,
         ...(body === undefined || methodOverride === "GET" ? {} : { body: body.slice(0) }),
         ...(duplex === undefined ? {} : { duplex }),
       };

@@ -37,5 +37,5 @@ export function createLogger(sink: LogSink = defaultSink): CustodyLogger {
 }
 
 export function serializedLogSink(write: (line: string) => void): LogSink {
-  return (entry) => write(JSON.stringify(entry));
+  return (entry) => write(`${JSON.stringify(entry)}\n`);
 }

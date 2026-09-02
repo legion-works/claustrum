@@ -62,7 +62,10 @@ async function reportWithinBudget(report: Promise<void>, onFailure: (errorClass:
 }
 
 function cooldownFromRetryAfter(value: string | null, now: number): number {
-  if (value && /^\d+$/.test(value.trim())) return Number(value.trim()) * 1_000;
+  if (value && /^\d+$/.test(value.trim())) {
+    const milliseconds = Number(value.trim()) * 1_000;
+    return Number.isFinite(milliseconds) ? milliseconds : DEFAULT_RETRY_AFTER_MS;
+  }
   const date = value ? Date.parse(value) : Number.NaN;
   return Number.isFinite(date) ? Math.max(0, date - now) : DEFAULT_RETRY_AFTER_MS;
 }
@@ -160,9 +163,9 @@ export function createServeFetch(options: CreateServeFetchOptions) {
           options.log?.error({
             provider: options.provider,
             errorClass: error instanceof Error ? error.name : "UpstreamFetchError",
-            errorMessage: error instanceof Error ? error.message : String(error),
+            errorMessage: "upstream request failed",
           });
-          throw error;
+          throw new CustodyRequestError("upstream request failed");
         }
         if (response.status < 300 || response.status >= 400) {
           if (response.status === 401) {

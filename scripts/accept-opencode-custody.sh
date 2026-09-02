@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-WT=/home/icetea/worktrees/claustrum/opencode-custody/claustrum
+WT="${WT:-$(cd "$(dirname "$0")/.." && pwd -P)}"
 CK_AUTH="$WT/target/release/ck-auth"
 ROOT=/tmp/opencode/oc-accept
 PROVIDER=synthetic
@@ -44,10 +44,13 @@ cleanup() {
   local status=$?
   trap - EXIT INT TERM
   if [[ "$status" -ne 0 && "$MINTED" -eq 1 && "$RESTORED" -eq 0 ]]; then
-    ck_auth migrate-opencode --restore "$PROVIDER" \
-      --auth-file "$AUTH_FILE" --handle-file "$HANDLE_FILE" > "$ROOT/restore-on-failure.log" 2>&1 || true
+    if ! ck_auth migrate-opencode --restore "$PROVIDER" \
+      --auth-file "$AUTH_FILE" --handle-file "$HANDLE_FILE" > "$ROOT/restore-on-failure.log" 2>&1; then
+      printf 'ACCEPT FAIL rollback_restore_failed root=%s\n' "$ROOT" >&2
+      exit 1
+    fi
   fi
-  rm -rf "$ROOT"
+  [[ "$status" -eq 0 ]] && rm -rf "$ROOT"
   exit "$status"
 }
 trap cleanup EXIT INT TERM
@@ -81,9 +84,9 @@ jq --arg provider "$PROVIDER" \
   "$WT/packages/opencode/golden/tombstone.json" > "$EXPECTED_TOMBSTONE"
 chmod 600 "$EXPECTED_TOMBSTONE"
 
+MINTED=1
 ck_auth migrate-opencode --auth-file "$AUTH_FILE" --handle-file "$HANDLE_FILE" \
   --provider "$PROVIDER" > "$ROOT/migrate.log" 2>&1
-MINTED=1
 
 jq -e --slurp '.[0].synthetic == .[1]' "$AUTH_FILE" "$EXPECTED_TOMBSTONE" >/dev/null
 [[ "$(stat -c '%a' "$HANDLE_FILE")" == "600" ]]
