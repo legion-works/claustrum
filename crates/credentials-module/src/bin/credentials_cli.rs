@@ -24,7 +24,7 @@
 //!             `--payload-file` bytes exactly, and do not accept `--expires-ms`.
 //!   mint-signing-key --id signing:<provider>[:<generation>] [--replace]
 //!   import    --source opencode|pi|antigravity --id <id> --json <file>
-//!   migrate-opencode [--dry-run] [--replace] [--restore <provider>]
+//!   migrate-opencode [--dry-run] [--replace] [--force-shape] [--restore <provider>]
 //!   invalidate --id <id>
 //!   rotate-master-key
 //!   mint-handle --id <id>                      print a fresh handle (once)
@@ -368,7 +368,7 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
         "mint-signing-key" => &["--replace"],
         "import" => &["--replace"],
         "login" => &["--replace", "--no-listener", "--device"],
-        "migrate-opencode" => &["--dry-run", "--replace"],
+        "migrate-opencode" => &["--dry-run", "--replace", "--force-shape"],
         _ => &[],
     };
     let mut i = 0;
@@ -541,7 +541,7 @@ fn help_verb(verb: &str) -> String {
              --replace overwrites an existing id (fix a wrong-source import; keeps handles)."
         }
         "migrate-opencode" => {
-            "ck auth migrate-opencode [--dry-run] [--replace] [--restore <provider>]\n\
+            "ck auth migrate-opencode [--dry-run] [--replace] [--force-shape] [--restore <provider>]\n\
              \x20                     [--auth-file <path>] [--handle-file <path>] [--provider <id>]...\n\
              \x20                     [--serve-by <plugin-id>]\n\
              \n\
@@ -551,7 +551,10 @@ fn help_verb(verb: &str) -> String {
              --replace is explicit. --provider is repeatable and preserves the requested\n\
              provider order. OAuth and wellknown entries are skipped by default.\n\
              \n\
-             --dry-run prints non-secret compare verdicts and stops before every write.\n\
+              --dry-run prints non-secret compare verdicts and stops before every write.\n\
+              Providers whose api key leaves the generic fetch seam are refused with source\n\
+              citations. --force-shape overrides that availability-only refusal and prints the\n\
+              concrete sentinel consequence.\n\
              --restore <provider> safely writes an api entry back, revokes recorded handles,\n\
              and removes that provider from the handle file. --restore cannot combine with\n\
              --dry-run or --replace. The default --serve-by is opencode-claustrum."
@@ -3126,6 +3129,7 @@ fn cmd_usable(global: &GlobalArgs) -> Result<(), CliError> {
             global.data_dir.display()
         )));
     }
+    warn_unsafe_opencode_tombstones();
     let conn = usable::open_store_read_only(&db).map_err(|e| CliError::Io(e.to_string()))?;
 
     // Resolve the slot the STORE names, exactly as the daemon does. A rotation that
@@ -3277,6 +3281,40 @@ fn cmd_usable(global: &GlobalArgs) -> Result<(), CliError> {
     println!("  for a provider-rejected credential is the `needs_reauth` state, which a");
     println!("  consumer sets via report_auth_failure and the health gauge already counts.");
     Ok(())
+}
+
+fn warn_unsafe_opencode_tombstones() {
+    let auth_path = opencode_files::default_auth_path();
+    if !auth_path.exists() {
+        return;
+    }
+    let entries = match opencode_files::read_auth_entries(&auth_path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!(
+                "WARN: OpenCode auth file {} could not be inspected for unsafe custody tombstones: {error}",
+                auth_path.display()
+            );
+            return;
+        }
+    };
+    for (provider, entry) in entries {
+        if !opencode_migration::is_api_tombstone(&entry, &provider) {
+            continue;
+        }
+        match opencode_migration::unsafe_provider_shape(&provider) {
+            Ok(Some(shape)) => println!(
+                "WARN: OpenCode tombstone provider={provider} shape={} why={} source={}; run ck auth migrate-opencode --restore {provider}",
+                shape.shape_names(),
+                shape.why(),
+                shape.sites(),
+            ),
+            Ok(None) => {}
+            Err(error) => println!(
+                "WARN: OpenCode provider shape table could not classify {provider}: {error}"
+            ),
+        }
+    }
 }
 
 /// Verify the tamper-evidence chain, WITHOUT stopping the daemon.

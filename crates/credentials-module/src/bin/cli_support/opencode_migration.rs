@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
@@ -13,9 +15,156 @@ use credentials_core::record::{CredentialKind, VaultRecord};
 
 const ACCOUNT: &str = "main";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ProviderShape {
+    Api,
+    ApiEnv,
+    ApiDiscovery,
+    ApiMetadata,
+}
+
+impl ProviderShape {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::ApiEnv => "api-env",
+            Self::ApiDiscovery => "api-discovery",
+            Self::ApiMetadata => "api-metadata",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderShapeDefinition {
+    why: String,
+    if_forced: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderShapeEntry {
+    shapes: Vec<ProviderShape>,
+    sites: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderShapeTable {
+    version: u8,
+    shape_definitions: BTreeMap<ProviderShape, ProviderShapeDefinition>,
+    providers: BTreeMap<String, ProviderShapeEntry>,
+    examined_servable: BTreeMap<String, String>,
+    maintainer_note: Vec<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UnsafeProviderShape {
+    shapes: Vec<ProviderShape>,
+    why: Vec<String>,
+    if_forced: Vec<String>,
+    sites: Vec<String>,
+}
+
+impl UnsafeProviderShape {
+    pub(crate) fn shape_names(&self) -> String {
+        self.shapes
+            .iter()
+            .map(|shape| shape.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    pub(crate) fn why(&self) -> String {
+        self.why.join(" | ")
+    }
+
+    pub(crate) fn sites(&self) -> String {
+        self.sites.join(",")
+    }
+
+    fn if_forced(&self) -> String {
+        self.if_forced.join(" | ")
+    }
+}
+
+fn provider_shape_table() -> Result<&'static ProviderShapeTable, CliError> {
+    static TABLE: OnceLock<Result<ProviderShapeTable, String>> = OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            let table: ProviderShapeTable =
+                serde_json::from_str(include_str!("opencode-provider-shapes.json"))
+                    .map_err(|error| format!("provider shape table is invalid JSON: {error}"))?;
+            if table.version != 1 {
+                return Err(format!(
+                    "provider shape table has unsupported version {}",
+                    table.version
+                ));
+            }
+            if !table.examined_servable.contains_key("github-copilot") {
+                return Err(
+                    "provider shape table must record github-copilot as examined and servable"
+                        .into(),
+                );
+            }
+            if table.maintainer_note.len() != 2 {
+                return Err(
+                    "provider shape table must retain both derivation traps for maintainers".into(),
+                );
+            }
+            for (provider, entry) in &table.providers {
+                if entry.shapes.is_empty() || entry.sites.is_empty() {
+                    return Err(format!(
+                        "provider shape table has an empty shape or site list for {provider}"
+                    ));
+                }
+                for shape in &entry.shapes {
+                    if *shape == ProviderShape::Api || !table.shape_definitions.contains_key(shape)
+                    {
+                        return Err(format!(
+                            "provider shape table has an undefined non-api shape for {provider}"
+                        ));
+                    }
+                }
+            }
+            Ok(table)
+        })
+        .as_ref()
+        .map_err(|error| CliError::Io(error.clone()))
+}
+
+pub(crate) fn unsafe_provider_shape(
+    provider: &str,
+) -> Result<Option<UnsafeProviderShape>, CliError> {
+    let Some(entry) = provider_shape_table()?.providers.get(provider) else {
+        return Ok(None);
+    };
+    if entry.shapes.as_slice() == [ProviderShape::Api] {
+        return Ok(None);
+    }
+    let definitions = &provider_shape_table()?.shape_definitions;
+    let mut why = Vec::new();
+    let mut if_forced = Vec::new();
+    for shape in &entry.shapes {
+        let definition = definitions.get(shape).ok_or_else(|| {
+            CliError::Io(format!(
+                "provider shape table is missing {}",
+                shape.as_str()
+            ))
+        })?;
+        why.push(definition.why.clone());
+        if_forced.push(definition.if_forced.clone());
+    }
+    Ok(Some(UnsafeProviderShape {
+        shapes: entry.shapes.clone(),
+        why,
+        if_forced,
+        sites: entry.sites.clone(),
+    }))
+}
+
 struct MigrationArgs {
     dry_run: bool,
     replace: bool,
+    force_shape: bool,
     restore: Option<String>,
     auth_file: PathBuf,
     handle_file: PathBuf,
@@ -35,6 +184,7 @@ impl MigrationArgs {
     fn parse(raw: &[String]) -> Result<Self, CliError> {
         let mut dry_run = false;
         let mut replace = false;
+        let mut force_shape = false;
         let mut restore = None;
         let mut auth_file = None;
         let mut handle_file = None;
@@ -45,6 +195,7 @@ impl MigrationArgs {
             match raw[index].as_str() {
                 "--dry-run" => dry_run = true,
                 "--replace" => replace = true,
+                "--force-shape" => force_shape = true,
                 "--restore" | "--auth-file" | "--handle-file" | "--provider" | "--serve-by" => {
                     let value = raw
                         .get(index + 1)
@@ -65,14 +216,15 @@ impl MigrationArgs {
             }
             index += 1;
         }
-        if restore.is_some() && (dry_run || replace || !providers.is_empty()) {
+        if restore.is_some() && (dry_run || replace || force_shape || !providers.is_empty()) {
             return Err(CliError::Usage(
-                "--restore is mutually exclusive with --dry-run, --replace, and --provider".into(),
+                "--restore is mutually exclusive with --dry-run, --replace, --force-shape, and --provider".into(),
             ));
         }
         Ok(Self {
             dry_run,
             replace,
+            force_shape,
             restore,
             auth_file: auth_file.unwrap_or_else(opencode_files::default_auth_path),
             handle_file: handle_file.unwrap_or_else(opencode_files::default_handle_path),
@@ -90,6 +242,22 @@ fn migrate_providers(global: &GlobalArgs, args: &MigrationArgs) -> Result<(), Cl
         return Ok(());
     }
     for provider in providers {
+        if let Some(shape) = unsafe_provider_shape(&provider)? {
+            if !args.force_shape {
+                println!(
+                    "provider={provider} refused shape={} why={} source={}; use --force-shape to override. availability-only, sentinel non-secret.",
+                    shape.shape_names(),
+                    shape.why(),
+                    shape.sites(),
+                );
+                continue;
+            }
+            println!(
+                "provider={provider} force_shape shape={} consequence={}; availability-only, sentinel non-secret.",
+                shape.shape_names(),
+                shape.if_forced(),
+            );
+        }
         let entry = auth.get(&provider).expect("selected provider exists");
         if is_api_tombstone(entry, &provider) {
             if args.dry_run {
@@ -359,7 +527,7 @@ fn api_tombstone(provider: &str) -> Value {
     json!({"type": "api", "key": format!("{TOMBSTONE_PREFIX}{provider}")})
 }
 
-fn is_api_tombstone(entry: &Value, provider: &str) -> bool {
+pub(crate) fn is_api_tombstone(entry: &Value, provider: &str) -> bool {
     entry == &api_tombstone(provider)
 }
 

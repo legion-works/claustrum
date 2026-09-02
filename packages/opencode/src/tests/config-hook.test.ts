@@ -374,17 +374,6 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await expectRefusal(cfg, "deepseek", /auth-read failure.*invalid JSON.*bounded tombstone scan/);
   });
 
-  test("refuses a malformed OPENCODE_AUTH_CONTENT source containing a tombstone", async () => {
-    const files = await fixture("malformed-auth-env");
-    useEnv("OPENCODE_AUTH_CONTENT", `{"deepseek":${JSON.stringify(tombstoneFor("api", "deepseek"))}`);
-    const cfg = config("deepseek");
-    prepareRefusalProbe(cfg, "deepseek");
-
-    await hook(cfg);
-
-    await expectRefusal(cfg, "deepseek", /auth-read failure.*OPENCODE_AUTH_CONTENT.*bounded tombstone scan/);
-  });
-
   test("refuses every scanned tombstone without disturbing configured providers absent from the scan", async () => {
     const files = await fixture("large-auth-two-tombstones");
     await writeAuth(files.auth, {
@@ -506,6 +495,66 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(cfg.provider.deepseek.options?.fetch).toBeFunction();
     await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
       .rejects.toBeInstanceOf(CustodySplitError);
+  });
+
+  for (const env of [
+    { name: "absent", value: undefined, selected: "disk" },
+    { name: "empty", value: "", selected: "disk" },
+    { name: "malformed", value: "{", selected: "disk" },
+    { name: "valid", value: JSON.stringify({ deepseek: { type: "api", key: "env-real-key" } }), selected: "env" },
+  ] as const) {
+    for (const disk of ["tombstone", "real"] as const) {
+      test(`matches OpenCode Auth.all for ${env.name} auth content and a ${disk} disk entry`, async () => {
+        const files = await fixture(`auth-all-${env.name}-${disk}`);
+        await writeHandles(files.handles, handles("deepseek"));
+        await writeAuth(files.auth, {
+          deepseek: disk === "tombstone"
+            ? tombstoneFor("api", "deepseek")
+            : { type: "api", key: "disk-real-key" },
+        });
+        useEnv("OPENCODE_AUTH_CONTENT", env.value);
+        const cfg = config("deepseek");
+        prepareRefusalProbe(cfg, "deepseek");
+
+        await hook(cfg);
+
+        const selectedIsTombstone = env.selected === "disk" && disk === "tombstone";
+        if (selectedIsTombstone) {
+          expect(cfg.provider.deepseek.options?.apiKey).toBe(sentinel("deepseek"));
+        } else {
+          await expectRefusal(cfg, "deepseek", /local credential is real/);
+        }
+      });
+    }
+  }
+
+  test("caps a malformed many-hit scan and refuses configured providers once the cap is reached", async () => {
+    const files = await fixture("auth-scan-hit-cap");
+    const hits = Array.from({ length: 300 }, (_, index) => sentinel(`provider-${index}`)).join(" ");
+    await writeFile(files.auth, `{${JSON.stringify(hits)}`);
+    await chmod(files.auth, 0o600);
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("tombstone scan hit cap");
+    await expectRefusal(cfg, "deepseek", /bounded tombstone scan/);
+  });
+
+  test("refuses exactly the three observed providers when a malformed scan stays below the cap", async () => {
+    const files = await fixture("auth-scan-three-hits");
+    const providers = ["deepseek", "xai", "groq"];
+    await writeFile(files.auth, `{${providers.map(sentinel).join(" ")}`);
+    await chmod(files.auth, 0o600);
+    const cfg = config(...providers, "anthropic");
+    for (const provider of providers) prepareRefusalProbe(cfg, provider);
+
+    await hook(cfg);
+
+    for (const provider of providers) await expectRefusal(cfg, provider, /bounded tombstone scan/);
+    expect(cfg.provider.anthropic.options).toEqual({ baseURL: "https://anthropic.example", headers: { "x-stock": "kept" } });
   });
 
   test("re-reads OPENCODE_AUTH_CONTENT before the auth file for each served request", async () => {

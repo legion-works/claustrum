@@ -34,6 +34,26 @@ provider with in-request failover for providers the generic plugin serves.
 | Multi-account | One vault record per key/account; ordered priority list per provider |
 | Dedicated-plugin providers | Served by THEIR plugin consuming this client + handle file + tombstone convention; never by the generic closure |
 
+### Seam boundary
+
+This is a config-hook/fetch-seam integration, **not provider-universal custody**. The generic
+plugin does not know provider names and never consults the provider-shape table. The CLI that
+creates tombstones owns that provider knowledge as data in
+`crates/credentials-module/src/bin/cli_support/opencode-provider-shapes.json`, maintained from
+OpenCode source on every base update. It records source sites, the deliberately servable negative
+determinations, and the availability-only consequence of `--force-shape`.
+
+| shape | why |
+| --- | --- |
+| `api-env` | OpenCode copies the key into `process.env` at provider load, so custody material would enter the environment. |
+| `api-discovery` | Model discovery or a loader closure consumes the key outside `options.fetch`; provider options can then be serialized. |
+| `api-metadata` | The provider reads API auth metadata that a metadata-less tombstone does not carry. |
+
+An unlisted provider defaults to the `api` fetch seam. A listed provider is servable only when its
+shape list is exactly `[api]`; multiple listed shapes are orthogonal and refuse together. The
+table's method has a stated edge: it covers consumers found in upstream `provider/provider.ts` and
+`plugin/` at its pinned commit, not every possible consumer elsewhere in the tree.
+
 ## 3. Verified mechanism (OpenCode `a184b7a718`, installed 1.18.25)
 
 - `plugin/index.ts:247` — every plugin's `config(cfg)` hook receives the live config object.
@@ -130,6 +150,13 @@ NEVER accepted on argv.
 Eligibility is by SHAPE: any entry whose `type` the verb has a mapping for (`api` now;
 `oauth` when §9's owner is ready) and that is not already a tombstone. `--provider`
 restricts; there is no allow-list of provider names.
+
+Before that generic eligibility check, `migrate-opencode` reads the provider-shape table. Known
+API entries that leave `options.fetch` are refused per provider with the shape, why, source site,
+and `--force-shape` remedy; other providers in the same invocation still migrate. Forcing remains
+availability-only because the sentinel is non-secret, but it can put that sentinel in an
+environment, discovery request, or metadata-dependent loader. `opencode-account add` refuses the
+same providers rather than treating account failover as a seam fix.
 
 Per provider, in order, each step idempotent (crash anywhere → re-run converges):
 

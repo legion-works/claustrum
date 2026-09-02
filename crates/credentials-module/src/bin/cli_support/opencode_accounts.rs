@@ -31,6 +31,15 @@ fn add(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     let before = optional(args, "--before");
     let handle_path = handle_path(args);
 
+    if let Some(shape) = opencode_migration::unsafe_provider_shape(&provider)? {
+        return Err(CliError::Usage(format!(
+            "refusing opencode-account add for {provider}: shape={} why={} source={}; this is availability-only (the sentinel is non-secret), but account failover cannot make a provider outside the fetch seam safe; run migrate-opencode --restore {provider}",
+            shape.shape_names(),
+            shape.why(),
+            shape.sites(),
+        )));
+    }
+
     let mut handles = opencode_migration::read_handles_or_empty(&handle_path)?;
     let provider_entry = handles
         .providers

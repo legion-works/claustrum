@@ -2,6 +2,23 @@
 
 This plugin owns only providers whose live credential path remains OpenCode's generic AI SDK `fetch` seam. It reads the handle file during OpenCode configuration and injects a tombstone API key plus a fetch hook only when the local auth entry is a Claustrum tombstone and the handle file assigns that provider to `opencode-claustrum`. Provider-specific loaders and credential paths need dedicated ownership; the provider allowlist question remains open.
 
+## Seam boundary
+
+This is a config-hook/fetch-seam integration, **not provider-universal custody**. A `type:"api"`
+entry is servable only when OpenCode keeps its key inside the generic `options.fetch` path. The CLI
+refuses known counter-shapes before it writes a tombstone:
+
+| shape | why |
+| --- | --- |
+| `api-env` | OpenCode copies the key into `process.env` at provider load; serving it would put material in the environment. |
+| `api-discovery` | Model discovery or a loader closure uses the key outside the fetch seam, where provider options can be serialized. |
+| `api-metadata` | The provider reads API auth metadata that a metadata-less tombstone cannot supply. |
+
+`crates/credentials-module/src/bin/cli_support/opencode-provider-shapes.json` is data maintained
+from OpenCode source for every base update; it records source sites, negative determinations, and
+the concrete effect of `--force-shape`. Unlisted providers default to `api`/fetch-seam eligibility.
+The plugin never reads this table: only the CLI that creates tombstones does.
+
 | `auth.json` | handle `serve` | action |
 | --- | --- | --- |
 | tombstone | `opencode-claustrum` | inject the Claustrum fetch hook |
@@ -28,3 +45,21 @@ OpenCode's provider API and UI serialize `Provider.Info.key`, so a tombstone can
 `OPENCODE_EXPERIMENTAL_NATIVE_LLM` bypasses this plugin's generic fetch seam when set to an enabling or unrecognized value on stock OpenCode 1.18.25. The plugin serves only when it is absent or exactly `false`, `no`, `off`, `0`, or `n`; it otherwise refuses observed custody entries and names the observed value.
 
 Run `ck auth migrate-opencode` to create or repair the tombstones and handle file. `superseded` handles remain in the file for migration history. They are not servable accounts.
+
+## Maintenance
+
+Keep the sweep's exit/row smoke signal on one method:
+
+```sh
+grep -cE '^\s*(catch|} catch)|^\s*return[; ]|^\s*continue;|^\s*if \(' packages/opencode/src/{plugin,serve}.ts
+```
+
+| revision | `plugin.ts` exits/rows | `serve.ts` exits/rows |
+| --- | --- | --- |
+| `eb034af` | 47/22 | 26/17 |
+| `57ce561` | 58/22 | 26/17 |
+| closing-wave worktree | 65/27 | 26/17 |
+
+The five added plugin rows cover the env parse fallthrough, scan I/O failure, final-chunk hit,
+identifier boundary, and hit-cap fallback. A changed exit count without a matching sweep row is a
+review failure, not harmless churn.

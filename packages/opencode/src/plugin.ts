@@ -25,6 +25,7 @@ type MutableConfig = { provider?: Record<string, ConfigProvider> };
 const AUTH_FILE_MAX_BYTES = 1024 * 1024;
 const AUTH_SCAN_CHUNK_BYTES = 64 * 1024;
 const AUTH_SCAN_CARRY_BYTES = TOMBSTONE_PREFIX.length + 64;
+const AUTH_SCAN_MAX_HITS = 256;
 const SCANNED_PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const FORBIDDEN_PROVIDER_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -73,17 +74,14 @@ async function readAuthFile(path: string): Promise<Record<string, unknown>> {
 
 async function readAuth(path: string, reader: (path: string) => Promise<Record<string, unknown>>): Promise<Record<string, unknown>> {
   const content = process.env.OPENCODE_AUTH_CONTENT;
-  if (content !== undefined) {
+  if (content) {
     try {
       const value: unknown = JSON.parse(content);
       if (!value || typeof value !== "object" || Array.isArray(value)) {
         throw new AuthFileValidationError("OPENCODE_AUTH_CONTENT must contain an object");
       }
       return value as Record<string, unknown>;
-    } catch (error) {
-      if (error instanceof AuthFileValidationError) throw error;
-      throw new AuthFileValidationError(`OPENCODE_AUTH_CONTENT contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    } catch {}
   }
   return reader(path);
 }
@@ -94,42 +92,54 @@ async function readAuth(path: string, reader: (path: string) => Promise<Record<s
 // both are the same no-hit branch; closing (1) breaks (2). A mis-keyed sentinel refuses the
 // provider it NAMES, not the entry that carries it; tolerable only because the sentinel is
 // non-secret (availability loss, nothing exposed). Rationale: docs/opencode-custody-design.md.
-function scanTombstones(source: string, providers: Set<string>, allowTrailing = false) {
+function scanTombstones(source: string, providers: Set<string>, allowTrailing = false): boolean {
   let index = 0;
   while ((index = source.indexOf(TOMBSTONE_PREFIX, index)) !== -1) {
     const start = index + TOMBSTONE_PREFIX.length;
     let end = start;
     while (end - start < 64 && /[a-z0-9._-]/.test(source[end] ?? "")) end += 1;
-    if (end > start && (allowTrailing || end < source.length)) providers.add(source.slice(start, end));
+    if (end > start && (allowTrailing || end < source.length)) {
+      const provider = source.slice(start, end);
+      if (!providers.has(provider) && providers.size >= AUTH_SCAN_MAX_HITS) return true;
+      providers.add(provider);
+    }
     index = start;
   }
+  return false;
 }
 
-async function scanAuthTombstones(path: string): Promise<Set<string>> {
+type TombstoneScan = { providers: Set<string>; capped: boolean };
+
+async function scanAuthTombstones(path: string): Promise<TombstoneScan> {
   const providers = new Set<string>();
+  let capped = false;
   await new Promise<void>((resolve, reject) => {
     const stream = createReadStream(path, { highWaterMark: AUTH_SCAN_CHUNK_BYTES });
     let carry = "";
     stream.on("data", (chunk: Buffer) => {
       const source = carry + chunk.toString("latin1");
-      scanTombstones(source, providers);
+      if (!capped) capped = scanTombstones(source, providers);
       carry = source.slice(-AUTH_SCAN_CARRY_BYTES);
     });
     stream.on("error", reject);
     stream.on("end", () => {
-      scanTombstones(carry, providers, true);
+      if (!capped) capped = scanTombstones(carry, providers, true);
       resolve();
     });
   });
-  return providers;
+  return { providers, capped };
 }
 
-async function scanAuthSource(path: string): Promise<Set<string>> {
+async function scanAuthSource(path: string): Promise<TombstoneScan> {
   const content = process.env.OPENCODE_AUTH_CONTENT;
-  if (content !== undefined) {
-    const providers = new Set<string>();
-    scanTombstones(content, providers, true);
-    return providers;
+  if (content) {
+    try {
+      const value: unknown = JSON.parse(content);
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new AuthFileValidationError("OPENCODE_AUTH_CONTENT must contain an object");
+    } catch {
+      return scanAuthTombstones(path);
+    }
+    return { providers: new Set<string>(), capped: false };
   }
   return scanAuthTombstones(path);
 }
@@ -237,7 +247,19 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
           const refusal = authReadRefusal(error, true);
           const providers = new Set(ownedProviders);
           try {
-            for (const provider of await scanAuthSource(defaultAuthPath())) providers.add(provider);
+            const scanned = await scanAuthSource(defaultAuthPath());
+            if (scanned.capped) {
+              // This malformed-source path is unlike the never-migrated no-hit case: a cap proves
+              // there are more tombstones than we can name, so refusing configured providers is safer.
+              for (const provider of Object.keys(providerConfig)) providers.add(provider);
+              log.warn({
+                provider: "auth-scan",
+                errorCode: "tombstone_scan_hit_cap",
+                errorMessage: `tombstone scan hit cap ${AUTH_SCAN_MAX_HITS}; refusing owned and configured providers`,
+              });
+            } else {
+              for (const provider of scanned.providers) providers.add(provider);
+            }
           } catch (scanError) {
             logError(log, new CustodyAuthReadError(
               `bounded tombstone scan failed: ${scanError instanceof Error ? `${scanError.name}: ${scanError.message}` : String(scanError)}`,

@@ -821,6 +821,170 @@ fn the_migrate_opencode_dry_run_writes_nothing_and_prints_a_non_secret_plan() {
 }
 
 #[test]
+fn the_provider_shape_table_parses_the_eight_refused_ids_and_excludes_copilot() {
+    let table: Value = serde_json::from_str(include_str!(
+        "../src/bin/cli_support/opencode-provider-shapes.json"
+    ))
+    .expect("provider shape table parses");
+    let definitions = table["shape_definitions"]
+        .as_object()
+        .expect("shape definitions object");
+    let mut providers = Vec::new();
+    for shape in definitions.values() {
+        assert!(shape["why"].as_str().is_some_and(|why| !why.is_empty()));
+        assert!(shape["if_forced"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()));
+    }
+    for (provider, shape) in table["providers"].as_object().expect("providers object") {
+        assert!(shape["shapes"]
+            .as_array()
+            .is_some_and(|shapes| !shapes.is_empty()));
+        assert!(shape["sites"].as_array().is_some_and(|sites| sites
+            .iter()
+            .all(|site| site.as_str().is_some_and(|site| site.contains(':')))));
+        providers.push(provider.as_str());
+    }
+    providers.sort_unstable();
+    assert_eq!(providers.len(), 8);
+    assert!(providers.contains(&"amazon-bedrock"));
+    assert!(providers.contains(&"azure"));
+    assert!(!providers.contains(&"github-copilot"));
+    assert!(table["examined_servable"].get("github-copilot").is_some());
+    assert_eq!(
+        table["maintainer_note"].as_array().expect("maintainer notes"),
+        &vec![
+            Value::String("attribute each hit by walking the custom() map keys backwards, not by eyeballing (first pass put two gitlab sites under sap-ai-core; PRIVATE-TOKEN header was the only tell)".into()),
+            Value::String("cross-reference the oauth-gate list — it is what keeps false entries like copilot out; a delta without both checks stated is refusable".into()),
+        ]
+    );
+}
+
+#[test]
+fn the_migrate_opencode_refuses_an_api_env_provider_with_its_source_citation() {
+    let rig = MigrationRig::new(
+        "migration-shape-refusal",
+        json!({"amazon-bedrock": {"type": "api", "key": "bedrock-secret"}}),
+    );
+    let out = rig.migrate(&["--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("provider=amazon-bedrock refused shape=api-env"));
+    assert!(stdout.contains("provider.ts:324"));
+    assert!(stdout.contains("--force-shape"));
+}
+
+#[test]
+fn the_migrate_opencode_force_shape_overrides_a_provider_shape_refusal() {
+    let rig = MigrationRig::new(
+        "migration-shape-force",
+        json!({"amazon-bedrock": {"type": "api", "key": "bedrock-secret"}}),
+    );
+    let out = rig.migrate(&["--dry-run", "--force-shape"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("provider=amazon-bedrock credential_id=apikey:amazon-bedrock:main dry_run")
+    );
+    assert!(stdout.contains("the sentinel lands in process.env (e.g. AWS_BEARER_TOKEN_BEDROCK)"));
+    assert!(stdout.contains("availability-only, sentinel non-secret"));
+}
+
+#[test]
+fn the_migrate_opencode_migrates_safe_providers_while_refusing_unsafe_shapes() {
+    let rig = MigrationRig::new(
+        "migration-shape-mixed",
+        json!({
+            "deepseek": {"type": "api", "key": "deepseek-secret"},
+            "amazon-bedrock": {"type": "api", "key": "bedrock-secret"}
+        }),
+    );
+    let out = rig.migrate(&[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("provider=deepseek credential_id=apikey:deepseek:main"));
+    assert!(stdout.contains("provider=amazon-bedrock refused shape=api-env"));
+    let auth: Value =
+        serde_json::from_slice(&std::fs::read(&rig.auth).expect("auth")).expect("auth json");
+    assert_eq!(auth["deepseek"]["key"], "claustrum-tombstone:v1:deepseek");
+    assert_eq!(auth["amazon-bedrock"]["key"], "bedrock-secret");
+}
+
+#[test]
+fn opencode_account_add_refuses_a_provider_forced_across_the_fetch_seam() {
+    let rig = MigrationRig::new(
+        "account-add-shape-refusal",
+        json!({"amazon-bedrock": {"type": "api", "key": "bedrock-secret"}}),
+    );
+    assert!(rig.migrate(&["--force-shape"]).status.success());
+    let key_file = rig.root.join("alt.key");
+    std::fs::write(&key_file, b"alt-secret").expect("key file");
+    let out = rig.run(&[
+        "opencode-account",
+        "add",
+        "--provider",
+        "amazon-bedrock",
+        "--label",
+        "alt",
+        "--key-file",
+        key_file.to_str().expect("key path"),
+        "--handle-file",
+        rig.handles.to_str().expect("handle path"),
+    ]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("shape=api-env"));
+    assert!(stderr.contains("provider.ts:324"));
+}
+
+#[test]
+fn usable_warns_when_an_existing_tombstone_has_an_unsafe_provider_shape() {
+    let rig = MigrationRig::new("usable-shape-warning", json!({}));
+    let data_home = rig.root.join("data");
+    let auth = data_home.join("opencode").join("auth.json");
+    std::fs::create_dir_all(auth.parent().expect("auth parent")).expect("auth parent");
+    std::fs::write(
+        &auth,
+        serde_json::to_vec(&json!({
+            "amazon-bedrock": {"type": "api", "key": "claustrum-tombstone:v1:amazon-bedrock"}
+        }))
+        .expect("auth json"),
+    )
+    .expect("auth file");
+    std::fs::set_permissions(&auth, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("auth mode");
+    let out = cli()
+        .arg("usable")
+        .arg("--data-dir")
+        .arg(&rig.vault)
+        .arg("--key-path")
+        .arg(&rig.key)
+        .env("XDG_DATA_HOME", &data_home)
+        .output()
+        .expect("run usable");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("WARN: OpenCode tombstone provider=amazon-bedrock shape=api-env"));
+    assert!(stdout.contains("migrate-opencode --restore amazon-bedrock"));
+}
+
+#[test]
 fn the_migrate_opencode_first_run_stores_writes_a_handle_and_then_tombstones() {
     let rig = MigrationRig::new(
         "migration-first",
