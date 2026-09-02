@@ -137,6 +137,7 @@ async function readHandleSnapshot(path = defaultHandleFilePath(), io: HandleFile
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { file: { version: 1, providers: [] } };
+      if ((error as NodeJS.ErrnoException).code === "ELOOP") invalid("handle file must not be a symlink");
       invalid(`cannot stat handle file: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (metadata.isSymbolicLink?.()) invalid("handle file must not be a symlink");

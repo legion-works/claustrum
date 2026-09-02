@@ -144,8 +144,11 @@ describe("custody freshness", () => {
     expect(await resolved).toBeUndefined();
     expect(client.gets).toEqual([{ handle: MAIN_HANDLE, minTtlMs: undefined }]);
     pending.resolve(credential("eventual-material"));
-    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("eventual-material"));
-    expect(client.gets).toEqual([{ handle: MAIN_HANDLE, minTtlMs: undefined }]);
+    expect(await freshness.resolve(apiAccounts[0]!)).toEqual(credential("fresh"));
+    expect(client.gets).toEqual([
+      { handle: MAIN_HANDLE, minTtlMs: undefined },
+      { handle: MAIN_HANDLE, minTtlMs: undefined },
+    ]);
   });
 
   test("does not cache a warm that completed after its handle revision changed", async () => {

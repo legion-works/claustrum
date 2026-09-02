@@ -3,13 +3,13 @@ import {
   SubcClient,
   type BindIdentity,
 } from '@cortexkit/subc-client'
-import { resolveClaustrumConnectionPath } from './detect'
+import { resolveClaustrumConnectionPath } from './detect.js'
 import {
   asCredentialError,
   ClaustrumCredentialError,
   hasCredentialError,
-} from './errors'
-import { storeIdentity } from './identity'
+} from './errors.js'
+import { storeIdentity } from './identity.js'
 
 const CLAUSTRUM_MODULE_ID = 'claustrum'
 const RECONNECT_BACKOFF_MS = 60_000
@@ -144,14 +144,14 @@ export class ClaustrumClient {
   static async connect(options: ClaustrumClientOptions = {}): Promise<ClaustrumClient> {
     const connectionFile = resolveClaustrumConnectionPath(options.connectionFile)
     const connector = options.connector ?? ((connectOptions) => SubcClient.connect(connectOptions))
-    const client = await connector({
-      connectionFile,
-      handshakeTimeoutMs: options.handshakeTimeoutMs,
-    })
     const identity = options.identity ?? storeIdentity(
       options.projectRoot ?? process.cwd(),
       options.storagePath ?? process.cwd(),
     )
+    const client = await connector({
+      connectionFile,
+      handshakeTimeoutMs: options.handshakeTimeoutMs,
+    })
     return new ClaustrumClient(
       client,
       connector,

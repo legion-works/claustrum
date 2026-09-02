@@ -4,15 +4,15 @@ export {
   resolveClaustrumConnectionPath,
   type ClaustrumDetection,
   type ClaustrumEndpoint,
-} from './detect'
-export { storeIdentity, storageFingerprint } from './identity'
+} from './detect.js'
+export { storeIdentity, storageFingerprint } from './identity.js'
 export {
   ClaustrumCredentialError,
   credentialErrorAction,
   ERROR_CLASS_WIRE_SET,
   type ClaustrumCredentialErrorAction,
   type ClaustrumCredentialErrorClass,
-} from './errors'
+} from './errors.js'
 export {
   ClaustrumClient,
   type ClaustrumClientOptions,
@@ -20,4 +20,4 @@ export {
   type ClaustrumReporterSource,
   type CredentialStatus,
   type ServedCredential,
-} from './wire'
+} from './wire.js'

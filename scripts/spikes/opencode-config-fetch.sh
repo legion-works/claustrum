@@ -7,6 +7,7 @@
 set -euo pipefail
 
 umask 077
+mkdir -p /tmp/opencode
 ROOT="$(mktemp -d /tmp/opencode/oc-spike.XXXXXX)"
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_DATA_HOME="$ROOT/data"

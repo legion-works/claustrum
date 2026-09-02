@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { statSync } from 'node:fs'
 import { tmpdir, userInfo } from 'node:os'
 import { join } from 'node:path'
 import { PROTOCOL_VERSION, readConnectionFile } from '@cortexkit/subc-client'
@@ -22,7 +22,9 @@ export function getDefaultClaustrumConnectionPath(): string {
     join(tmpdir(), `subc-${uid}.connection.json`),
   ]
   // Keep the client aligned with `ck`: runtime, production data home, then temp fallback.
-  return candidates.find(existsSync) ?? candidates[0]!
+  return candidates.find((candidate) => {
+    try { return statSync(candidate).isFile() } catch { return false }
+  }) ?? candidates[0]!
 }
 
 export function resolveClaustrumConnectionPath(explicit?: string): string {

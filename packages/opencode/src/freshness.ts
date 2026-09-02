@@ -21,6 +21,7 @@ type Slot = {
   cooldownUntil?: number;
   state: FreshnessState;
   inFlight?: Promise<ServedCredential | undefined>;
+  generation: number;
   staleCacheWarningEmitted?: boolean;
 };
 
@@ -78,7 +79,7 @@ export class FreshnessController {
     this.#log = options.log;
     this.#setTimeout = options.setTimeout ?? globalThis.setTimeout;
     this.#clearTimeout = options.clearTimeout ?? ((timer) => globalThis.clearTimeout(timer as ReturnType<typeof setTimeout>));
-    for (const account of this.#accounts) this.#slots.set(account.handle, { state: "available" });
+    for (const account of this.#accounts) this.#slots.set(account.handle, { state: "available", generation: 0 });
     if (this.#shape === "oauth") {
       const set = options.setInterval ?? ((callback, ms) => globalThis.setInterval(callback, ms) as unknown as IntervalHandle);
       const clear = options.clearInterval ?? ((timer) => globalThis.clearInterval(timer as unknown as ReturnType<typeof setInterval>));
@@ -123,7 +124,7 @@ export class FreshnessController {
     }
     if (!this.#canWarm(slot)) return undefined;
     if (this.#isFresh(slot)) return slot.cached;
-    return this.#bounded(this.#warm(account, false));
+    return this.#bounded(account, this.#warm(account, false));
   }
 
   async tick(): Promise<void> {
@@ -131,7 +132,7 @@ export class FreshnessController {
     await this.#refreshHandleVersion();
     await Promise.all(this.#accounts.map(async (account) => {
       const slot = this.#slot(account);
-      if (this.#canWarm(slot)) await this.#bounded(this.#warm(account, true));
+      if (this.#canWarm(slot)) await this.#bounded(account, this.#warm(account, true), false);
     }));
   }
 
@@ -183,9 +184,10 @@ export class FreshnessController {
     if (slot.inFlight) return slot.inFlight;
     const minTtlMs = this.#shape === "oauth" ? this.#minTtlMs : undefined;
     const version = this.#version;
+    const generation = ++slot.generation;
     const inFlight = this.#client.getCredential(account.handle, minTtlMs)
       .then((served) => {
-        if (version !== this.#version) return undefined;
+        if (version !== this.#version || generation !== slot.generation) return undefined;
         slot.cached = served;
         slot.observedAt = this.#now();
         slot.cooldownUntil = undefined;
@@ -194,7 +196,7 @@ export class FreshnessController {
         return served;
       })
       .catch((error: unknown) => {
-        this.#markFailure(account, slot, error);
+        if (version === this.#version && generation === slot.generation) this.#markFailure(account, slot, error);
         return undefined;
       })
       .finally(() => {
@@ -204,7 +206,7 @@ export class FreshnessController {
     return inFlight;
   }
 
-  async #bounded(promise: Promise<ServedCredential | undefined>): Promise<ServedCredential | undefined> {
+  async #bounded(account: FreshnessAccount, promise: Promise<ServedCredential | undefined>, expire = true): Promise<ServedCredential | undefined> {
     let timeout: unknown;
     const deadline = new Promise<void>((resolve) => {
       timeout = this.#setTimeout(() => resolve(), WARM_BUDGET_MS);
@@ -215,6 +217,11 @@ export class FreshnessController {
     ]);
     if (timeout !== undefined) this.#clearTimeout(timeout);
     if (result.kind === "timeout") {
+      const slot = this.#slot(account);
+      if (expire && slot.inFlight === promise) {
+        slot.inFlight = undefined;
+        slot.generation += 1;
+      }
       this.#log?.warn({ provider: this.#provider, state: "transient", errorClass: "credential_warm", errorCode: "timeout" });
     }
     return result.kind === "completed" ? result.served : undefined;

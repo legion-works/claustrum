@@ -4,7 +4,7 @@ import { dirname, relative, resolve } from 'node:path'
 import type { BindIdentity } from '@cortexkit/subc-client'
 
 export function storageFingerprint(storagePath: string): string {
-  const absolutePath = resolve(storagePath)
+  const absolutePath = storagePath
   let canonicalPath: string
   try {
     canonicalPath = realpathSync(absolutePath)
