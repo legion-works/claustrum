@@ -701,6 +701,10 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
         await hook(cfg, { log: () => {} });
 
         const refusals = await refusalSet(cfg);
+        // `.every()` over an EMPTY model set is vacuously true. The model pins above (non-empty for
+        // extra-key / mis-keyed / metadata-leaf, empty for wrong-typed key / wellknown) are the only
+        // thing that keeps these rows from passing while asserting nothing — do not drop or
+        // "simplify" them without moving that guarantee here.
         expect([...opencodeWouldLoad(source)].every((provider) => refusals.has(provider))).toBe(true);
       }
     }
