@@ -1,5 +1,6 @@
 import { ClaustrumCredentialError, type ServedCredential } from "@cortexkit/claustrum-client";
 
+import { CustodyOwnershipError } from "./errors";
 import type { CustodyLogger } from "./log";
 
 export type FreshnessAccount = {
@@ -200,6 +201,9 @@ export class FreshnessController {
     });
     const result = await Promise.race([promise, deadline]);
     if (timeout !== undefined) this.#clearTimeout(timeout);
+    if (result === undefined) {
+      this.#log?.warn({ provider: this.#provider, state: "transient", errorClass: "credential_warm", errorCode: "timeout" });
+    }
     return result ?? undefined;
   }
 
@@ -244,8 +248,12 @@ export class FreshnessController {
         }
       }
       this.#version = current;
-    } catch {
-      this.#log?.warn({ provider: this.#provider, errorClass: "handle_file", errorCode: "unreadable" });
+    } catch (error) {
+      const refusal = new CustodyOwnershipError(
+        `could not verify custody handle ownership: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      this.#log?.error({ provider: this.#provider, errorClass: refusal.name, errorMessage: refusal.message });
+      throw refusal;
     }
   }
 }

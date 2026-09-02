@@ -3,7 +3,7 @@ import {
   type ServedCredential,
 } from "@cortexkit/claustrum-client";
 
-import { CustodyAuthReadError, CustodyExhaustionError, CustodyRedirectRefusedError, CustodySplitError } from "./errors";
+import { CustodyAuthReadError, CustodyExhaustionError, CustodyOwnershipError, CustodyRedirectRefusedError, CustodyRequestError, CustodySplitError } from "./errors";
 import {
   DEFAULT_RETRY_AFTER_MS,
   FreshnessController,
@@ -35,6 +35,7 @@ export type CreateServeFetchOptions = {
   now?: () => number;
   shape?: "api" | "oauth";
   freshness?: FreshnessController;
+  verifyOwnership?: () => Promise<void>;
   log?: CustodyLogger;
 };
 
@@ -44,13 +45,20 @@ type AccountRuntime = {
 
 const REPORT_BUDGET_MS = 100;
 
-async function reportWithinBudget(report: Promise<void>): Promise<void> {
+async function reportWithinBudget(report: Promise<void>, onFailure: (errorClass: string, errorCode: string) => void): Promise<void> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
-  await Promise.race([
-    report.catch(() => {}),
-    new Promise<void>((resolve) => { timeout = setTimeout(resolve, REPORT_BUDGET_MS); }),
+  const completed = await Promise.race([
+    report.then(
+      () => true,
+      (error) => {
+        onFailure(error instanceof Error ? error.name : "ReportError", "failed");
+        return true;
+      },
+    ),
+    new Promise<false>((resolve) => { timeout = setTimeout(() => resolve(false), REPORT_BUDGET_MS); }),
   ]);
   if (timeout !== undefined) clearTimeout(timeout);
+  if (!completed) onFailure("ReportTimeout", "timeout");
 }
 
 function cooldownFromRetryAfter(value: string | null, now: number): number {
@@ -87,17 +95,43 @@ export function createServeFetch(options: CreateServeFetchOptions) {
   });
 
   return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const snapshot = await snapshotRequest(input, init, providerSentinel);
+    let snapshot;
+    try {
+      snapshot = await snapshotRequest(input, init, providerSentinel);
+    } catch (error) {
+      const refusal = new CustodyRequestError(
+        `could not prepare custody request: ${error instanceof Error ? error.name : String(error)}`,
+      );
+      options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+      throw refusal;
+    }
     let authEntry: unknown;
     try {
       authEntry = await options.readAuthEntry();
     } catch (error) {
-      throw new CustodyAuthReadError(
+      const refusal = new CustodyAuthReadError(
         `could not read OpenCode auth entry: ${error instanceof Error ? error.name : "unknown error"}`,
       );
+      options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+      throw refusal;
     }
     if (!isProviderTombstone(authEntry, options.provider)) {
-      throw new CustodySplitError("local credential is real while custody handles remain; migrate or restore ownership");
+      const refusal = new CustodySplitError("local credential is real while custody handles remain; migrate or restore ownership");
+      options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+      throw refusal;
+    }
+    if (options.verifyOwnership) {
+      try {
+        await options.verifyOwnership();
+      } catch (error) {
+        const refusal = error instanceof CustodyOwnershipError
+          ? error
+          : new CustodyOwnershipError(
+            `could not verify custody handle ownership: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+        throw refusal;
+      }
     }
 
     for (const { account } of accounts) {
@@ -109,8 +143,27 @@ export function createServeFetch(options: CreateServeFetchOptions) {
       let target: URL | undefined;
       let methodOverride: string | undefined;
       for (let hop = 0; hop <= 5; hop += 1) {
-        const forwarded = snapshot.withMaterial(attempt.material, target, methodOverride);
-        const response = await options.upstreamFetch(forwarded);
+        let forwarded: Request;
+        try {
+          forwarded = snapshot.withMaterial(attempt.material, target, methodOverride);
+        } catch (error) {
+          const refusal = new CustodyRequestError(
+            `could not substitute custody credential: ${error instanceof Error ? error.name : String(error)}`,
+          );
+          options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+          throw refusal;
+        }
+        let response: Response;
+        try {
+          response = await options.upstreamFetch(forwarded);
+        } catch (error) {
+          options.log?.error({
+            provider: options.provider,
+            errorClass: error instanceof Error ? error.name : "UpstreamFetchError",
+            errorMessage: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
         if (response.status < 300 || response.status >= 400) {
           if (response.status === 401) {
             options.log?.warn({
@@ -122,12 +175,21 @@ export function createServeFetch(options: CreateServeFetchOptions) {
             });
             await discard(response);
             try {
-              await reportWithinBudget(options.client.reportAuthFailure({
-                handle: account.handle,
-                providerStatus: 401,
-                recordVersion: attempt.recordVersion,
-                reporterSource: "direct",
-              }));
+              await reportWithinBudget(
+                options.client.reportAuthFailure({
+                  handle: account.handle,
+                  providerStatus: 401,
+                  recordVersion: attempt.recordVersion,
+                  reporterSource: "direct",
+                }),
+                (errorClass, errorCode) => options.log?.warn({
+                  provider: options.provider,
+                  label: account.label,
+                  credentialId: account.credential_id,
+                  errorClass,
+                  errorCode,
+                }),
+              );
             } finally {
               freshness.invalidate(account);
             }
@@ -159,15 +221,29 @@ export function createServeFetch(options: CreateServeFetchOptions) {
         }
         const location = response.headers.get("Location");
         if (!location) return response;
-        const fromOrigin = new URL(forwarded.url).origin;
-        const next = new URL(location, forwarded.url);
+        let fromOrigin: string;
+        let next: URL;
+        try {
+          fromOrigin = new URL(forwarded.url).origin;
+          next = new URL(location, forwarded.url);
+        } catch (error) {
+          const refusal = new CustodyRequestError(
+            `could not validate custody redirect: ${error instanceof Error ? error.name : String(error)}`,
+          );
+          options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+          throw refusal;
+        }
         if (next.origin !== fromOrigin) {
           await discard(response);
-          throw new CustodyRedirectRefusedError(options.provider, fromOrigin, next.origin);
+          const refusal = new CustodyRedirectRefusedError(options.provider, fromOrigin, next.origin);
+          options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+          throw refusal;
         }
         if (hop === 5) {
           await discard(response);
-          throw new CustodyRedirectRefusedError(options.provider, fromOrigin, next.origin);
+          const refusal = new CustodyRedirectRefusedError(options.provider, fromOrigin, next.origin);
+          options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+          throw refusal;
         }
         await discard(response);
         target = next;
@@ -180,6 +256,8 @@ export function createServeFetch(options: CreateServeFetchOptions) {
       continue;
     }
 
-    throw exhaustion(options.provider, accounts, freshness);
+    const refusal = exhaustion(options.provider, accounts, freshness);
+    options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+    throw refusal;
   };
 }

@@ -218,7 +218,7 @@ Four cells, all explicit:
 | tombstone | `opencode-claustrum` | inject `cfg.provider[p].options = { apiKey: SENTINEL(p), fetch }` |
 | tombstone | absent or unreadable handle file | `CustodyOrphan`: log loud, name the fix (`migrate-opencode --serve-by …`), inject a REFUSING fetch because no live owner can be proven |
 | tombstone | other owner | not ours — inject nothing, debug log only; the named owner serves it |
-| real credential | `opencode-claustrum` | `SplitCustody`: log loud; inject a REFUSING `fetch` that rejects with `CustodySplitError` before any request leaves the process (`apiKey` untouched). Serving either copy is wrong: the local key rotates the family away from the vault; the vault copy ignores what the operator just wrote. v2.1 said "inject nothing" — live acceptance arm 2 showed that lets stock OpenCode serve the local key, so "serve neither" was not achieved. Never throw from the `config` hook itself: that takes down every provider, not the split one. |
+| real credential | `opencode-claustrum` | `SplitCustody`: log loud; inject a REFUSING `fetch` that rejects with `CustodySplitError` before any request leaves the process (`apiKey` untouched). Serving either copy is wrong: the local key rotates the family away from the vault; the vault copy ignores what the operator just wrote. Never throw from the `config` hook itself: that takes down every provider, not the split one. |
 | real credential | absent | not ours; untouched |
 
 The third cell is the hazard specific to the config hook: `1485`/`1646` merge unvalidated,
@@ -341,5 +341,6 @@ cells raise typed `CustodyOrphan` / `SplitCustody` · logger capture asserting n
   can look configured. It is non-secret; upstream redaction/status separation remains a
   possible later improvement.
 - Native LLM mode bypasses generic provider `options.fetch` for API auth on stock 1.18.25;
-  custody detects `OPENCODE_EXPERIMENTAL_NATIVE_LLM=1` and refuses observed entries.
+  custody serves only when `OPENCODE_EXPERIMENTAL_NATIVE_LLM` is absent or exactly `false`, `no`,
+  `off`, `0`, or `n`, and otherwise refuses observed entries.
 - Two languages and three suites pin one tombstone shape; the golden file is the only defence.

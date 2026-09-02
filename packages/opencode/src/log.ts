@@ -11,6 +11,7 @@ export type CustodyLogEntry = {
   cooldownUntil?: number;
   errorClass?: string;
   errorCode?: string;
+  errorMessage?: string;
 };
 
 export type LogSink = (entry: CustodyLogEntry) => void;

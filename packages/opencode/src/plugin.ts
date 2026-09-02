@@ -6,7 +6,9 @@ import type { Plugin } from "@opencode-ai/plugin";
 
 import {
   AuthFileValidationError,
+  CustodyAuthReadError,
   CustodyNativeRuntimeError,
+  CustodyOwnershipError,
   CustodyOrphanError,
   CustodySplitError,
   HandleFileValidationError,
@@ -46,13 +48,20 @@ async function readAuthFile(path: string): Promise<Record<string, unknown>> {
     if ((await stat(path)).size > AUTH_FILE_MAX_BYTES) {
       throw new AuthFileValidationError("auth file exceeds 1 MiB");
     }
-    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    let value: unknown;
+    try {
+      value = JSON.parse(await readFile(path, "utf8"));
+    } catch (error) {
+      if (error instanceof AuthFileValidationError) throw error;
+      throw new AuthFileValidationError(`auth file contains invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return value && typeof value === "object" && !Array.isArray(value)
       ? value as Record<string, unknown>
       : {};
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw error;
+    if (error instanceof AuthFileValidationError) throw error;
+    throw new AuthFileValidationError(`cannot read auth file: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -88,7 +97,13 @@ function logError(log: CustodyLogger, error: Error, provider: string) {
     provider,
     errorClass: error.name,
     errorCode: (error as NodeJS.ErrnoException).code,
+    errorMessage: error.message,
   });
+}
+
+function authReadRefusal(error: unknown): CustodyAuthReadError {
+  const cause = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return new CustodyAuthReadError(`auth-read failure: ${cause}`);
 }
 
 export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependencies = {}): Plugin {
@@ -147,16 +162,6 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             fetch: async () => { throw error; },
           };
         };
-        let auth: Record<string, unknown>;
-        try {
-          auth = await readAuth(defaultAuthPath(), authReader);
-        } catch (error) {
-          log.error({
-            errorClass: error instanceof Error ? error.name : "AuthReadError",
-            errorCode: (error as NodeJS.ErrnoException).code,
-          });
-          return;
-        }
         let handles: OpenCodeHandleFileV1;
         try {
           handles = await handleReader(defaultHandleFilePath());
@@ -165,13 +170,36 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             ? error
             : new HandleFileValidationError(error instanceof Error ? error.message : String(error));
           logError(log, typed, "handle-file");
+          let auth: Record<string, unknown>;
+          try {
+            auth = await readAuth(defaultAuthPath(), authReader);
+          } catch (authError) {
+            const refusal = authReadRefusal(authError);
+            for (const provider of Object.keys(providerConfig)) {
+              logError(log, refusal, provider);
+              configureRefusal(provider, refusal);
+            }
+            return;
+          }
           for (const [provider, entry] of Object.entries(auth)) {
             if (!isProviderTombstone(entry, provider)) continue;
             const refusal = new CustodyOrphanError(
-              "tombstone ownership cannot be proven while the handle file is unreadable; run ck auth migrate-opencode",
+              `handle file unavailable: ${typed.message}; tombstone ownership cannot be proven; run ck auth migrate-opencode`,
             );
             logError(log, refusal, provider);
             configureRefusal(provider, refusal);
+          }
+          return;
+        }
+        let auth: Record<string, unknown>;
+        try {
+          auth = await readAuth(defaultAuthPath(), authReader);
+        } catch (error) {
+          const refusal = authReadRefusal(error);
+          for (const handle of handles.providers) {
+            if (handle.serve !== OUR_PLUGIN_ID) continue;
+            logError(log, refusal, handle.provider);
+            configureRefusal(handle.provider, refusal);
           }
           return;
         }
@@ -218,13 +246,12 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             continue;
           }
 
-          // The native runtime reads `provider.options.apiKey` directly and never consults
-          // `options.fetch` (session/llm/native-runtime.ts, statusWithFetch), so with it on the
-          // sentinel would go to the wire as the key. OpenCode parses the flag with Effect's
-          // Config.boolean (effect/runtime-flags.ts:57): true/yes/on/1, case-insensitive.
+          // The native runtime reads `provider.options.apiKey` directly instead of this fetch
+          // seam. Its case-sensitive flag parser therefore gets an allowlist, not a best guess.
           if (nativeLlmEnabled(process.env.OPENCODE_EXPERIMENTAL_NATIVE_LLM)) {
+            const observed = process.env.OPENCODE_EXPERIMENTAL_NATIVE_LLM;
             const refusal = new CustodyNativeRuntimeError(
-              "OpenCode native LLM mode bypasses the custody fetch seam; unset OPENCODE_EXPERIMENTAL_NATIVE_LLM",
+              `OpenCode native LLM mode bypasses the custody fetch seam; OPENCODE_EXPERIMENTAL_NATIVE_LLM=${observed} must be unset or disabled`,
             );
             logError(log, refusal, provider);
             configureRefusal(provider, refusal);
@@ -256,6 +283,21 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
               client,
               shape: handle!.shape,
               freshness,
+              verifyOwnership: async () => {
+                let current: OpenCodeHandleFileV1;
+                try {
+                  current = await handleReader(defaultHandleFilePath());
+                } catch (error) {
+                  throw new CustodyOwnershipError(
+                    `could not verify custody handle ownership: ${error instanceof Error ? error.message : String(error)}`,
+                  );
+                }
+                if (current.providers.find((candidate) => candidate.provider === provider)?.serve !== OUR_PLUGIN_ID) {
+                  throw new CustodyOwnershipError(
+                    `custody handle ownership changed for provider=${provider}; reload OpenCode after ck auth migrate-opencode`,
+                  );
+                }
+              },
               readAuthEntry: async () => (await readAuth(defaultAuthPath(), authReader))[provider],
               upstreamFetch,
               log,

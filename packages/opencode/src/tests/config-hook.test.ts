@@ -18,6 +18,9 @@ type TestConfig = {
   provider: Record<string, { options?: Record<string, unknown>; models?: Record<string, unknown> }>;
 };
 
+type RefusalProbe = { apiKey: unknown; forwarded: number };
+const refusalProbes = new WeakMap<TestConfig, Map<string, RefusalProbe>>();
+
 function useEnv(key: string, value: string | undefined) {
   if (!savedEnv.has(key)) savedEnv.set(key, process.env[key]);
   if (value === undefined) delete process.env[key];
@@ -75,6 +78,29 @@ function config(...providers: string[]): TestConfig {
   };
 }
 
+function prepareRefusalProbe(cfg: TestConfig, provider: string) {
+  const options = cfg.provider[provider]?.options;
+  if (!options) throw new Error(`missing test provider ${provider}`);
+  const probe = { apiKey: options.apiKey, forwarded: 0 };
+  options.fetch = async () => {
+    probe.forwarded += 1;
+    return new Response("must not forward");
+  };
+  const probes = refusalProbes.get(cfg) ?? new Map<string, RefusalProbe>();
+  probes.set(provider, probe);
+  refusalProbes.set(cfg, probes);
+}
+
+async function expectRefusal(cfg: TestConfig, provider: string, cause: RegExp) {
+  const probe = refusalProbes.get(cfg)?.get(provider);
+  if (!probe) throw new Error(`missing refusal probe for ${provider}`);
+  const options = cfg.provider[provider]?.options;
+  expect(options?.apiKey).toBe(probe.apiKey);
+  expect(options?.fetch).toBeFunction();
+  await expect((options?.fetch as typeof globalThis.fetch)("https://upstream.example")).rejects.toThrow(cause);
+  expect(probe.forwarded).toBe(0);
+}
+
 async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
   const hooks = await createOpencodeClaustrumPlugin(deps)({} as never);
   await hooks.config?.(cfg as never);
@@ -117,21 +143,14 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     const logs: string[] = [];
     const cfg = config("deepseek");
     cfg.provider.deepseek.options!.apiKey = "local-key";
-    let forwarded = 0;
+    prepareRefusalProbe(cfg, "deepseek");
 
     await hook(cfg, {
       log: (line) => logs.push(line),
-      fetch: (async () => {
-        forwarded += 1;
-        return new Response("must not forward");
-      }) as never,
     });
 
     expect(logs.join("\n")).toContain("CustodySplitError");
-    expect(cfg.provider.deepseek.options?.apiKey).toBe("local-key");
-    expect(typeof cfg.provider.deepseek.options?.fetch).toBe("function");
-    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example")).rejects.toBeInstanceOf(CustodySplitError);
-    expect(forwarded).toBe(0);
+    await expectRefusal(cfg, "deepseek", /local credential is real/);
   });
 
   test("refuses requests for a tombstone without a handle entry", async () => {
@@ -140,16 +159,15 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
     const logs: string[] = [];
     const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
 
     await hook(cfg, { log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("CustodyOrphanError");
-    expect(typeof cfg.provider.deepseek.options?.fetch).toBe("function");
-    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
-      .rejects.toThrow("migrate-opencode");
+    await expectRefusal(cfg, "deepseek", /no serving handle/);
   });
 
-  test("logs CustodyOrphanError and injects nothing when an owned handle has no auth.json entry", async () => {
+  test("logs CustodyOrphanError and leaves an owned handle without an auth.json entry unconfigured", async () => {
     const files = await fixture("missing-auth-owned-handle");
     await writeHandles(files.handles, handles("deepseek"));
     await writeAuth(files.auth, {});
@@ -187,6 +205,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
     const calls = { detect: 0, connect: 0 };
     const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
 
     await hook(cfg, {
       detect: async () => { calls.detect += 1; return { status: "available", schema: 1, wireVersion: 1, endpoints: [] }; },
@@ -194,9 +213,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     });
 
     expect(calls).toEqual({ detect: 0, connect: 0 });
-    expect(typeof cfg.provider.deepseek.options?.fetch).toBe("function");
-    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
-      .rejects.toThrow("migrate-opencode");
+    await expectRefusal(cfg, "deepseek", /handle file unavailable/);
   });
 
   test("uses CLAUSTRUM_OPENCODE_HANDLES before the XDG default path", async () => {
@@ -214,18 +231,19 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(cfg.provider.xai.options?.apiKey).toBeUndefined();
   });
 
-  test("refuses a non-0600 handle file and injects nothing", async () => {
+  test("refuses a non-0600 handle file with a typed ownership cause", async () => {
     const files = await fixture("bad-mode");
     await writeHandles(files.handles, handles("deepseek"));
     await chmod(files.handles, 0o640);
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
     const logs: string[] = [];
     const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
 
     await hook(cfg, { log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("HandleFileValidationError");
-    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    await expectRefusal(cfg, "deepseek", /mode must be exactly 0600/);
   });
 
   test("refuses a handle file owned by another uid through injectable stat metadata", async () => {
@@ -234,6 +252,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
     const logs: string[] = [];
     const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
     const handleReader = (path: string) => readHandleFile(path, {
       currentUid: () => 1000,
       stat: async () => ({ isFile: () => true, mode: 0o100600, uid: 1001 }),
@@ -242,7 +261,7 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await hook(cfg, { handleReader, log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("HandleFileValidationError");
-    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    await expectRefusal(cfg, "deepseek", /parent must be a directory/);
   });
 
   test("rejects a world-writable non-sticky handle parent but accepts a uid-owned 0755 parent", async () => {
@@ -264,11 +283,12 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await chmod(join(ROOT, "plugin-handle-parent-mode", "config", "cortexkit"), 0o777);
     const logs: string[] = [];
     const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
 
     await hook(cfg, { log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("HandleFileValidationError");
-    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    await expectRefusal(cfg, "deepseek", /world-writable without sticky bit/);
   });
 
   test("rejects an oversized handle file and never exposes raw handles in its revision", async () => {
@@ -290,17 +310,63 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     await expect(readHandleFile(files.handles)).rejects.toThrow("symlink");
   });
 
-  test("refuses an oversized auth.json before it can configure a custody fetch", async () => {
+  test("refuses an oversized auth.json with a typed auth-read failure before it can configure custody", async () => {
     const files = await fixture("large-auth-file");
     await writeHandles(files.handles, handles("deepseek"));
     await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek"), padding: "x".repeat(1024 * 1024) });
     const logs: string[] = [];
     const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
 
     await hook(cfg, { log: (line) => logs.push(line) });
 
     expect(logs.join("\n")).toContain("AuthFileValidationError");
-    expect(cfg.provider.deepseek.options?.apiKey).toBeUndefined();
+    expect(logs.join("\n")).toContain("exceeds 1 MiB");
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*exceeds 1 MiB/);
+  });
+
+  test("refuses an unparseable auth.json with a typed auth-read failure", async () => {
+    const files = await fixture("invalid-auth-file");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeFile(files.auth, "{");
+    await chmod(files.auth, 0o600);
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+    prepareRefusalProbe(cfg, "deepseek");
+
+    await hook(cfg, { log: (line) => logs.push(line) });
+
+    expect(logs.join("\n")).toContain("AuthFileValidationError");
+    expect(logs.join("\n")).toContain("invalid JSON");
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*invalid JSON/);
+  });
+
+  test("refuses an unreadable auth source for every owned handle provider", async () => {
+    const files = await fixture("unreadable-auth-source");
+    await writeHandles(files.handles, {
+      version: 1,
+      providers: [
+        handles("deepseek").providers[0],
+        handles("xai").providers[0],
+      ],
+    });
+    const logs: string[] = [];
+    const cfg = config("deepseek", "xai");
+    prepareRefusalProbe(cfg, "deepseek");
+    prepareRefusalProbe(cfg, "xai");
+
+    await hook(cfg, {
+      authReader: async () => {
+        const error = new Error("permission denied");
+        Object.assign(error, { code: "EACCES" });
+        throw error;
+      },
+      log: (line) => logs.push(line),
+    });
+
+    expect(logs.join("\n")).toContain("auth-read failure");
+    await expectRefusal(cfg, "deepseek", /auth-read failure.*permission denied/);
+    await expectRefusal(cfg, "xai", /auth-read failure.*permission denied/);
   });
 
   test("preserves provider and account order when injecting each owned tombstone", async () => {
@@ -378,6 +444,35 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(forwarded).toBe(0);
   });
 
+  test("refuses a request before forwarding when the handle file no longer proves ownership", async () => {
+    const files = await fixture("request-handle-ownership");
+    await writeHandles(files.handles, handles("deepseek"));
+    await writeAuth(files.auth, { deepseek: tombstoneFor("api", "deepseek") });
+    const logs: string[] = [];
+    const cfg = config("deepseek");
+    let forwarded = 0;
+
+    await hook(cfg, {
+      detect: async () => ({ status: "available", schema: 1, wireVersion: 1, endpoints: [] }),
+      clientFactory: async () => ({
+        getCredential: async () => ({ material: "vault-material", recordVersion: 1, expiresAtMs: null }),
+        reportAuthFailure: async () => {},
+      }) as never,
+      fetch: (async () => {
+        forwarded += 1;
+        return new Response("must not forward");
+      }) as never,
+      log: (line) => logs.push(line),
+    });
+    await chmod(files.handles, 0o640);
+
+    await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example", {
+      headers: { Authorization: `Bearer ${sentinel("deepseek")}` },
+    })).rejects.toThrow(/could not verify custody handle ownership.*mode must be exactly 0600/);
+    expect(forwarded).toBe(0);
+    expect(logs.join("\n")).toContain("mode must be exactly 0600");
+  });
+
   test("reconnects after a transient connection failure and its backoff", async () => {
     let now = 0;
     let available = false;
@@ -431,12 +526,9 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
     expect(logs[0]).toContain("custody_disabled");
   });
 
-  // OpenCode reads the flag through Effect's Config.boolean (effect dist/Config.js:541-562):
-  // enabling spellings `true yes on 1 y`, disabling `false no off 0 n`, CASE-SENSITIVE. The guard
-  // fails closed: only the five disabling spellings (or absence) let custody serve. `TRUE` and
-  // `maybe` do not enable OpenCode's native runtime, but they are refused anyway rather than
-  // guessed at — an under-firing guard here sends the sentinel to the wire as the key.
-  for (const value of ["1", "true", "yes", "on", "y", "TRUE", "maybe", " 1"]) {
+  // OpenCode parses the flag case-sensitively. Serving only on absence or a documented disabling
+  // value prevents an unrecognized future value from exposing the sentinel through native auth.
+  for (const value of ["1", "true", "yes", "on", "y", "fasle", "TRUE", "maybe", " 1"]) {
     test(`refuses observed tombstones when native LLM mode is enabled with ${JSON.stringify(value)}`, async () => {
       const files = await fixture(`native-llm-${value.replace(/[^a-z0-9]/gi, "_")}-${value === value.toLowerCase() ? "l" : "u"}`);
       await writeHandles(files.handles, handles("deepseek"));
@@ -444,12 +536,13 @@ async function hook(cfg: TestConfig, deps: ConfigHookDependencies = {}) {
       useEnv("OPENCODE_EXPERIMENTAL_NATIVE_LLM", value);
       const logs: string[] = [];
       const cfg = config("deepseek");
+      prepareRefusalProbe(cfg, "deepseek");
 
       await hook(cfg, { log: (line) => logs.push(line) });
 
       expect(logs.join("\n")).toContain("CustodyNativeRuntimeError");
-      await expect((cfg.provider.deepseek.options?.fetch as typeof globalThis.fetch)("https://upstream.example"))
-        .rejects.toThrow("native LLM");
+      expect(logs.join("\n")).toContain(`OPENCODE_EXPERIMENTAL_NATIVE_LLM=${value}`);
+      await expectRefusal(cfg, "deepseek", new RegExp(`OPENCODE_EXPERIMENTAL_NATIVE_LLM=${value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
     });
   }
 
