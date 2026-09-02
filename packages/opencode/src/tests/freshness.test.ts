@@ -182,9 +182,10 @@ describe("custody freshness", () => {
     // Handle file changes; NO concurrent resolve that would bump the generation.
     version = "two";
     pending.resolve(credential("stale"));
-    await first;
+    const firstResult = await first;
     await Promise.resolve();
 
+    expect(firstResult).toBeUndefined();
     // The post-RPC check re-reads the handle revision at least once more.
     expect(versionReads).toBeGreaterThan(readsAfterRefresh);
 

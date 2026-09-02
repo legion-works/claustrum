@@ -201,17 +201,18 @@ describe('ClaustrumClient', () => {
     }
   })
 
-  test('default discovery uses process.env.HOME for the home tier, not userInfo().homedir', async () => {
+  test('default discovery uses process.env.HOME exactly for the home tier, not userInfo().homedir', async () => {
     // P1: the Rust `discover_subc_connection_file` resolves the home tier from
     // `non_empty_env("HOME")` directly — no `getpwuid`-style fallback. The client must
-    // mirror this: when HOME is overridden to a fixture dir holding a production
-    // connection file, the client returns that file rather than the real user's
+    // mirror this byte-for-byte: when HOME contains a trailing space and points to a
+    // fixture dir holding a production connection file, the client returns that file
+    // rather than the trimmed path or the real user's
     // ~/.local/share/cortexkit/run/subc-connection.json. Without the mirror, an
     // override is silently ignored and a daemon started under the test fixture is
     // unreachable, leaving vault-backed requests dead.
     const tempRoot = await mkdtemp(join(tmpdir(), 'claustrum-home-override-'))
     tempDirs.push(tempRoot)
-    const homeDir = join(tempRoot, 'home')
+    const homeDir = join(tempRoot, 'home ')
     await mkdir(homeDir, { recursive: true })
     const fixtureTmp = join(tempRoot, 'tmp')
     await mkdir(fixtureTmp, { recursive: true })

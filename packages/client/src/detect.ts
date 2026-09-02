@@ -43,12 +43,13 @@ const TEMP_SUFFIX = '.connection.json'
 // produce a different token (sanitized user on macOS, the literal "unknown" if all of
 // the lookups miss). The glob is the only way to mirror the daemon without re-deriving
 // the token (which is filesystem-side-effecting per the Rust side comment).
-// The home tier resolves from `$HOME` directly, mirroring `non_empty_env("HOME")` in
-// `discover_subc_connection_file`. The Rust code does NOT fall back to a `getpwuid`-style
-// lookup; the client must not either, or an operator who points HOME at a per-test
-// fixture (CI, a second user, a sandboxed run) loses the daemon they started there.
+// The home tier resolves from `$HOME` byte-for-byte, mirroring `non_empty_env("HOME")`
+// in `discover_subc_connection_file`: only the empty string is absent, and whitespace
+// is not trimmed. The Rust code does NOT fall back to a `getpwuid`-style lookup; the
+// client must not either, or an operator who points HOME at a per-test fixture loses
+// the daemon they started there.
 function homeTierPath(): string | undefined {
-  const homeEnv = process.env.HOME?.trim()
+  const homeEnv = process.env.HOME
   return homeEnv ? join(homeEnv, '.local', 'share', 'cortexkit', 'run', PRODUCTION_FILE_NAME) : undefined
 }
 

@@ -45,10 +45,6 @@ function caseInsensitiveReplace(value: string, sentinel: string, encodedMaterial
   return substituted.replace(encodedSentinelHexInsensitiveRegex(encodedSentinel), encodedMaterial);
 }
 
-function escapeForRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 // Builds a regex for `encodedSentinel` that matches the literal sentinel letters
 // EXACTLY but accepts either case for the hex digits inside each `%XX` escape.
 // Without this, an `i`-flagged regex would also case-fold the sentinel's own
