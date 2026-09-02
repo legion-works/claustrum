@@ -454,6 +454,15 @@ impl From<StoreError> for StoreOpError {
     }
 }
 
+fn normalize_and_validate_record_identity(
+    mut record: VaultRecord,
+) -> Result<VaultRecord, StoreOpError> {
+    let identity = record.identity.clone();
+    record = record.with_identity(identity);
+    record.identity.validate().map_err(StoreOpError::Encode)?;
+    Ok(record)
+}
+
 /// SHA-256 of a record's opaque payload — the value an overwrite CAS compares
 /// against. Computed over the payload bytes only (not the whole record), so a
 /// caller can prove "I am overwriting the payload I last saw" without holding the
@@ -907,7 +916,7 @@ impl EncryptedStore {
         record: &VaultRecord,
         ctx: AuditCtx<'_>,
     ) -> Result<(), StoreOpError> {
-        let mut record = record.clone();
+        let mut record = normalize_and_validate_record_identity(record.clone())?;
         record.record_version = 1;
         let blob = self.seal_record(credential_id, &record)?;
         let key_id_hex = self.key_id.to_hex();
@@ -1001,7 +1010,7 @@ impl EncryptedStore {
             return Err(StoreOpError::CasMismatch);
         }
         let next_version = current.record_version.saturating_add(1);
-        let mut record = record.clone();
+        let mut record = normalize_and_validate_record_identity(record.clone())?;
         record.record_version = next_version;
         let blob = self.seal_record(credential_id, &record)?;
         let key_id_hex = self.key_id.to_hex();
@@ -1053,8 +1062,29 @@ impl EncryptedStore {
     }
 
     /// Overwrite an existing record UNCONDITIONALLY (no CAS), re-sealing it at
+    /// `current_version + 1` and resetting its state to `active`, while preserving an
+    /// existing identity when the replacement does not provide one. This is the normal
+    /// token-rotation path; callers that intentionally clear identity use
+    /// [`Self::overwrite_unconditional_with_identity_policy_audited`].
+    pub fn overwrite_unconditional_audited(
+        &self,
+        credential_id: &str,
+        record: &VaultRecord,
+        ctx: AuditCtx<'_>,
+    ) -> Result<(), StoreOpError> {
+        self.overwrite_unconditional_with_identity_policy_audited(credential_id, record, true, ctx)
+    }
+
+    /// Overwrite an existing record UNCONDITIONALLY (no CAS), re-sealing it at
     /// `current_version + 1` and resetting its state to `active`, with an explicit
     /// audit context. Fails [`StoreOpError::NotFound`] if the id is absent.
+    ///
+    /// When `preserve_existing_identity` is true and `record` has no identity, carries
+    /// the existing identity into the replacement. Identity describes the account rather
+    /// than the token, so re-importing rotated tokens must not erase account labelling.
+    /// An undecryptable existing envelope is treated as no identity so repair still
+    /// replaces corrupted material. Passing false makes an empty incoming identity an
+    /// explicit clear.
     ///
     /// Unlike [`overwrite_cas_audited`], this reads the current version via `meta`
     /// (plaintext columns, NO decrypt) rather than `get`, so it works even when the
@@ -1064,12 +1094,14 @@ impl EncryptedStore {
     /// one. The handles table is untouched, so existing handles keep resolving to this
     /// id (no re-mint). The version bump + state reset + intent clear + audit entry all
     /// commit in ONE fenced transaction.
-    pub fn overwrite_unconditional_audited(
+    pub fn overwrite_unconditional_with_identity_policy_audited(
         &self,
         credential_id: &str,
         record: &VaultRecord,
+        preserve_existing_identity: bool,
         ctx: AuditCtx<'_>,
     ) -> Result<(), StoreOpError> {
+        let incoming = normalize_and_validate_record_identity(record.clone())?;
         let key_id_hex = self.key_id.to_hex();
         let now = now_ms();
         let audit_key = self.audit_key.clone();
@@ -1087,19 +1119,37 @@ impl EncryptedStore {
         // concurrent delete), which cannot happen under the single writer, so the
         // guard is belt-and-suspenders that also documents the invariant.
         let outcome = self.fenced_write(|tx| {
-            let current_version: Option<i64> = tx
+            let existing: Option<(i64, Vec<u8>)> = tx
                 .query_row(
-                    "SELECT record_version FROM credentials WHERE credential_id = ?1",
+                    "SELECT record_version, envelope FROM credentials WHERE credential_id = ?1",
                     rusqlite::params![credential_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let Some(current_version) = current_version else {
+            let Some((current_version, existing_envelope)) = existing else {
                 return Ok(None); // NotFound: signalled to the caller below.
             };
             let next_version = (current_version as u64).saturating_add(1);
 
-            let mut sealed = record.clone();
+            let mut sealed = incoming.clone();
+            if preserve_existing_identity && sealed.identity.is_empty() {
+                let existing_identity = envelope::open(
+                    &self.key,
+                    &existing_envelope,
+                    &RecordBinding {
+                        credential_id,
+                        record_version: current_version as u64,
+                    },
+                )
+                .ok()
+                .and_then(|plaintext| VaultRecord::decode(&plaintext).ok())
+                .map(|existing| existing.identity);
+                if let Some(identity) =
+                    existing_identity.filter(|identity| identity.validate().is_ok())
+                {
+                    sealed.identity = identity;
+                }
+            }
             sealed.record_version = next_version;
             // seal_record is pure crypto (no DB), safe to call inside the txn.
             let blob = self
@@ -1135,6 +1185,91 @@ impl EncryptedStore {
                 )?;
             }
             Ok(Some(n))
+        })?;
+        match outcome {
+            None => Err(StoreOpError::NotFound),
+            Some(0) => Err(StoreOpError::CasMismatch),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Replace only non-secret account identity, preserving every secret field and the
+    /// record's lifecycle state. The envelope must be re-sealed, so `record_version`
+    /// advances and lets consumers treat the identity update as fresh record metadata.
+    /// This opens the envelope without the normal serving-state gate: identity is safe
+    /// to correct on `needs_reauth` or `retired` records, but an undecryptable record
+    /// cannot be labelled because there is no trustworthy material to preserve.
+    pub fn set_identity_audited(
+        &self,
+        credential_id: &str,
+        identity: crate::record::RecordIdentity,
+        ctx: AuditCtx<'_>,
+    ) -> Result<(), StoreOpError> {
+        let identity = identity.normalized();
+        identity.validate().map_err(StoreOpError::Encode)?;
+        let key_id_hex = self.key_id.to_hex();
+        let now = now_ms();
+        let audit_key = self.audit_key.clone();
+        let outcome = self.fenced_write(|tx| {
+            let existing: Option<(i64, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT record_version, envelope FROM credentials WHERE credential_id = ?1",
+                    rusqlite::params![credential_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((current_version, envelope)) = existing else {
+                return Ok(None);
+            };
+            let plaintext = envelope::open(
+                &self.key,
+                &envelope,
+                &RecordBinding {
+                    credential_id,
+                    record_version: current_version as u64,
+                },
+            )
+            .map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(StoreOpError::Decrypt(error)))
+            })?;
+            let record = VaultRecord::decode(&plaintext).map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(StoreOpError::Corrupt(
+                    error.to_string(),
+                )))
+            })?;
+            let next_version = (current_version as u64).saturating_add(1);
+            let mut updated = record.with_identity(identity.clone());
+            updated.record_version = next_version;
+            let payload_hash_hex = hex32(&payload_hash(&updated.payload));
+            let blob = self
+                .seal_record(credential_id, &updated)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let changed = tx.execute(
+                "UPDATE credentials SET record_version = ?2, key_id = ?3, envelope = ?4, \
+                     updated_at_ms = ?5 WHERE credential_id = ?1 AND record_version = ?6",
+                rusqlite::params![
+                    credential_id,
+                    next_version as i64,
+                    key_id_hex,
+                    blob,
+                    now,
+                    current_version,
+                ],
+            )?;
+            if changed > 0 {
+                append_audit_tx(
+                    tx,
+                    &audit_key,
+                    &AuditRecord {
+                        op: AuditOp::SetIdentity,
+                        credential_id: Some(credential_id.to_string()),
+                        payload_hash: Some(payload_hash_hex),
+                        actor: ctx.actor.to_string(),
+                        alarm: ctx.alarm,
+                    },
+                )?;
+            }
+            Ok(Some(changed))
         })?;
         match outcome {
             None => Err(StoreOpError::NotFound),
@@ -3559,7 +3694,7 @@ mod tests {
                 expires_at_ms: Some(9_999),
                 token_url: "https://t.test/token".into(),
                 client_id: Some("c".into()),
-                scopes: vec![],
+                scopes: vec!["scope-a".into(), "scope-b".into()],
             },
             b"payload-bytes".to_vec(),
         )
@@ -3896,6 +4031,329 @@ mod tests {
             ),
             Err(StoreOpError::NotFound)
         ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_preserves_existing_identity_when_incoming_has_none() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(24);
+        let existing = oauth_record().with_identity(RecordIdentity {
+            account_id: Some("acct-original".to_string()),
+            email: Some("original@example.com".to_string()),
+            org_name: Some("Original Organization".to_string()),
+        });
+        store.create("oauth:anthropic", &existing).expect("create");
+
+        store
+            .overwrite_unconditional_audited(
+                "oauth:anthropic",
+                &oauth_record(),
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("replace");
+
+        assert_eq!(
+            store.get("oauth:anthropic").expect("read").identity,
+            existing.identity,
+            "a token-only re-import must retain the account identity already attached to the id"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_uses_an_incoming_identity_in_preference_to_existing() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(25);
+        let existing = oauth_record().with_identity(RecordIdentity {
+            account_id: Some("acct-original".to_string()),
+            email: Some("original@example.com".to_string()),
+            org_name: None,
+        });
+        let incoming = oauth_record().with_identity(RecordIdentity {
+            account_id: Some("acct-replacement".to_string()),
+            email: Some("replacement@example.com".to_string()),
+            org_name: Some("Replacement Organization".to_string()),
+        });
+        store.create("oauth:anthropic", &existing).expect("create");
+
+        store
+            .overwrite_unconditional_audited(
+                "oauth:anthropic",
+                &incoming,
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("replace");
+
+        assert_eq!(
+            store.get("oauth:anthropic").expect("read").identity,
+            incoming.identity,
+            "explicit import identity must replace stale account metadata"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_keeps_an_identity_empty_when_both_records_lack_one() {
+        let (root, store) = tmp_store(26);
+        store
+            .create("oauth:anthropic", &oauth_record())
+            .expect("create");
+
+        store
+            .overwrite_unconditional_audited(
+                "oauth:anthropic",
+                &oauth_record(),
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("replace");
+
+        assert!(
+            store
+                .get("oauth:anthropic")
+                .expect("read")
+                .identity
+                .is_empty(),
+            "a replacement cannot synthesize identity where neither record supplied it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_can_explicitly_clear_existing_identity() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(27);
+        let existing = oauth_record().with_identity(RecordIdentity {
+            account_id: Some("acct-original".to_string()),
+            email: Some("original@example.com".to_string()),
+            org_name: None,
+        });
+        store.create("oauth:anthropic", &existing).expect("create");
+
+        store
+            .overwrite_unconditional_with_identity_policy_audited(
+                "oauth:anthropic",
+                &oauth_record(),
+                false,
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("replace with clear");
+
+        assert!(
+            store
+                .get("oauth:anthropic")
+                .expect("read")
+                .identity
+                .is_empty(),
+            "an explicit clear must not be mistaken for token-only replace preservation"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unconditional_overwrite_repairs_a_corrupt_record_without_inventing_identity() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(28);
+        let existing = oauth_record().with_identity(RecordIdentity {
+            account_id: Some("acct-original".to_string()),
+            email: Some("original@example.com".to_string()),
+            org_name: None,
+        });
+        store.create("oauth:anthropic", &existing).expect("create");
+        store
+            .with_raw_conn(|conn| {
+                conn.execute(
+                    "UPDATE credentials SET envelope = X'00' WHERE credential_id = 'oauth:anthropic'",
+                    [],
+                )
+            })
+            .expect("corrupt envelope");
+
+        store
+            .overwrite_unconditional_audited(
+                "oauth:anthropic",
+                &oauth_record(),
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect("repair replace");
+
+        assert!(
+            store
+                .get("oauth:anthropic")
+                .expect("read repaired record")
+                .identity
+                .is_empty(),
+            "a corrupt record cannot supply identity, but it must not block token repair"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn identity_writes_reject_empty_and_control_character_account_ids() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(56);
+        store
+            .create("oauth:anthropic", &oauth_record())
+            .expect("seed record");
+        let empty = store
+            .set_identity_audited(
+                "oauth:anthropic",
+                RecordIdentity {
+                    account_id: Some(String::new()),
+                    email: None,
+                    org_name: None,
+                },
+                AuditCtx::admin(AuditOp::SetIdentity),
+            )
+            .expect_err("empty account id must be rejected at the store sink");
+        assert!(
+            matches!(empty, StoreOpError::Encode(ref message) if message.contains("account_id")),
+            "the returned error must name the invalid non-secret field: {empty}"
+        );
+
+        let control_record = oauth_record().with_identity(RecordIdentity {
+            account_id: Some("acct\u{0007}bad".to_string()),
+            email: None,
+            org_name: None,
+        });
+        let control = store
+            .overwrite_unconditional_audited(
+                "oauth:anthropic",
+                &control_record,
+                AuditCtx::admin(AuditOp::Import),
+            )
+            .expect_err("control characters must be rejected for replacement identity too");
+        assert!(
+            matches!(control, StoreOpError::Encode(ref message) if message.contains("account_id")),
+            "the returned error must name the invalid non-secret field: {control}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_identity_reseals_same_oauth_material_and_audits_the_metadata_change() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(29);
+        let existing = oauth_record();
+        let payload_before = existing.payload.clone();
+        let oauth_before = existing.oauth.clone();
+        store.create("oauth:anthropic", &existing).expect("create");
+        let handle = mint_handle().expect("mint handle");
+        store
+            .put_handle_hash(
+                &handle.hash,
+                "oauth:anthropic",
+                AuditCtx::admin(AuditOp::MintHandle),
+            )
+            .expect("store handle");
+        store
+            .with_raw_conn(|conn| {
+                conn.execute(
+                    "UPDATE credentials SET stale_pending = 1 WHERE credential_id = 'oauth:anthropic'",
+                    [],
+                )
+            })
+            .expect("seed stale marker");
+        let version_before = store.meta("oauth:anthropic").expect("meta").record_version;
+
+        store
+            .set_identity_audited(
+                "oauth:anthropic",
+                RecordIdentity {
+                    account_id: Some("acct-set".to_string()),
+                    email: Some("set@example.com".to_string()),
+                    org_name: Some("Set Organization".to_string()),
+                },
+                AuditCtx::admin(AuditOp::SetIdentity),
+            )
+            .expect("set identity");
+
+        let record = store.get("oauth:anthropic").expect("read");
+        let meta = store.meta("oauth:anthropic").expect("meta");
+        assert_eq!(
+            record.payload, payload_before,
+            "identity must not rotate payload bytes"
+        );
+        assert_eq!(
+            record.oauth, oauth_before,
+            "identity must not replace OAuth material"
+        );
+        assert_eq!(record.identity.account_id.as_deref(), Some("acct-set"));
+        assert_eq!(
+            meta.state,
+            RecordState::Active,
+            "identity must not alter lifecycle state"
+        );
+        assert_eq!(
+            meta.record_version,
+            version_before + 1,
+            "re-sealing advances version"
+        );
+        assert!(
+            meta.stale_pending,
+            "identity-only writes must not clear a consumer's pending refresh verdict"
+        );
+        assert_eq!(
+            store.resolve_handle(&handle.raw).expect("resolve handle"),
+            "oauth:anthropic",
+            "identity-only writes must retain existing capability handles"
+        );
+        assert_eq!(
+            store
+                .read_audit(None)
+                .expect("audit")
+                .last()
+                .expect("entry")
+                .op,
+            "set_identity"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_identity_allows_a_decryptable_needs_reauth_record() {
+        use crate::record::RecordIdentity;
+
+        let (root, store) = tmp_store(30);
+        store
+            .create("oauth:anthropic", &oauth_record())
+            .expect("create");
+        store.invalidate("oauth:anthropic").expect("invalidate");
+
+        store
+            .set_identity_audited(
+                "oauth:anthropic",
+                RecordIdentity {
+                    account_id: Some("acct-labelled".to_string()),
+                    email: None,
+                    org_name: None,
+                },
+                AuditCtx::admin(AuditOp::SetIdentity),
+            )
+            .expect("set identity while needs reauth");
+        assert_eq!(
+            store.meta("oauth:anthropic").expect("meta").state,
+            RecordState::NeedsReauth,
+            "identity metadata must not reactivate the credential"
+        );
+        store
+            .reactivate_audited("oauth:anthropic", AuditCtx::admin(AuditOp::Reactivate))
+            .expect("reactivate");
+        assert_eq!(
+            store
+                .get("oauth:anthropic")
+                .expect("read after reactivation")
+                .identity
+                .account_id
+                .as_deref(),
+            Some("acct-labelled")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

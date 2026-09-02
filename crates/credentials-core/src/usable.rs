@@ -121,6 +121,8 @@ pub struct RecordUsability {
     /// deserializes with the shape intact and serves it: `VaultRecord::decode` is plain
     /// serde and does not pass through the sink.
     pub unservable_identity: bool,
+    /// The non-secret account id operators use to distinguish OAuth credentials.
+    pub account_id: Option<String>,
 }
 
 /// Why a scan could not start. Distinguished from a per-record failure, which is
@@ -278,6 +280,7 @@ pub fn scan(conn: &Connection, key: &MasterKey) -> Result<Vec<RecordUsability>, 
                         why: format!("{e:?}"),
                     },
                     unservable_identity: false,
+                    account_id: None,
                 });
                 continue;
             }
@@ -292,6 +295,7 @@ pub fn scan(conn: &Connection, key: &MasterKey) -> Result<Vec<RecordUsability>, 
                         why: format!("undecodable: {e}"),
                     },
                     unservable_identity: false,
+                    account_id: None,
                 });
                 continue;
             }
@@ -323,6 +327,7 @@ pub fn scan(conn: &Connection, key: &MasterKey) -> Result<Vec<RecordUsability>, 
             state,
             usability,
             unservable_identity: !record.identity.is_servable(),
+            account_id: record.identity.account_id,
         });
     }
     Ok(out)

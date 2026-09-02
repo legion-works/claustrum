@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditRecord;
 use crate::audit::{AuditCtx, AuditOp};
-use crate::record::VaultRecord;
+use crate::record::{RecordIdentity, VaultRecord};
 use crate::store::{mint_handle, EncryptedStore, GrantOperation, StoreOpError};
 
 /// The admin-op schema version. Bumped only on a breaking op-body change; the
@@ -37,6 +37,14 @@ pub enum AdminOpBody {
         record: Box<VaultRecord>,
         audit_op: AdminAuditOp,
         mode: StoreMode,
+    },
+    /// Update only the non-secret identity attached to an existing record. The store
+    /// re-seals the unchanged credential material and keeps its lifecycle state.
+    #[serde(rename = "admin.set_identity")]
+    SetIdentity {
+        v: u32,
+        id: String,
+        identity: RecordIdentity,
     },
     #[serde(rename = "admin.invalidate")]
     Invalidate { v: u32, id: String },
@@ -152,6 +160,12 @@ impl std::fmt::Debug for AdminOpBody {
                 .field("audit_op", audit_op)
                 .field("mode", mode)
                 .finish(),
+            AdminOpBody::SetIdentity { v, id, identity } => f
+                .debug_struct("SetIdentity")
+                .field("v", v)
+                .field("id", id)
+                .field("identity", identity)
+                .finish(),
             AdminOpBody::Invalidate { v, id } => f
                 .debug_struct("Invalidate")
                 .field("v", v)
@@ -234,6 +248,7 @@ impl AdminOpBody {
     pub fn schema_version(&self) -> u32 {
         match self {
             AdminOpBody::Store { v, .. }
+            | AdminOpBody::SetIdentity { v, .. }
             | AdminOpBody::Invalidate { v, .. }
             | AdminOpBody::Logout { v, .. }
             | AdminOpBody::Reactivate { v, .. }
@@ -260,6 +275,7 @@ impl AdminOpBody {
                 credential_id: id, ..
             }
             | AdminOpBody::Store { id, .. }
+            | AdminOpBody::SetIdentity { id, .. }
             | AdminOpBody::Invalidate { id, .. }
             | AdminOpBody::Logout { id, .. }
             | AdminOpBody::Reactivate { id, .. }
@@ -354,9 +370,13 @@ pub fn apply(
             let ctx = AuditCtx::route_admin(audit_op.to_audit_op(), actor);
             match mode {
                 StoreMode::Create => store.create_audited(&id, &record, ctx)?,
-                StoreMode::ReplaceUnconditional => {
-                    store.overwrite_unconditional_audited(&id, &record, ctx)?
-                }
+                StoreMode::ReplaceUnconditional { clear_identity } => store
+                    .overwrite_unconditional_with_identity_policy_audited(
+                        &id,
+                        &record,
+                        !clear_identity,
+                        ctx,
+                    )?,
                 StoreMode::ReplaceCas { expected_hash_hex } => {
                     let expected = decode_hash32(&expected_hash_hex)
                         .ok_or_else(|| StoreOpError::Encode("bad expected hash hex".into()))?;
@@ -364,6 +384,14 @@ pub fn apply(
                 }
             }
             Ok(serde_json::json!({ "stored": true }))
+        }
+        AdminOpBody::SetIdentity { id, identity, .. } => {
+            store.set_identity_audited(
+                &id,
+                identity,
+                AuditCtx::route_admin(AuditOp::SetIdentity, actor),
+            )?;
+            Ok(serde_json::json!({ "identity_updated": true }))
         }
         AdminOpBody::Invalidate { id, .. } => {
             let ctx = AuditCtx::route_admin(AuditOp::Invalidate, actor);
@@ -543,7 +571,12 @@ pub enum StoreMode {
     Create,
     /// Unconditional overwrite (version-guarded internally): the re-login / re-import
     /// replace that keeps the handle.
-    ReplaceUnconditional,
+    ReplaceUnconditional {
+        /// `import --clear-identity` is the one replacement that must not retain an
+        /// identity absent from the incoming record.
+        #[serde(default)]
+        clear_identity: bool,
+    },
     /// CAS overwrite gated on the current payload hash (lowercase hex).
     ReplaceCas { expected_hash_hex: String },
 }

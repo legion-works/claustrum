@@ -173,7 +173,9 @@ pub fn cmd_login(
                 &id,
                 record,
                 credentials_core::admin_ops::AdminAuditOp::Login,
-                credentials_core::admin_ops::StoreMode::ReplaceUnconditional,
+                credentials_core::admin_ops::StoreMode::ReplaceUnconditional {
+                    clear_identity: false,
+                },
             ),
         )?;
         println!("logged in and replaced {id}");

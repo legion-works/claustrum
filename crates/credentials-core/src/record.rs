@@ -136,6 +136,40 @@ pub struct RecordIdentity {
 }
 
 impl RecordIdentity {
+    /// Validate the bounded non-secret labels before a store write. Keeping this at
+    /// the record boundary prevents authenticated admin-op bytes from bypassing CLI
+    /// validation and making account grouping depend on malformed metadata.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(account_id) = self.account_id.as_deref() {
+            if account_id.trim().is_empty() {
+                return Err("account_id must not be empty".to_string());
+            }
+            validate_identity_value("account_id", account_id)?;
+        }
+        if let Some(email) = self.email.as_deref() {
+            validate_identity_value("email", email)?;
+        }
+        if let Some(org_name) = self.org_name.as_deref() {
+            validate_identity_value("org_name", org_name)?;
+        }
+        Ok(())
+    }
+
+    /// Drop email-only identity before validation or persistence; consumers join on
+    /// account_id, so keeping its display-only counterpart would advertise a label
+    /// that cannot identify an account.
+    pub(crate) fn normalized(self) -> Self {
+        if self.is_servable() {
+            self
+        } else {
+            RecordIdentity {
+                account_id: None,
+                email: None,
+                org_name: self.org_name,
+            }
+        }
+    }
+
     /// Whether this identity can be served without collapsing a consumer's labelling.
     ///
     /// False for the one shape that looks captured and behaves as though it was not:
@@ -151,6 +185,16 @@ impl RecordIdentity {
     pub fn is_empty(&self) -> bool {
         self.account_id.is_none() && self.email.is_none() && self.org_name.is_none()
     }
+}
+
+fn validate_identity_value(field: &str, value: &str) -> Result<(), String> {
+    if value.len() > 256 {
+        return Err(format!("{field} must be at most 256 bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
 }
 
 /// The vault's typed, at-rest view of one credential. Encrypted as one unit; only
@@ -279,15 +323,7 @@ impl VaultRecord {
     /// Normalising beats refusing: an identity is display metadata, and failing a
     /// login over it would trade a labelling gap for a lost credential.
     pub fn with_identity(mut self, identity: RecordIdentity) -> Self {
-        self.identity = if identity.is_servable() {
-            identity
-        } else {
-            RecordIdentity {
-                account_id: None,
-                email: None,
-                org_name: identity.org_name,
-            }
-        };
+        self.identity = identity.normalized();
         self
     }
 

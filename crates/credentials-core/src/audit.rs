@@ -38,6 +38,9 @@ pub enum AuditOp {
     Login,
     /// An overwrite under a compare-and-set.
     Overwrite,
+    /// A non-secret account identity update that re-seals the existing credential
+    /// material without replacing it.
+    SetIdentity,
     /// An authoritative invalidate (revoke).
     Invalidate,
     /// A master-key rotation (rewrap).
@@ -100,6 +103,7 @@ impl AuditOp {
             AuditOp::Import => "import",
             AuditOp::Login => "login",
             AuditOp::Overwrite => "overwrite",
+            AuditOp::SetIdentity => "set_identity",
             AuditOp::Invalidate => "invalidate",
             AuditOp::RotateMasterKey => "rotate_master_key",
             AuditOp::RefreshCommit => "refresh_commit",
@@ -580,6 +584,7 @@ mod vocabulary_documentation_tests {
                 AuditOp::Import => AuditOp::Import.as_str(),
                 AuditOp::Login => AuditOp::Login.as_str(),
                 AuditOp::Overwrite => AuditOp::Overwrite.as_str(),
+                AuditOp::SetIdentity => AuditOp::SetIdentity.as_str(),
                 AuditOp::Invalidate => AuditOp::Invalidate.as_str(),
                 AuditOp::RotateMasterKey => AuditOp::RotateMasterKey.as_str(),
                 AuditOp::RefreshCommit => AuditOp::RefreshCommit.as_str(),
@@ -599,6 +604,7 @@ mod vocabulary_documentation_tests {
         assert_documented(section, "audit_log.op", value(AuditOp::Import));
         assert_documented(section, "audit_log.op", value(AuditOp::Login));
         assert_documented(section, "audit_log.op", value(AuditOp::Overwrite));
+        assert_documented(section, "audit_log.op", value(AuditOp::SetIdentity));
         assert_documented(section, "audit_log.op", value(AuditOp::Invalidate));
         assert_documented(section, "audit_log.op", value(AuditOp::RotateMasterKey));
         assert_documented(section, "audit_log.op", value(AuditOp::RefreshCommit));
