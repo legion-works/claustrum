@@ -692,6 +692,103 @@ impl MigrationRig {
             .expect("run ck-auth with test seam")
     }
 
+    fn plugin_export(&self, name: &str, export: Value) -> PathBuf {
+        let path = self.root.join(name);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&export).expect("plugin export json"),
+        )
+        .expect("plugin export");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("plugin export mode");
+        path
+    }
+
+    fn migrate_plugin(&self, export: &Path, extra: &[&str]) -> Output {
+        let mut args = vec![
+            "migrate-plugin",
+            "--serve",
+            "tenant-a",
+            "--provider",
+            "anthropic",
+            "--from",
+            export.to_str().expect("plugin export path"),
+        ];
+        args.extend_from_slice(extra);
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .output()
+            .expect("run migrate-plugin")
+    }
+
+    fn migrate_plugin_with_provider(
+        &self,
+        provider: &str,
+        export: &Path,
+        extra: &[&str],
+    ) -> Output {
+        let mut args = vec![
+            "migrate-plugin",
+            "--serve",
+            "tenant-a",
+            "--provider",
+            provider,
+            "--from",
+            export.to_str().expect("plugin export path"),
+        ];
+        args.extend_from_slice(extra);
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .output()
+            .expect("run migrate-plugin with custom provider")
+    }
+
+    fn migrate_plugin_with_env(
+        &self,
+        export: &Path,
+        extra: &[&str],
+        key: &str,
+        value: &str,
+    ) -> Output {
+        let mut args = vec![
+            "migrate-plugin",
+            "--serve",
+            "tenant-a",
+            "--provider",
+            "anthropic",
+            "--from",
+            export.to_str().expect("plugin export path"),
+        ];
+        args.extend_from_slice(extra);
+        cli()
+            .args(args)
+            .arg("--data-dir")
+            .arg(&self.vault)
+            .arg("--key-path")
+            .arg(&self.key)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env(key, value)
+            .output()
+            .expect("run migrate-plugin with test seam")
+    }
+
+    fn plugin_handles(&self) -> PathBuf {
+        self.root
+            .join("config")
+            .join("cortexkit")
+            .join("opencode-handles.json")
+    }
+
     fn set_auth(&self, entries: Value) {
         std::fs::write(&self.auth, serde_json::to_vec(&entries).expect("auth json"))
             .expect("rewrite auth");
@@ -742,8 +839,67 @@ fn live_handle_count(rig: &MigrationRig, credential_id: &str) -> i64 {
         .expect("count live handles")
 }
 
+fn audit_tip(rig: &MigrationRig) -> i64 {
+    drop(open_vault(rig));
+    rusqlite::Connection::open(rig.vault.join("store.db"))
+        .expect("open scratch vault")
+        .query_row("SELECT COALESCE(MAX(seq), 0) FROM audit_log", [], |row| {
+            row.get(0)
+        })
+        .expect("audit tip")
+}
+
+fn plugin_export(accounts: Value) -> Value {
+    json!({
+        "version": 1,
+        "provider": "anthropic",
+        "serve": "tenant-a",
+        "accounts": accounts,
+    })
+}
+
+fn plugin_export_with_provider(provider: &str, accounts: Value) -> Value {
+    json!({
+        "version": 1,
+        "provider": provider,
+        "serve": "tenant-a",
+        "accounts": accounts,
+    })
+}
+
+fn plugin_account(label: &str) -> Value {
+    json!({
+        "label": label,
+        "kind": "oauth",
+        "access": "access-secret",
+        "refresh": "refresh-secret",
+        "expires_ms": 2_000_000_000_000_i64,
+        "account_id": "account-1",
+        "email": "account@example.test",
+    })
+}
+
+fn assert_plugin_refusal(tag: &str, export: Value, extra: &[&str], expected: &str) {
+    let rig = MigrationRig::new(tag, json!({}));
+    let export = rig.plugin_export("export.json", export);
+    let tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, extra);
+    assert!(!out.status.success(), "{tag} must refuse");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(expected),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(audit_tip(&rig), tip, "{tag} must not write the vault");
+    assert!(
+        !rig.plugin_handles().exists(),
+        "{tag} must not write the manifest"
+    );
+}
+
 #[cfg(debug_assertions)]
 fn assert_minted_handle_was_revoked(rig: &MigrationRig, credential_id: &str) {
+    drop(open_vault(rig));
     let conn = rusqlite::Connection::open(rig.vault.join("store.db")).expect("open scratch vault");
     let live_handles: i64 = conn
         .query_row(
@@ -942,6 +1098,558 @@ fn the_migrate_opencode_dry_run_writes_nothing_and_prints_a_non_secret_plan() {
     assert!(!rig.handles.exists());
     assert_eq!(std::fs::read(&rig.auth).expect("auth after"), before);
     assert!(!stdout.contains("dry-secret") && !stderr.contains("dry-secret"));
+}
+
+#[test]
+fn migrate_plugin_refuses_tombstone_material_before_the_vault_changes() {
+    let rig = MigrationRig::new("plugin-tombstone-refusal", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        json!({
+            "version": 1,
+            "provider": "anthropic",
+            "serve": "tenant-a",
+            "accounts": [{
+                "label": "work",
+                "kind": "oauth",
+                "access": "claustrum-tombstone:v1:anthropic",
+                "refresh": "refresh-secret",
+                "expires_ms": 2_000_000_000_000_i64
+            }]
+        }),
+    );
+    let tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, &[]);
+
+    assert!(!out.status.success(), "tombstone export must refuse");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("reserved tombstone prefix"));
+    assert_eq!(audit_tip(&rig), tip, "refusal must not write the vault");
+    assert!(
+        !rig.plugin_handles().exists(),
+        "refusal must not write the manifest"
+    );
+}
+
+#[test]
+fn migrate_plugin_refuses_main_before_the_vault_changes() {
+    let rig = MigrationRig::new("plugin-main-refusal", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        json!({
+            "version": 1,
+            "provider": "anthropic",
+            "serve": "tenant-a",
+            "accounts": [{
+                "label": "main",
+                "kind": "oauth",
+                "access": "access-secret",
+                "refresh": "refresh-secret",
+                "expires_ms": 2_000_000_000_000_i64
+            }]
+        }),
+    );
+    let tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, &[]);
+
+    assert!(!out.status.success(), "main must refuse");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("label 'main'"));
+    assert_eq!(audit_tip(&rig), tip, "refusal must not write the vault");
+    assert!(
+        !rig.plugin_handles().exists(),
+        "refusal must not write the manifest"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn migrate_plugin_revokes_a_mint_when_manifest_persistence_fails() {
+    let rig = MigrationRig::new("plugin-mint-guard", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        json!({
+            "version": 1,
+            "provider": "anthropic",
+            "serve": "tenant-a",
+            "accounts": [{
+                "label": "work",
+                "kind": "oauth",
+                "access": "access-secret",
+                "refresh": "refresh-secret",
+                "expires_ms": 2_000_000_000_000_i64
+            }]
+        }),
+    );
+    let out = rig.migrate_plugin_with_env(
+        &export,
+        &[],
+        "CK_OPENCODE_TEST_FAIL_PLUGIN_MANIFEST_WRITE",
+        "1",
+    );
+
+    assert!(
+        !out.status.success(),
+        "the seam must stop manifest persistence"
+    );
+    assert_minted_handle_was_revoked(&rig, "oauth:anthropic:work");
+}
+
+#[test]
+fn migrate_plugin_refuses_an_unsupported_export_version_before_the_vault_changes() {
+    let mut export = plugin_export(json!([plugin_account("work")]));
+    export["version"] = json!(2);
+    assert_plugin_refusal("plugin-version", export, &[], "version must be 1");
+}
+
+#[test]
+fn migrate_plugin_refuses_a_provider_mismatch_before_the_vault_changes() {
+    let mut export = plugin_export(json!([plugin_account("work")]));
+    export["provider"] = json!("openai");
+    assert_plugin_refusal(
+        "plugin-provider",
+        export,
+        &[],
+        "provider does not match --provider",
+    );
+}
+
+#[test]
+fn migrate_plugin_refuses_a_serve_mismatch_before_the_vault_changes() {
+    let mut export = plugin_export(json!([plugin_account("work")]));
+    export["serve"] = json!("tenant-b");
+    assert_plugin_refusal("plugin-serve", export, &[], "serve does not match --serve");
+}
+
+#[test]
+fn migrate_plugin_refuses_an_invalid_tenant_label_before_the_vault_changes() {
+    let mut export = plugin_export(json!([plugin_account("work")]));
+    export["serve"] = json!("Bad tenant");
+    let rig = MigrationRig::new("plugin-invalid-serve", json!({}));
+    let export_path = rig.plugin_export("export.json", export);
+    let tip = audit_tip(&rig);
+    let out = rig.run_with_env(
+        &[
+            "migrate-plugin",
+            "--serve",
+            "Bad tenant",
+            "--provider",
+            "anthropic",
+            "--from",
+            export_path.to_str().unwrap(),
+        ],
+        "XDG_CONFIG_HOME",
+        rig.root.join("config").to_str().unwrap(),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("serve is not a valid tenant label"));
+    assert_eq!(audit_tip(&rig), tip);
+    assert!(!rig.plugin_handles().exists());
+}
+
+#[test]
+fn migrate_plugin_refuses_an_invalid_provider_label_before_the_vault_changes() {
+    let rig = MigrationRig::new("plugin-invalid-provider", json!({}));
+    let mut export = plugin_export(json!([plugin_account("work")]));
+    export["provider"] = json!("Bad provider");
+    let export_path = rig.plugin_export("export.json", export);
+    let tip = audit_tip(&rig);
+    let out = rig.run_with_env(
+        &[
+            "migrate-plugin",
+            "--serve",
+            "tenant-a",
+            "--provider",
+            "Bad provider",
+            "--from",
+            export_path.to_str().unwrap(),
+        ],
+        "XDG_CONFIG_HOME",
+        rig.root.join("config").to_str().unwrap(),
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("provider is not a valid label"));
+    assert_eq!(audit_tip(&rig), tip);
+    assert!(!rig.plugin_handles().exists());
+}
+
+#[test]
+fn migrate_plugin_refuses_an_invalid_account_label_before_the_vault_changes() {
+    assert_plugin_refusal(
+        "plugin-invalid-label",
+        plugin_export(json!([plugin_account("Bad label")])),
+        &[],
+        "label 'Bad label' is invalid",
+    );
+}
+
+#[test]
+fn migrate_plugin_refuses_a_tombstone_refresh_before_the_vault_changes() {
+    let mut account = plugin_account("work");
+    account["refresh"] = json!("claustrum-tombstone:v1:anthropic");
+    assert_plugin_refusal(
+        "plugin-tombstone-refresh",
+        plugin_export(json!([account])),
+        &[],
+        "reserved tombstone prefix",
+    );
+}
+
+#[test]
+fn migrate_plugin_refuses_duplicate_labels_before_the_vault_changes() {
+    assert_plugin_refusal(
+        "plugin-duplicate-label",
+        plugin_export(json!([plugin_account("work"), plugin_account("work")])),
+        &[],
+        "duplicate label 'work'",
+    );
+}
+
+#[test]
+fn migrate_plugin_refuses_an_expired_export_without_allow_expired() {
+    let mut account = plugin_account("work");
+    account["expires_ms"] = json!(1);
+    assert_plugin_refusal(
+        "plugin-expired-refusal",
+        plugin_export(json!([account])),
+        &[],
+        "expired; rerun with --allow-expired",
+    );
+}
+
+#[test]
+fn migrate_plugin_refuses_replace_and_skip_existing_together() {
+    assert_plugin_refusal(
+        "plugin-mutually-exclusive",
+        plugin_export(json!([plugin_account("work")])),
+        &["--replace", "--skip-existing"],
+        "mutually exclusive",
+    );
+}
+
+#[test]
+fn migrate_plugin_imports_two_accounts_preserves_other_tenant_bytes_and_leaves_auth_untouched() {
+    let rig = MigrationRig::new(
+        "plugin-happy",
+        json!({"anthropic": {"type": "oauth", "access": "local-access", "refresh": "local-refresh", "expires": 1}}),
+    );
+    let foreign = opencode_files::HandleProvider {
+        provider: "other".into(),
+        shape: opencode_files::HandleShape::Api,
+        serve: "other-tenant".into(),
+        accounts: vec![opencode_files::HandleAccount {
+            label: "main".into(),
+            handle: format!("ckh_{}", "o".repeat(43)),
+            credential_id: "apikey:other:main".into(),
+            superseded: Vec::new(),
+        }],
+    };
+    let foreign_file = opencode_files::HandleFile {
+        version: 1,
+        providers: vec![foreign.clone()],
+    };
+    opencode_files::write_handle_file_for_tenant_default(
+        &rig.plugin_handles(),
+        "other-tenant",
+        &foreign_file,
+    )
+    .expect("write foreign manifest block");
+    let foreign_bytes = serde_json::to_vec(&foreign).expect("foreign bytes");
+    let auth_before = std::fs::read(&rig.auth).expect("auth before");
+    let mut personal = plugin_account("personal");
+    personal["account_id"] = json!("personal-id");
+    personal["email"] = json!("personal@example.test");
+    let export = rig.plugin_export(
+        "export.json",
+        plugin_export(json!([plugin_account("work"), personal])),
+    );
+
+    let out = rig.migrate_plugin(&export, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("work: imported oauth:anthropic:work v1, handle written"));
+    assert!(stdout.contains("personal: imported oauth:anthropic:personal v1, handle written"));
+    assert!(!stdout.contains("ckh_") && !stderr.contains("ckh_"));
+    assert_eq!(std::fs::read(&rig.auth).expect("auth after"), auth_before);
+
+    let handles = opencode_files::read_handle_file(&rig.plugin_handles()).expect("handles");
+    assert_eq!(
+        serde_json::to_vec(&handles.providers[0]).unwrap(),
+        foreign_bytes
+    );
+    let block = handles
+        .providers
+        .iter()
+        .find(|block| block.provider == "anthropic")
+        .expect("tenant block");
+    assert_eq!(block.serve, "tenant-a");
+    assert!(matches!(block.shape, opencode_files::HandleShape::Oauth));
+    assert_eq!(block.accounts.len(), 2);
+    let store = open_vault(&rig);
+    for account in &block.accounts {
+        assert_eq!(
+            store.resolve_handle(&account.handle).unwrap(),
+            account.credential_id
+        );
+    }
+}
+
+#[test]
+fn migrate_plugin_dry_run_leaves_chain_manifest_and_handles_unchanged() {
+    let rig = MigrationRig::new("plugin-dry-run", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        plugin_export(json!([plugin_account("work")])),
+    );
+    let before_tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, &["--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("credential_id=oauth:anthropic:work exists=false action=import"));
+    assert!(stdout.contains("summary: dry-run 1 account(s), no writes"));
+    assert_eq!(audit_tip(&rig), before_tip);
+    assert!(!rig.plugin_handles().exists());
+    assert_eq!(live_handle_count(&rig, "oauth:anthropic:work"), 0);
+}
+
+#[test]
+fn migrate_plugin_replace_advances_the_version_and_preserves_exported_identity() {
+    let rig = MigrationRig::new("plugin-replace", json!({}));
+    let export = rig.plugin_export("first.json", plugin_export(json!([plugin_account("work")])));
+    assert!(rig.migrate_plugin(&export, &[]).status.success());
+    let old = opencode_files::read_handle_file(&rig.plugin_handles())
+        .unwrap()
+        .providers
+        .iter()
+        .find(|block| block.provider == "anthropic")
+        .unwrap()
+        .accounts[0]
+        .handle
+        .clone();
+    let mut account = plugin_account("work");
+    account["access"] = json!("rotated-access");
+    account["refresh"] = json!("rotated-refresh");
+    let replacement = rig.plugin_export("replacement.json", plugin_export(json!([account])));
+    let out = rig.migrate_plugin(&replacement, &["--replace"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("replaced oauth:anthropic:work v2"));
+    let handles = opencode_files::read_handle_file(&rig.plugin_handles()).unwrap();
+    let new = handles
+        .providers
+        .iter()
+        .find(|block| block.provider == "anthropic")
+        .unwrap()
+        .accounts[0]
+        .handle
+        .clone();
+    let store = open_vault(&rig);
+    assert!(store.resolve_handle(&old).is_err());
+    assert_eq!(store.resolve_handle(&new).unwrap(), "oauth:anthropic:work");
+    let record = store
+        .get("oauth:anthropic:work")
+        .expect("replacement record");
+    assert_eq!(record.record_version, 2);
+    assert_eq!(record.identity.account_id.as_deref(), Some("account-1"));
+    assert_eq!(
+        record.identity.email.as_deref(),
+        Some("account@example.test")
+    );
+}
+
+#[test]
+fn migrate_plugin_skip_existing_leaves_a_credential_without_a_manifest_entry_untouched() {
+    let rig = MigrationRig::new("plugin-skip", json!({}));
+    let export = rig.plugin_export("first.json", plugin_export(json!([plugin_account("work")])));
+    assert!(rig.migrate_plugin(&export, &[]).status.success());
+    std::fs::remove_file(rig.plugin_handles()).expect("remove temp manifest");
+    let tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, &["--skip-existing"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("work: skipped (exists)"));
+    assert_eq!(audit_tip(&rig), tip);
+    assert!(!rig.plugin_handles().exists());
+}
+
+#[test]
+fn migrate_plugin_accepts_an_expired_export_only_with_allow_expired() {
+    let rig = MigrationRig::new("plugin-expired-allowed", json!({}));
+    let mut account = plugin_account("work");
+    account["expires_ms"] = json!(1);
+    let export = rig.plugin_export("export.json", plugin_export(json!([account])));
+    let out = rig.migrate_plugin(&export, &["--allow-expired"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("expired export accepted"));
+    assert!(String::from_utf8_lossy(&rig.run(&["list"]).stdout).contains("oauth:anthropic:work"));
+}
+
+#[test]
+fn migrate_plugin_refuses_a_non_oauth_account_kind_before_the_vault_changes() {
+    let mut account = plugin_account("work");
+    account["kind"] = json!("api");
+    assert_plugin_refusal(
+        "plugin-kind-refusal",
+        plugin_export(json!([account])),
+        &[],
+        "account kind must be oauth",
+    );
+}
+
+#[test]
+fn migrate_plugin_refuses_an_insecure_export_file_before_the_vault_changes() {
+    let rig = MigrationRig::new("plugin-insecure-export", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        plugin_export(json!([plugin_account("work")])),
+    );
+    std::fs::set_permissions(&export, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .expect("insecure export mode");
+    let tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, &[]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("regular 0600 file no larger than 256 KiB")
+    );
+    assert_eq!(audit_tip(&rig), tip);
+    assert!(!rig.plugin_handles().exists());
+}
+
+#[test]
+fn migrate_plugin_refuses_an_existing_credential_without_an_explicit_choice_before_writing() {
+    let rig = MigrationRig::new("plugin-existing-refusal", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        plugin_export(json!([plugin_account("work")])),
+    );
+    assert!(rig.migrate_plugin(&export, &[]).status.success());
+    std::fs::remove_file(rig.plugin_handles()).expect("remove temporary manifest");
+    let tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, &[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--replace or --skip-existing"));
+    assert_eq!(audit_tip(&rig), tip);
+    assert!(!rig.plugin_handles().exists());
+}
+
+#[test]
+fn migrate_plugin_refuses_an_existing_manifest_label_without_replace_before_writing() {
+    let rig = MigrationRig::new("plugin-manifest-refusal", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        plugin_export(json!([plugin_account("work")])),
+    );
+    assert!(rig.migrate_plugin(&export, &[]).status.success());
+    let before = std::fs::read(rig.plugin_handles()).expect("manifest before");
+    let tip = audit_tip(&rig);
+    let out = rig.migrate_plugin(&export, &[]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("manifest account 'work' already exists"));
+    assert_eq!(audit_tip(&rig), tip);
+    assert_eq!(
+        std::fs::read(rig.plugin_handles()).expect("manifest after"),
+        before
+    );
+}
+
+#[test]
+fn migrate_plugin_skip_existing_skips_an_existing_manifest_label_and_imports_the_rest() {
+    let rig = MigrationRig::new("plugin-manifest-skip", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        plugin_export(json!([plugin_account("work")])),
+    );
+    assert!(rig.migrate_plugin(&export, &[]).status.success());
+    let before = std::fs::read(rig.plugin_handles()).expect("manifest before");
+
+    let mixed = rig.plugin_export(
+        "mixed.json",
+        plugin_export(json!([plugin_account("work"), plugin_account("newone")])),
+    );
+    let out = rig.migrate_plugin(&mixed, &["--skip-existing"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("work: skipped (exists)"));
+    assert!(stdout.contains("newone: imported oauth:anthropic:newone v1, handle written"));
+
+    let handles = opencode_files::read_handle_file(&rig.plugin_handles()).expect("handles");
+    let block = handles
+        .providers
+        .iter()
+        .find(|block| block.provider == "anthropic")
+        .expect("tenant block");
+    assert_eq!(block.accounts.len(), 2);
+    let before_handles: opencode_files::HandleFile =
+        serde_json::from_slice(&before).expect("parse manifest before");
+    let before_work = &before_handles
+        .providers
+        .iter()
+        .find(|block| block.provider == "anthropic")
+        .expect("before block")
+        .accounts[0];
+    let after_work = block
+        .accounts
+        .iter()
+        .find(|entry| entry.label == "work")
+        .expect("work entry");
+    assert_eq!(after_work.handle, before_work.handle);
+    assert!(block.accounts.iter().any(|entry| entry.label == "newone"));
+    let store = open_vault(&rig);
+    assert_eq!(
+        store.resolve_handle(&after_work.handle).unwrap(),
+        "oauth:anthropic:work"
+    );
+}
+
+// migrate-plugin's credential ids are always `oauth:<provider>:<label>`, so the
+// refresh-adapter resolution for the oauth method always succeeds regardless of
+// provider spelling (credential_id.rs: `None | Some(AuthMethod::Oauth) => Some(..)`
+// unconditionally). --provider is not checked against a closed list here.
+#[test]
+fn migrate_plugin_imports_both_accounts_for_an_arbitrary_provider_string() {
+    let rig = MigrationRig::new("plugin-arbitrary-provider", json!({}));
+    let export = rig.plugin_export(
+        "export.json",
+        plugin_export_with_provider(
+            "nonexistent-provider",
+            json!([plugin_account("work"), plugin_account("personal")]),
+        ),
+    );
+    let out = rig.migrate_plugin_with_provider("nonexistent-provider", &export, &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let versions = String::from_utf8_lossy(&rig.run(&["list"]).stdout).to_string();
+    assert!(versions.contains("oauth:nonexistent-provider:work"));
+    assert!(versions.contains("oauth:nonexistent-provider:personal"));
+
+    let handles = opencode_files::read_handle_file(&rig.plugin_handles()).expect("handles");
+    let block = handles
+        .providers
+        .iter()
+        .find(|block| block.provider == "nonexistent-provider")
+        .expect("tenant block");
+    assert_eq!(block.accounts.len(), 2);
 }
 
 #[test]

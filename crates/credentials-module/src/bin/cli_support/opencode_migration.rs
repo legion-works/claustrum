@@ -737,6 +737,23 @@ pub(crate) fn write_and_verify_handles(
     opencode_files::verify_handle_written(path, handles).map_err(files_error)
 }
 
+pub(crate) fn write_and_verify_handles_for_tenant(
+    path: &Path,
+    tenant: &str,
+    handles: &opencode_files::HandleFile,
+) -> Result<(), CliError> {
+    #[cfg(debug_assertions)]
+    if std::env::var("CK_OPENCODE_TEST_FAIL_PLUGIN_MANIFEST_WRITE").as_deref() == Ok("1") {
+        return Err(CliError::Io(
+            "OpenCode files: tenant manifest write interrupted; re-run converges from the stored credential"
+                .into(),
+        ));
+    }
+    opencode_files::write_handle_file_for_tenant_default(path, tenant, handles)
+        .map_err(files_error)?;
+    opencode_files::verify_handle_written_for_tenant(path, tenant, handles).map_err(files_error)
+}
+
 pub(crate) fn mint_handle(global: &GlobalArgs, id: &str) -> Result<String, CliError> {
     commit_admin(
         global,

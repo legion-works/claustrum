@@ -42,6 +42,11 @@ struct ManifestLockOptions {
     before_evict: Option<Arc<dyn Fn() + Send + Sync>>,
     after_evict: Option<Arc<dyn Fn() + Send + Sync>>,
     before_manifest_rename: Option<BeforeManifestRename>,
+    /// Test-only fixed clock reading; `None` uses the wall clock. Lets a test
+    /// pin the TTL-staleness comparison to an exact instant instead of deriving
+    /// staleness from `now_ms() - TTL - epsilon`, which races the wall clock
+    /// between fixture setup and the lock attempt under load.
+    now_override_ms: Option<u64>,
 }
 
 impl Default for ManifestLockOptions {
@@ -55,6 +60,7 @@ impl Default for ManifestLockOptions {
             before_evict: None,
             after_evict: None,
             before_manifest_rename: None,
+            now_override_ms: None,
         }
     }
 }
@@ -325,19 +331,35 @@ pub fn write_handle_file(path: &Path, file: &HandleFile) -> Result<(), OpenCodeF
     )
 }
 
+pub(crate) fn write_handle_file_for_tenant_default(
+    path: &Path,
+    tenant: &str,
+    file: &HandleFile,
+) -> Result<(), OpenCodeFilesError> {
+    write_handle_file_for_tenant(path, tenant, file, ManifestLockOptions::default())
+}
+
 pub fn verify_handle_written(path: &Path, expected: &HandleFile) -> Result<(), OpenCodeFilesError> {
+    verify_handle_written_for_tenant(path, OPENCODE_CLAUSTRUM_TENANT, expected)
+}
+
+pub(crate) fn verify_handle_written_for_tenant(
+    path: &Path,
+    tenant: &str,
+    expected: &HandleFile,
+) -> Result<(), OpenCodeFilesError> {
     validate_handle_file(expected)?;
     let written = read_handle_file(path)?;
     let expected_owned: Vec<_> = expected
         .providers
         .iter()
-        .filter(|provider| provider.serve == OPENCODE_CLAUSTRUM_TENANT)
+        .filter(|provider| provider.serve == tenant)
         .cloned()
         .collect();
     let written_owned: Vec<_> = written
         .providers
         .iter()
-        .filter(|provider| provider.serve == OPENCODE_CLAUSTRUM_TENANT)
+        .filter(|provider| provider.serve == tenant)
         .cloned()
         .collect();
     if written_owned != expected_owned {
@@ -346,6 +368,15 @@ pub fn verify_handle_written(path: &Path, expected: &HandleFile) -> Result<(), O
         ));
     }
     Ok(())
+}
+
+pub(crate) fn read_secret_file(path: &Path, kind: &str) -> Result<Vec<u8>, OpenCodeFilesError> {
+    validate_secure_file(path)?;
+    read_limited(path, HANDLE_FILE_MAX_BYTES, kind)
+}
+
+pub(crate) fn validate_manifest_label(value: &str) -> Result<(), OpenCodeFilesError> {
+    validate_identifier(value, "label")
 }
 
 pub struct MintedHandleOutput {
@@ -492,6 +523,13 @@ fn current_time_ms() -> Result<u64, OpenCodeFilesError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .map_err(|_| OpenCodeFilesError::Invalid("system clock is before UNIX epoch".into()))
+}
+
+fn resolve_now_ms(options: &ManifestLockOptions) -> Result<u64, OpenCodeFilesError> {
+    match options.now_override_ms {
+        Some(fixed) => Ok(fixed),
+        None => current_time_ms(),
+    }
 }
 
 fn random_nonce() -> Result<String, OpenCodeFilesError> {
@@ -642,7 +680,7 @@ where
     let lock = lock_path(path);
     let owner_path = lock.join("owner");
     let nonce = random_nonce()?;
-    let started_at_ms = current_time_ms()?;
+    let started_at_ms = resolve_now_ms(&options)?;
     let deadline = Instant::now() + options.ttl;
     loop {
         match fs::create_dir(&lock) {
@@ -651,7 +689,7 @@ where
                 let owner = ManifestLockOwner {
                     tenant: tenant.into(),
                     pid: std::process::id(),
-                    claimed_at_ms: current_time_ms()?,
+                    claimed_at_ms: resolve_now_ms(&options)?,
                     nonce: nonce.clone(),
                 };
                 if let Err(error) = write_lock_owner(&lock, &owner) {
@@ -1240,12 +1278,16 @@ mod manifest_lock_tests {
         let _serial = TEST_SERIAL.lock().unwrap();
         let root = TempRoot::new();
         let path = root.manifest();
-        write_fixture_owner(&path, now_ms() - MANIFEST_LOCK_TTL_MS - 1, "other-tenant");
+        let now = now_ms();
+        write_fixture_owner(&path, now - MANIFEST_LOCK_TTL_MS - 1, "other-tenant");
 
         with_manifest_lock_with_options(
             &path,
             "opencode-claustrum",
-            ManifestLockOptions::default(),
+            ManifestLockOptions {
+                now_override_ms: Some(now),
+                ..ManifestLockOptions::default()
+            },
             |_| Ok(()),
         )
         .unwrap();
@@ -1307,7 +1349,8 @@ mod manifest_lock_tests {
         let _serial = TEST_SERIAL.lock().unwrap();
         let root = TempRoot::new();
         let path = root.manifest();
-        write_fixture_owner(&path, now_ms() - MANIFEST_LOCK_TTL_MS - 1, "other-tenant");
+        let now = now_ms();
+        write_fixture_owner(&path, now - MANIFEST_LOCK_TTL_MS - 1, "other-tenant");
         let eviction_barrier = Arc::new(Barrier::new(2));
         let eviction_wins = Arc::new(AtomicU64::new(0));
         let active = Arc::new(AtomicU64::new(0));
@@ -1327,6 +1370,7 @@ mod manifest_lock_tests {
                     after_evict: Some(Arc::new(move || {
                         wins.fetch_add(1, Ordering::SeqCst);
                     })),
+                    now_override_ms: Some(now),
                     ..ManifestLockOptions::default()
                 };
                 with_manifest_lock_with_options(&path, tenant, options, |_| {

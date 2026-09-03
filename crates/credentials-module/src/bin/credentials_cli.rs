@@ -59,6 +59,8 @@ mod opencode_accounts;
 mod opencode_files;
 #[path = "cli_support/opencode_migration.rs"]
 mod opencode_migration;
+#[path = "cli_support/opencode_plugin_migration.rs"]
+mod opencode_plugin_migration;
 #[path = "cli_support/provider_login.rs"]
 mod provider_login;
 #[path = "cli_support/route_client.rs"]
@@ -261,6 +263,7 @@ fn run() -> Result<(), CliError> {
         "mint-signing-key" => cmd_mint_signing_key(&global, &args),
         "import" => cmd_import(&global, &args),
         "migrate-opencode" => opencode_migration::cmd_migrate_opencode(&global, &args),
+        "migrate-plugin" => opencode_plugin_migration::cmd_migrate_plugin(&global, &args),
         "opencode-account" => opencode_accounts::cmd_opencode_account(&global, &args),
         "login" => cmd_login(&global, &args),
         "invalidate" => cmd_invalidate(&global, &args),
@@ -344,6 +347,7 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
             "--provider",
             "--serve-by",
         ],
+        "migrate-plugin" => &["--serve", "--provider", "--from"],
         "opencode-account" => &[
             "--provider",
             "--label",
@@ -370,6 +374,12 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
         "import" => &["--replace"],
         "login" => &["--replace", "--no-listener", "--device"],
         "migrate-opencode" => &["--dry-run", "--replace", "--force-shape"],
+        "migrate-plugin" => &[
+            "--dry-run",
+            "--replace",
+            "--skip-existing",
+            "--allow-expired",
+        ],
         _ => &[],
     };
     let mut i = 0;
@@ -559,6 +569,20 @@ fn help_verb(verb: &str) -> String {
              --restore <provider> safely writes an api entry back, revokes recorded handles,\n\
              and removes that provider from the handle file. --restore cannot combine with\n\
              --dry-run or --replace. The default --serve-by is opencode-claustrum."
+        }
+        "migrate-plugin" => {
+            "ck auth migrate-plugin --serve <tenant> --provider <id> --from <export.json>\n\
+             \x20                       [--replace | --skip-existing] [--dry-run] [--allow-expired]\n\
+             \n\
+             Import one tenant plugin's normalized OAuth export into oauth:<provider>:<label>,\n\
+             mint one capability per imported account, and write that tenant's oauth block into\n\
+             the locked OpenCode handle manifest. The export must be a regular 0600 file no\n\
+             larger than 256 KiB. It never reads or writes OpenCode auth.json.\n\
+             \n\
+             Existing credentials refuse by default, --replace advances their version and swaps\n\
+             the manifest capability, and --skip-existing leaves them untouched. --dry-run\n\
+             prints the non-secret plan and writes nothing. Expired exports require\n\
+             --allow-expired."
         }
         "opencode-account" => {
             "ck auth opencode-account add --provider <id> --label <label> --key-file <path|-> \

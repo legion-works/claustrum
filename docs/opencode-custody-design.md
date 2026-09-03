@@ -142,6 +142,8 @@ ck auth migrate-opencode --restore <provider>
 ck auth opencode-account add    <provider> --account <label> --key-file <path|-> [--before <label>]
 ck auth opencode-account remove <provider> --account <label>
 ck auth opencode-account list   <provider>
+ck auth migrate-plugin --serve <tenant> --provider <p> --from <export.json>
+                       [--replace | --skip-existing] [--dry-run] [--allow-expired]
 ```
 
 Defaults: `--auth-file` = OpenCode's own resolution of `auth.json`; `--handle-file
@@ -181,6 +183,38 @@ provider's handles, drop it from the handle file. Vault records are kept.
 `opencode-account`: `add` imports `<kind>:<provider>:<label>`, mints, inserts in priority
 order; `remove` revokes and drops the list entry (record kept); `list` prints label,
 record_version, state — no material.
+
+### Tenant plugin OAuth migration
+
+A dedicated tenant plugin exports a normalized, secret-bearing 0600 JSON file (maximum 256 KiB):
+
+```json
+{
+  "version": 1,
+  "provider": "anthropic",
+  "serve": "anthropic-auth",
+  "accounts": [
+    {
+      "label": "work",
+      "kind": "oauth",
+      "access": "…",
+      "refresh": "…",
+      "expires_ms": 1735689600000,
+      "account_id": "optional-stable-id",
+      "email": "optional@example.test"
+    }
+  ]
+}
+```
+
+`ck auth migrate-plugin` validates the complete export before its first vault write, imports each
+account as `oauth:<provider>:<label>`, mints a capability, and writes its `{ provider, shape:
+"oauth", serve }` block through the tenant-scoped manifest lock. It never reads or writes
+OpenCode `auth.json`; `main` is deliberately excluded from this fallback path. Flow: **plugin
+export → ck auth migrate-plugin → tenant enroll sweep sees the entries**. Re-run with
+`--replace` to advance an existing record and rewrite its manifest entry, or `--skip-existing` to
+leave an existing record alone (its manifest entry is skipped too, whether present or absent).
+Without either flag an existing record or manifest label refuses the whole run before any write.
 
 Handle file (ordered = priority order; `serve` = the plugin id that owns the provider):
 
