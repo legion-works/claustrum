@@ -7,6 +7,14 @@ export {
 } from './detect.js'
 export { storeIdentity, storageFingerprint } from './identity.js'
 export {
+  MANIFEST_LOCK,
+  withManifestLock,
+  writeHandleFileLocked,
+  type ManifestHandleAccount,
+  type ManifestHandleFile,
+  type ManifestHandleProvider,
+} from './manifest-lock.js'
+export {
   ClaustrumCredentialError,
   credentialErrorAction,
   ERROR_CLASS_WIRE_SET,
