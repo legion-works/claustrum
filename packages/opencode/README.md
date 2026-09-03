@@ -48,6 +48,8 @@ OpenCode's provider API and UI serialize `Provider.Info.key`, so a tombstone can
 
 Run `ck auth migrate-opencode` to create or repair the tombstones and handle file. `superseded` handles remain in the file for migration history. They are not servable accounts.
 
+For a manual handoff, use `ck auth login … → ck auth mint-handle <id> --out <file> → tenant enroll reads the file`; the output file is newly created with mode `0600` and the handle is not printed.
+
 ## Maintenance
 
 Keep the sweep's control-flow smoke signal on two greps -- one for branches (`if (`),

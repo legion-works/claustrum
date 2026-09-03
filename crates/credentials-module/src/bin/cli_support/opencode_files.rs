@@ -12,6 +12,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -343,6 +346,62 @@ pub fn verify_handle_written(path: &Path, expected: &HandleFile) -> Result<(), O
         ));
     }
     Ok(())
+}
+
+pub struct MintedHandleOutput {
+    path: PathBuf,
+    file: Option<File>,
+    persisted: bool,
+}
+
+impl MintedHandleOutput {
+    pub fn persist(mut self, handle: &str) -> Result<(), OpenCodeFilesError> {
+        #[cfg(debug_assertions)]
+        if std::env::var("CK_OPENCODE_TEST_FAIL_MINT_OUT_WRITE").as_deref() == Ok("1") {
+            return Err(OpenCodeFilesError::Invalid(
+                "handle output write interrupted by test seam".into(),
+            ));
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| OpenCodeFilesError::Invalid("handle output is closed".into()))?;
+        file.write_all(format!("{handle}\n").as_bytes())
+            .map_err(|source| io_error("write handle output", source))?;
+        file.sync_all()
+            .map_err(|source| io_error("sync handle output", source))?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+impl Drop for MintedHandleOutput {
+    fn drop(&mut self) {
+        let _ = self.file.take();
+        if !self.persisted {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub fn create_minted_handle_output(path: &Path) -> Result<MintedHandleOutput, OpenCodeFilesError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| OpenCodeFilesError::Invalid("file path has no parent".into()))?;
+    fs::create_dir_all(parent).map_err(|source| io_error("create parent directory", source))?;
+    validate_secure_parent(parent)?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| io_error("create handle output", source))?;
+    Ok(MintedHandleOutput {
+        path: path.to_path_buf(),
+        file: Some(file),
+        persisted: false,
+    })
 }
 
 fn write_handle_file_for_tenant(
@@ -1100,6 +1159,18 @@ mod manifest_lock_tests {
         );
         fs::write(lock.join("owner"), source).unwrap();
         fs::set_permissions(lock.join("owner"), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[test]
+    fn minted_handle_output_is_mode_0600_when_created() {
+        let root = TempRoot::new();
+        let path = root.0.join("minted-handle");
+        let output = create_minted_handle_output(&path).expect("create minted handle output");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(output);
     }
 
     fn short_options() -> ManifestLockOptions {

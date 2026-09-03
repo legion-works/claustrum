@@ -768,7 +768,9 @@ pub(crate) fn mint_then_persist<T>(
     match persist(&handle) {
         Ok(value) => Ok(value),
         Err(persist_error) => match revoke_handle(global, &handle) {
-            Ok(()) => Err(persist_error),
+            Ok(()) => Err(CliError::Io(format!(
+                "failed to persist minted handle for credential {id}: {persist_error}; minted handle was revoked; retry the operation"
+            ))),
             Err(revoke_error) => Err(CliError::Io(format!(
                 "failed to persist minted handle for credential {id}: {persist_error}; cleanup also failed: {revoke_error}; run `ck auth audit` to find the mint, then `ck auth revoke-all-handles {id}` to revoke it"
             ))),

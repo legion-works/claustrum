@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { open, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-import { ClaustrumClient, detectClaustrumConnection } from "@cortexkit/claustrum-client";
+import { ClaustrumClient, detectClaustrumConnection, HANDLE_FILE_CONTRACT } from "@cortexkit/claustrum-client";
 import type { Plugin } from "@opencode-ai/plugin";
 
 import { boundedBytesText, readBounded, type BoundedReadDescriptor } from "./bounded-read";
@@ -27,7 +27,7 @@ type MutableConfig = { provider?: Record<string, ConfigProvider> };
 const AUTH_FILE_MAX_BYTES = 1024 * 1024;
 const AUTH_SCAN_CHUNK_BYTES = 64 * 1024;
 const AUTH_SCAN_CARRY_BYTES = TOMBSTONE_PREFIX.length + 64;
-const SCANNED_PROVIDER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const SCANNED_PROVIDER_ID = HANDLE_FILE_CONTRACT.labelRe;
 const FORBIDDEN_PROVIDER_IDS = new Set(["__proto__", "constructor", "prototype"]);
 
 type AuthFileDescriptor = BoundedReadDescriptor & {

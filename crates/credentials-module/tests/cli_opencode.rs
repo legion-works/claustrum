@@ -730,6 +730,18 @@ fn open_vault(rig: &MigrationRig) -> EncryptedStore {
     EncryptedStore::open(sqlite, key).expect("open scratch vault")
 }
 
+fn live_handle_count(rig: &MigrationRig, credential_id: &str) -> i64 {
+    drop(open_vault(rig));
+    rusqlite::Connection::open(rig.vault.join("store.db"))
+        .expect("open scratch vault")
+        .query_row(
+            "SELECT COUNT(*) FROM handles WHERE credential_id = ?1 AND revoked = 0",
+            rusqlite::params![credential_id],
+            |row| row.get(0),
+        )
+        .expect("count live handles")
+}
+
 #[cfg(debug_assertions)]
 fn assert_minted_handle_was_revoked(rig: &MigrationRig, credential_id: &str) {
     let conn = rusqlite::Connection::open(rig.vault.join("store.db")).expect("open scratch vault");
@@ -1775,6 +1787,220 @@ fn the_opencode_account_add_key_file_stdin_does_not_echo_material() {
             .payload,
         b"stdin-secret"
     );
+}
+
+#[test]
+fn mint_handle_out_writes_mode_0600_handle_and_hides_it_from_stdout() {
+    let rig = MigrationRig::new(
+        "mint-out",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let out_path = rig.root.join("handoff").join("handle.txt");
+    let out = rig.run(&[
+        "mint-handle",
+        "--id",
+        "apikey:deepseek:main",
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!stdout.contains("ckh_"));
+    assert_eq!(mode(&out_path), 0o600);
+    let content = std::fs::read_to_string(out_path).expect("handle output");
+    assert!(content.starts_with("ckh_") && content.ends_with('\n'));
+    assert_eq!(content.trim_end().len(), 47);
+}
+
+#[test]
+fn mint_handle_out_pins_mode_on_create_without_a_later_chmod() {
+    let source = include_str!("../src/bin/cli_support/opencode_files.rs");
+    let start = source
+        .find("pub fn create_minted_handle_output")
+        .expect("mint output creator");
+    let end = source[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .expect("mint output creator end");
+    let creator = &source[start..end];
+    assert!(
+        creator.contains(".create_new(true)\n        .mode(0o600)\n        .open(path)"),
+        "output file creation must pin 0600 in the create_new open call"
+    );
+    assert!(
+        !source.contains("set_mode(path, 0o600)"),
+        "a later chmod masks a create-time permissions window"
+    );
+}
+
+#[test]
+fn mint_handle_without_out_retains_the_raw_handle_stdout_contract() {
+    let rig = MigrationRig::new(
+        "mint-stdout",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let out = rig.run(&["mint-handle", "--id", "apikey:deepseek:main"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.trim().starts_with("ckh_") && stdout.trim().len() == 47);
+}
+
+#[test]
+fn mint_handle_out_refuses_an_existing_path_without_touching_it() {
+    let rig = MigrationRig::new(
+        "mint-out-existing",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let out_path = rig.root.join("existing");
+    std::fs::write(&out_path, b"operator-owned\n").expect("existing output");
+    let before = std::fs::read(&out_path).expect("existing bytes");
+    let live_before = live_handle_count(&rig, "apikey:deepseek:main");
+    let out = rig.run(&[
+        "mint-handle",
+        "--id",
+        "apikey:deepseek:main",
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert_eq!(
+        std::fs::read(&out_path).expect("existing after refusal"),
+        before
+    );
+    let live_after = live_handle_count(&rig, "apikey:deepseek:main");
+    eprintln!("existing-output live_handles {live_before}->{live_after}");
+    assert_eq!(
+        live_after, live_before,
+        "output refusal must not mint a handle"
+    );
+}
+
+#[test]
+fn mint_handle_out_removes_the_created_file_when_minting_fails() {
+    let rig = MigrationRig::new(
+        "mint-out-mint-failure",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    let out_path = rig.root.join("handoff").join("handle.txt");
+    let out = rig.run(&[
+        "mint-handle",
+        "--id",
+        "apikey:missing:main",
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        !out_path.exists(),
+        "mint refusal must remove the empty output"
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn mint_handle_out_revokes_the_handle_when_the_open_output_write_fails() {
+    let rig = MigrationRig::new(
+        "mint-out-write-failure",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let out_path = rig.root.join("handoff").join("handle.txt");
+    let live_before = live_handle_count(&rig, "apikey:deepseek:main");
+    let out = rig.run_with_env(
+        &[
+            "mint-handle",
+            "--id",
+            "apikey:deepseek:main",
+            "--out",
+            out_path.to_str().unwrap(),
+        ],
+        "CK_OPENCODE_TEST_FAIL_MINT_OUT_WRITE",
+        "1",
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("minted handle was revoked"), "{stderr}");
+    assert!(stderr.contains("retry"), "{stderr}");
+    let live_after = live_handle_count(&rig, "apikey:deepseek:main");
+    eprintln!("write-failure live_handles {live_before}->{live_after}");
+    assert_eq!(
+        live_after, live_before,
+        "failed write must revoke only the new handle"
+    );
+    let conn = rusqlite::Connection::open(rig.vault.join("store.db")).expect("open scratch vault");
+    let audit = conn
+        .prepare(
+            "SELECT op FROM audit_log WHERE credential_id = ?1 AND op IN ('mint_handle', 'revoke_handle') ORDER BY seq",
+        )
+        .expect("prepare handle audit query")
+        .query_map(rusqlite::params!["apikey:deepseek:main"], |row| row.get::<_, String>(0))
+        .expect("query handle audit")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read handle audit");
+    assert!(
+        audit
+            .windows(2)
+            .any(|ops| ops == ["mint_handle", "revoke_handle"]),
+        "{audit:?}"
+    );
+    assert!(!out_path.exists(), "failed output must be removed");
+}
+
+#[test]
+fn mint_handle_out_refuses_a_world_writable_parent() {
+    let rig = MigrationRig::new(
+        "mint-out-parent",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let parent = rig.root.join("unsafe");
+    std::fs::create_dir(&parent).expect("parent");
+    std::fs::set_permissions(&parent, std::os::unix::fs::PermissionsExt::from_mode(0o777))
+        .expect("parent mode");
+    let out_path = parent.join("handle");
+    let out = rig.run(&[
+        "mint-handle",
+        "--id",
+        "apikey:deepseek:main",
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(!out_path.exists());
+}
+
+#[test]
+fn mint_handle_out_refuses_a_symlink_parent() {
+    let rig = MigrationRig::new(
+        "mint-out-symlink",
+        json!({"deepseek": {"type": "api", "key": "main-secret"}}),
+    );
+    assert!(rig.migrate(&[]).status.success());
+    let real = rig.root.join("real");
+    std::fs::create_dir(&real).expect("real parent");
+    let link = rig.root.join("link");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink parent");
+    let out_path = link.join("handle");
+    let out = rig.run(&[
+        "mint-handle",
+        "--id",
+        "apikey:deepseek:main",
+        "--out",
+        out_path.to_str().unwrap(),
+    ]);
+    assert!(!out.status.success());
+    assert!(!real.join("handle").exists());
 }
 
 #[cfg(debug_assertions)]

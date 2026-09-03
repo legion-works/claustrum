@@ -21,3 +21,12 @@ credential caching, refresh, account scheduling, and retry policy.
 
 The client sends `consumerIdentity: null` for every managed request so inherited
 `SUBC_MODULE_ID` and `SUBC_LAUNCH_NONCE` cannot impersonate a supervising host.
+
+## OpenCode handle-file exports
+
+`defaultHandleFilePath`, `readHandleFile`, `handleFileRevision`, and `parseHandleFile`
+are exported for tenant plugins consuming the OpenCode handle manifest. The shared
+`HANDLE_FILE_CONTRACT` is pinned to `maxBytes: 262144`, `mode: 0o600`,
+`labelRe: /^[a-z0-9][a-z0-9._-]{0,63}$/`, and
+`handleRe: /^ckh_[A-Za-z0-9_-]{43}$/`. Readers require a regular uid-owned file,
+an owned non-world-writable parent, and reject prototype keys.

@@ -12,6 +12,7 @@ import {
 } from 'node:fs/promises'
 import { randomBytes, randomInt } from 'node:crypto'
 import { dirname, join } from 'node:path'
+import { HANDLE_FILE_CONTRACT, parseHandleFile, type OpenCodeHandleFileV1 } from './handles.js'
 
 export const MANIFEST_LOCK = {
   ttlMs: 30_000,
@@ -20,29 +21,9 @@ export const MANIFEST_LOCK = {
   staleTargetRe: /^\.lock\.stale-\d+-[A-Za-z0-9_-]+$/,
 }
 
-const HANDLE_FILE_MAX_BYTES = 256 * 1024
-const IDENTIFIER_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/
-const HANDLE_RE = /^ckh_[A-Za-z0-9_-]{43}$/
-const FORBIDDEN_IDENTIFIERS = new Set(['__proto__', 'constructor', 'prototype'])
-
-export type ManifestHandleAccount = {
-  label: string
-  handle: string
-  credential_id: string
-  superseded?: string[]
-}
-
-export type ManifestHandleProvider = {
-  provider: string
-  shape: 'api' | 'oauth'
-  serve: string
-  accounts: ManifestHandleAccount[]
-}
-
-export type ManifestHandleFile = {
-  version: 1
-  providers: ManifestHandleProvider[]
-}
+export type ManifestHandleAccount = OpenCodeHandleFileV1['providers'][number]['accounts'][number]
+export type ManifestHandleProvider = OpenCodeHandleFileV1['providers'][number]
+export type ManifestHandleFile = OpenCodeHandleFileV1
 
 type ManifestLockOwner = {
   tenant: string
@@ -75,60 +56,7 @@ function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code
 }
 
-function isIdentifier(value: unknown): value is string {
-  return typeof value === 'string' && IDENTIFIER_RE.test(value) && !FORBIDDEN_IDENTIFIERS.has(value)
-}
-
-function parseManifest(value: unknown): ManifestHandleFile {
-  if (!value || typeof value !== 'object') throw new Error('handle file must be an object')
-  const file = value as Record<string, unknown>
-  if (file.version !== 1 || !Array.isArray(file.providers)) {
-    throw new Error('handle file must have version 1 and providers')
-  }
-  const providerIds = new Set<string>()
-  for (const [index, provider] of file.providers.entries()) {
-    if (!provider || typeof provider !== 'object') throw new Error(`provider ${index} must be an object`)
-    const item = provider as Record<string, unknown>
-    if (!isIdentifier(item.provider)) throw new Error(`provider ${index} has invalid provider`)
-    if (providerIds.has(item.provider)) throw new Error(`provider ${index} duplicates provider ${item.provider}`)
-    providerIds.add(item.provider)
-  }
-  const providers = file.providers.map((provider, index): ManifestHandleProvider => {
-    const item = provider as Record<string, unknown>
-    const providerId = item.provider as string
-    if (item.shape !== 'api' && item.shape !== 'oauth') throw new Error(`provider ${index} has invalid shape`)
-    if (typeof item.serve !== 'string' || !item.serve) throw new Error(`provider ${index} requires serve`)
-    if (!Array.isArray(item.accounts) || item.accounts.length === 0) {
-      throw new Error(`provider ${index} has invalid accounts`)
-    }
-    const labels = new Set<string>()
-    const accounts = item.accounts.map((account, accountIndex): ManifestHandleAccount => {
-      if (!account || typeof account !== 'object') throw new Error(`provider ${index} has invalid accounts`)
-      const entry = account as Record<string, unknown>
-      if (!isIdentifier(entry.label)) throw new Error(`provider ${index} has an invalid account label`)
-      if (labels.has(entry.label)) throw new Error(`provider ${index} duplicates account label ${entry.label}`)
-      labels.add(entry.label)
-      if (typeof entry.handle !== 'string' || !HANDLE_RE.test(entry.handle)) {
-        throw new Error(`provider ${index} account ${entry.label} has invalid handle`)
-      }
-      if (typeof entry.credential_id !== 'string' || !entry.credential_id) {
-        throw new Error(`provider ${index} account ${entry.label} has invalid credential id`)
-      }
-      if (entry.superseded !== undefined &&
-        (!Array.isArray(entry.superseded) || entry.superseded.some((handle) => typeof handle !== 'string' || !HANDLE_RE.test(handle)))) {
-        throw new Error(`provider ${index} account ${entry.label} has invalid superseded handle`)
-      }
-      return {
-        label: entry.label,
-        handle: entry.handle,
-        credential_id: entry.credential_id,
-        ...(entry.superseded === undefined ? {} : { superseded: [...entry.superseded] as string[] }),
-      }
-    })
-    return { provider: providerId, shape: item.shape, serve: item.serve, accounts }
-  })
-  return { version: 1, providers }
-}
+function parseManifest(value: unknown): ManifestHandleFile { return parseHandleFile(value) }
 
 function parseOwner(source: string): ManifestLockOwner {
   const value = JSON.parse(source) as unknown
@@ -301,7 +229,7 @@ async function readManifest(path: string): Promise<ManifestHandleFile> {
   if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error('handle file must be a regular file')
   if ((metadata.mode & 0o777) !== 0o600) throw new Error('handle file mode must be exactly 0600')
   const source = await readFile(path)
-  if (source.byteLength > HANDLE_FILE_MAX_BYTES) throw new Error('handle file exceeds 256 KiB')
+  if (source.byteLength > HANDLE_FILE_CONTRACT.maxBytes) throw new Error('handle file exceeds 256 KiB')
   return parseManifest(JSON.parse(source.toString('utf8')))
 }
 
@@ -327,7 +255,7 @@ async function writeManifestAtomic(
 ): Promise<void> {
   const parent = dirname(path)
   const bytes = Buffer.from(JSON.stringify(file))
-  if (bytes.byteLength > HANDLE_FILE_MAX_BYTES) throw new Error('handle file exceeds 256 KiB')
+  if (bytes.byteLength > HANDLE_FILE_CONTRACT.maxBytes) throw new Error('handle file exceeds 256 KiB')
   const temporary = join(parent, `.${path.split('/').pop()}.${process.pid}.${randomToken()}.tmp`)
   let handle: Awaited<ReturnType<typeof open>> | undefined
   try {

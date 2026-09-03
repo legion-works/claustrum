@@ -29,3 +29,15 @@ export {
   type CredentialStatus,
   type ServedCredential,
 } from './wire.js'
+export {
+  HANDLE_FILE_CONTRACT,
+  HandleFileValidationError,
+  defaultHandleFilePath,
+  handleFileRevision,
+  parseHandleFile,
+  readHandleFile,
+  type HandleAccount,
+  type HandleFileIo,
+  type HandleProvider,
+  type OpenCodeHandleFileV1,
+} from './handles.js'

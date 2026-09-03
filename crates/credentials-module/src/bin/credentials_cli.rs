@@ -352,7 +352,8 @@ fn reject_unknown_args(command: &str, args: &[String]) -> Result<(), CliError> {
             "--handle-file",
         ],
         "login" => &["--provider", "--id", "--payload-file", "--account"],
-        "invalidate" | "reactivate" | "mint-handle" | "revoke-all-handles" | "remove" => &["--id"],
+        "invalidate" | "reactivate" | "revoke-all-handles" | "remove" => &["--id"],
+        "mint-handle" => &["--id", "--out"],
         "logout" => &["--provider", "--id"],
         "revoke-handle" => &["--handle"],
         "grant" | "revoke-grant" => &["--principal", "--prefix", "--operation"],
@@ -571,10 +572,12 @@ fn help_verb(verb: &str) -> String {
              labels, credential ids, lifecycle state, and record versions only."
         }
         "mint-handle" => {
-            "ck auth mint-handle --id <id>\n\
+            "ck auth mint-handle --id <id> [--out <path>]\n\
              \n\
              Mint an unguessable capability handle for a credential — the token a\n\
-             consumer presents to `credential.get`. A credential can have many handles."
+             consumer presents to `credential.get`. A credential can have many handles.\n\
+             With --out, writes the handle to a new 0600 file without printing the secret:\n\
+               ck auth login … → ck auth mint-handle <id> --out <file> → tenant enroll reads the file."
         }
         "revoke-handle" => {
             "ck auth revoke-handle --handle <raw>\n\
@@ -2806,19 +2809,29 @@ fn cmd_rotate_master_key(global: &GlobalArgs) -> Result<(), CliError> {
 
 fn cmd_mint_handle(global: &GlobalArgs, args: &[String]) -> Result<(), CliError> {
     let id = required(args, "--id")?;
-    let result = commit_admin(
-        global,
-        AdminOpBody::MintHandle {
-            v: ADMIN_OP_SCHEMA_V1,
-            id: id.clone(),
-        },
-    )?;
-    let handle = result["handle"]
-        .as_str()
-        .ok_or_else(|| CliError::Io("mint did not return a handle".into()))?;
-    // The raw handle is printed ONCE; write it into the consumer's 0600 config.
-    println!("{handle}");
-    eprintln!("(minted handle for {id}; store it now — it is not recoverable)");
+    if let Some(path) = optional(args, "--out") {
+        let output = opencode_files::create_minted_handle_output(std::path::Path::new(&path))
+            .map_err(|error| CliError::Io(error.to_string()))?;
+        opencode_migration::mint_then_persist(global, &id, move |handle| {
+            output
+                .persist(handle)
+                .map_err(|error| CliError::Io(error.to_string()))
+        })?;
+        println!("minted handle for {id} to {path}");
+    } else {
+        let result = commit_admin(
+            global,
+            AdminOpBody::MintHandle {
+                v: ADMIN_OP_SCHEMA_V1,
+                id: id.clone(),
+            },
+        )?;
+        let handle = result["handle"]
+            .as_str()
+            .ok_or_else(|| CliError::Io("mint did not return a handle".into()))?;
+        println!("{handle}");
+        eprintln!("(minted handle for {id}; store it now — it is not recoverable)");
+    }
     Ok(())
 }
 
