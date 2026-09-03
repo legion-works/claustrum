@@ -209,6 +209,10 @@ Source-specific notes:
 - **OAuth (auth.json):** `--provider <key>` selects one provider's
   `{ refresh, access, expires }` entry from the map. Without it, `--json` must point
   at a single provider's object.
+- **Claustrum tombstones are not importable credentials.** After `migrate-opencode`, a
+  tombstoned entry is an ownership marker, not material to re-seal with `import`.
+  Re-run `ck auth migrate-opencode` to converge migration state, or use `ck auth
+  migrate-opencode --restore <provider>` to return the live credential to OpenCode.
 - **Google must be imported from `gemini-cli` or `antigravity`, not opencode.** A
   Google refresh token only refreshes against the OAuth client that minted it.
   `--source gemini-cli` reads `~/.gemini/oauth_creds.json` (the gemini-cli Code-Assist

@@ -35,6 +35,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+BUN="${BUN:-$(command -v bun || true)}"
+[[ -n "$BUN" ]] || { printf 'GATE FAILED: bun not found; set BUN or add bun to PATH\n' >&2; exit 1; }
 
 # A FAILURE MUST SURVIVE `| tail -1`.
 #
@@ -110,6 +112,11 @@ FMT_PKGS=$(cargo metadata --no-deps --format-version 1 \
 [ -n "$FMT_PKGS" ] || fail "format (could not derive workspace members -- refusing to run an empty scope)"
 # shellcheck disable=SC2086
 run_check "format" cargo fmt $FMT_PKGS -- --check
+
+run_check "bun frozen install" "$BUN" install --frozen-lockfile
+run_check "bun typecheck" "$BUN" run typecheck
+run_check "bun build" "$BUN" run build
+run_check "bun tests (hermetic)" "$BUN" run test:hermetic
 
 run_check "clippy" \
   cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -227,13 +234,17 @@ stream and pass the arm without ever seeing it skip."
 # follows it), and any gap between the floor and the real count is how many can go
 # before anyone is told. Measured 402 across the workspace's suites at the time of
 # writing; an earlier floor of 200 left a third of them free to disappear.
-# The current measured total is 470 after adding redacted-Debug pins for VaultRecord and
-# AdminOpBody, on top of the request-shape pins for the read surface and the source-level
-# checks that keep diagnostic enum documentation complete.
+# The current measured total is 525 (debug profile, the same `cargo test --locked --workspace`
+# this arm runs): the redacted-Debug pins for VaultRecord and AdminOpBody on top of the
+# provider-shape refusal checks, the default opencode custody suites, and the cli_opencode
+# fake-daemon response diagnostic that fails at the offending request rather than at
+# TestDaemon::drop's join().
+# Do not measure it with `--release`: one login test deliberately fails there and the
+# pipeline still prints a number, 32 short of the truth.
 #
 # Raise this when tests are added. A failure here is normally that, not a defect --
 # but it should be a deliberate edit rather than a number nobody revisits.
-  run_expect 470 "workspace unit + integration" \
+run_expect 525 "workspace unit + integration" \
   cargo test --locked --workspace
 
 # Two independent defences, because each catches what the other misses:
@@ -280,6 +291,18 @@ run_expect 5 "master-key rotation crash cuts" \
   cargo test --locked -p credentials-core --features rotate-test-seam --test rotate_crash_cut
 run_expect 2 "login crash cut" \
   cargo test --locked -p credentials-core --features login-test-seam --test login_crash_cut
+# These debug-only seams prove the custody cleanup paths without making an
+# environment-triggered interruption reachable in a release binary.
+run_expect 1 "opencode tombstone reread crash cut" \
+  cargo test --locked -p credentials-module \
+    --test cli_opencode the_migrate_opencode_tombstone_reread_failure_keeps_the_old_handle_until_rerun
+run_expect 1 "opencode account handle-write crash cut" \
+  cargo test --locked -p credentials-module \
+    --test cli_opencode the_opencode_account_add_recovers_a_mint_before_handle_write_with_one_live_handle
+# Rebuild the shipped CLI with default features so every later check and the caller use
+# the production release artifact rather than a test-profile seam build.
+run_check "release ck-auth (default features)" \
+  cargo build --release --locked --offline -p credentials-module --bin ck-auth
 # The migration tools are feature-gated, so clippy compiles them but nothing RAN them
 # until this arm existed. Compiling proves they build; the property that matters -- the
 # key-identity diagnostic works while the daemon holds the lease -- is a runtime fact.
@@ -288,11 +311,11 @@ run_expect 1 "migration tools" \
   --test key_verify_takes_nothing
 
 # The release-artifact assertion CI runs as its own step: the debug-only
-# validation bypass must be absent from a --release binary. Ignored by default
+# test escape hatches must be absent from a --release binary. Ignored by default
 # because it builds one.
-run_expect 1 "release artifact (bypass absent)" \
+run_expect 1 "release artifact (test seams absent)" \
   cargo test --locked -p credentials-module --test cli_admin \
-  validation_bypass_is_absent -- --ignored --nocapture
+  test_escape_hatches_are_absent -- --ignored --nocapture
 
 # PROVE the scope claim rather than asserting it. "Every check CI runs" rots the
 # moment CI grows an arm, and that is exactly how it broke: CI gained an inbound
