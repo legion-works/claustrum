@@ -36,12 +36,12 @@ export const FILE_FIELDS: Array<keyof CustodyLogEntry> = [
   "cooldownUntil", "errorClass", "errorCode", "ts", "pid",
 ];
 const CREDENTIAL_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-const ERROR_CLASS = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
-const ERROR_CODE = /^[A-Za-z0-9_.-]{1,64}$/;
+const ERROR_CLASS = /^[A-Z][A-Za-z0-9]{0,47}$/;
+const ERROR_CODE = /^(?:[A-Z][A-Z0-9_]{1,31}|[a-z][a-z0-9_]{1,31})$/;
 const LEVELS = new Set(["debug", "info", "warn", "error"]);
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/;
-const STATES = new Set([
-  "available", "transient", "cooldown", "other_owner", "orphan", "split", "unmanaged",
+export const STATES = new Set([
+  "available", "transient", "cooldown", "reauth", "other_owner", "orphan", "split", "unmanaged",
   "refusing", "serving", "served", "gone",
 ]);
 

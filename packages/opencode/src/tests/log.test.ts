@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createFileLogSink, createLogger, FILE_FIELDS, serializedLogSink } from "../log";
+import { createFileLogSink, createLogger, FILE_FIELDS, serializedLogSink, STATES } from "../log";
 
 describe("custody logger", () => {
   const originalDebug = console.debug;
@@ -165,7 +165,7 @@ describe("custody logger", () => {
     createLogger(createFileLogSink({ path })).error({
       provider: "openai",
       errorClass: syntaxError,
-      errorCode: `${key} `,
+      errorCode: key,
     });
 
     const contents = readFileSync(path, "utf8");
@@ -173,6 +173,32 @@ describe("custody logger", () => {
     expect(contents).not.toContain(key);
     expect(contents).toContain('"errorClass":"invalid_shape"');
     expect(contents).toContain('"errorCode":"invalid_shape"');
+  });
+
+  test("STATES contains every literal state emitted by the producers", () => {
+    const sourceFiles = ["plugin.ts", "serve.ts", "freshness.ts"];
+    const literals = sourceFiles.flatMap((file) => {
+      const source = readFileSync(join(import.meta.dir, "..", file), "utf8");
+      return [...source.matchAll(/state\s*(?::|=)\s*"([^"]+)"/g)].map((match) => match[1]!);
+    });
+
+    expect(literals.length).toBeGreaterThanOrEqual(3);
+    for (const state of literals) expect(STATES.has(state)).toBe(true);
+    expect(STATES.has("reauth")).toBe(true);
+  });
+
+  test("producer error classes and codes retain their real shapes", () => {
+    const root = join(tmpdir(), `claustrum-log-${crypto.randomUUID()}`);
+    const path = join(root, "custody.jsonl");
+    const classes = ["SyntaxError", "HandleFileValidationError", "UpstreamFetchError", "FreshnessTickError", "AbortError"];
+    const codes = ["ENOENT", "EACCES", "ERR_INVALID_ARG_TYPE", "not_found", "needs_reauth", "kind_not_gettable", "sentinel_in_request"];
+    const logger = createLogger(createFileLogSink({ path }));
+    for (const errorClass of classes) logger.error({ provider: "openai", errorClass });
+    for (const errorCode of codes) logger.error({ provider: "openai", errorCode });
+
+    const records = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(records.slice(0, classes.length).map((record) => record.errorClass)).toEqual(classes);
+    expect(records.slice(classes.length).map((record) => record.errorCode)).toEqual(codes);
   });
 
   test("file sink rejects objects routed into allowlisted fields", () => {
