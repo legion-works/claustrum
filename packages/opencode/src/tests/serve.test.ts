@@ -4,8 +4,10 @@ import { join } from "node:path";
 
 import { ClaustrumCredentialError, type ServedCredential } from "@cortexkit/claustrum-client";
 
+import * as errors from "../errors";
 import { CustodyExhaustionError, CustodyRequestError, CustodySplitError } from "../errors";
 import { FreshnessController } from "../freshness";
+import * as pkg from "../index";
 import { snapshotRequest } from "../request";
 import { createServeFetch } from "../serve";
 import { sentinel, tombstoneFor } from "../tombstone";
@@ -780,5 +782,21 @@ describe("OpenCode custody serve fetch", () => {
     });
     expect(second.status).toBe(200);
     expect(calls).toBe(2);
+  });
+});
+
+describe("custody error public surface", () => {
+  test("warm-timeout and reported-exhaustion errors are exported from errors.ts", () => {
+    // Production change that fails this: leaving CustodyWarmTimeoutError on serve.ts so
+    // `export * from "./errors"` does not surface the retryable timeout class.
+    expect("CustodyWarmTimeoutError" in errors).toBe(true);
+    expect("ReportedCustodyExhaustionError" in errors).toBe(true);
+    expect(pkg.CustodyWarmTimeoutError).toBe(errors.CustodyWarmTimeoutError);
+    expect(pkg.ReportedCustodyExhaustionError).toBe(errors.ReportedCustodyExhaustionError);
+
+    const timeout = new errors.CustodyWarmTimeoutError("warm timed out", []);
+    const exhausted = new errors.ReportedCustodyExhaustionError("exhausted", [], true);
+    expect(timeout).not.toBeInstanceOf(CustodyExhaustionError);
+    expect(exhausted).toBeInstanceOf(CustodyExhaustionError);
   });
 });

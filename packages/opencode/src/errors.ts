@@ -55,3 +55,33 @@ export class CustodyNativeRuntimeError extends Error {
 export class CustodyExhaustionError extends Error {
   override name = "CustodyExhaustionError";
 }
+
+export type CustodyAccountSnapshot = {
+  label: string;
+  state: string;
+  warmTimedOut: boolean;
+};
+
+// A budget miss is retryable and the next warm succeeds, so a caller branching on exhaustion must not catch it.
+export class CustodyWarmTimeoutError extends Error {
+  override name = "CustodyWarmTimeoutError";
+  readonly reason = "warm_timeout" as const;
+  readonly accountStates: readonly CustodyAccountSnapshot[];
+
+  constructor(message: string, accountStates: readonly CustodyAccountSnapshot[]) {
+    super(message);
+    this.accountStates = accountStates;
+  }
+}
+
+export class ReportedCustodyExhaustionError extends CustodyExhaustionError {
+  readonly reason = "exhausted" as const;
+  readonly adviseMigrate: boolean;
+  readonly accountStates: readonly CustodyAccountSnapshot[];
+
+  constructor(message: string, accountStates: readonly CustodyAccountSnapshot[], adviseMigrate: boolean) {
+    super(message);
+    this.adviseMigrate = adviseMigrate;
+    this.accountStates = accountStates;
+  }
+}

@@ -3,7 +3,17 @@ import {
   type ServedCredential,
 } from "@cortexkit/claustrum-client";
 
-import { CustodyAuthReadError, CustodyExhaustionError, CustodyOwnershipError, CustodyRedirectRefusedError, CustodyRequestError, CustodySplitError } from "./errors";
+import {
+  CustodyAuthReadError,
+  CustodyExhaustionError,
+  CustodyOwnershipError,
+  CustodyRedirectRefusedError,
+  CustodyRequestError,
+  CustodySplitError,
+  CustodyWarmTimeoutError,
+  ReportedCustodyExhaustionError,
+  type CustodyAccountSnapshot,
+} from "./errors";
 import {
   DEFAULT_RETRY_AFTER_MS,
   FreshnessController,
@@ -84,35 +94,6 @@ async function discard(response: Response): Promise<void> {
   try {
     await response.body?.cancel();
   } catch {
-  }
-}
-
-export type CustodyAccountSnapshot = {
-  label: string;
-  state: string;
-  warmTimedOut: boolean;
-};
-
-export class CustodyWarmTimeoutError extends Error {
-  override name = "CustodyWarmTimeoutError";
-  readonly reason = "warm_timeout" as const;
-  readonly accountStates: readonly CustodyAccountSnapshot[];
-
-  constructor(message: string, accountStates: readonly CustodyAccountSnapshot[]) {
-    super(message);
-    this.accountStates = accountStates;
-  }
-}
-
-class ReportedCustodyExhaustionError extends CustodyExhaustionError {
-  readonly reason = "exhausted" as const;
-  readonly adviseMigrate: boolean;
-  readonly accountStates: readonly CustodyAccountSnapshot[];
-
-  constructor(message: string, accountStates: readonly CustodyAccountSnapshot[], adviseMigrate: boolean) {
-    super(message);
-    this.adviseMigrate = adviseMigrate;
-    this.accountStates = accountStates;
   }
 }
 
