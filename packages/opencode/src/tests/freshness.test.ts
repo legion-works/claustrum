@@ -155,6 +155,32 @@ describe("custody freshness", () => {
     ]);
   });
 
+  test("timeout warn reports the slot state the budget miss left behind", async () => {
+    // Production change that fails this: the timeout branch logging `state: "transient"`
+    // as a literal instead of reading the slot. The slot stays `available` so the next
+    // resolve can warm immediately; the warn must not contradict that.
+    const pending = deferred<ServedCredential>();
+    const entries: Array<{ state?: string; errorClass?: string; errorCode?: string }> = [];
+    const freshness = new FreshnessController({
+      provider: PROVIDER,
+      shape: "api",
+      accounts: [apiAccounts[0]!],
+      client: new FakeClient(async () => pending.promise),
+      log: createLogger((entry) => entries.push(entry)),
+      setTimeout: (callback) => {
+        queueMicrotask(callback);
+        return {};
+      },
+    });
+
+    expect(await freshness.resolve(apiAccounts[0]!)).toBeUndefined();
+
+    const timeoutWarn = entries.find((entry) => entry.errorCode === "timeout");
+    expect(timeoutWarn?.errorClass).toBe("credential_warm");
+    expect(timeoutWarn?.state).toBe(freshness.state(apiAccounts[0]!));
+    expect(timeoutWarn?.state).toBe("available");
+  });
+
   test("discards a warm whose handle revision changed during the RPC and no concurrent resolve bumped the generation", async () => {
     // P1: a handle file change mid-RPC must not let an in-flight get repopulate the cache
     // with a credential that binds to the old handle record. The captured `version` at

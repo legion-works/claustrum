@@ -4,7 +4,8 @@ import { join } from "node:path";
 
 import { ClaustrumCredentialError, type ServedCredential } from "@cortexkit/claustrum-client";
 
-import { CustodyRequestError, CustodySplitError } from "../errors";
+import { CustodyExhaustionError, CustodyRequestError, CustodySplitError } from "../errors";
+import { FreshnessController } from "../freshness";
 import { snapshotRequest } from "../request";
 import { createServeFetch } from "../serve";
 import { sentinel, tombstoneFor } from "../tombstone";
@@ -44,6 +45,13 @@ class FakeClient {
 
 function credential(material: string, recordVersion: number): ServedCredential {
   return { material, recordVersion, expiresAtMs: null };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function clientWith(
@@ -660,5 +668,117 @@ describe("OpenCode custody serve fetch", () => {
       expect(message).not.toContain(SENTINEL);
     }
     expect(requests).toHaveLength(1);
+  });
+
+  test("a sole-account warm timeout names a transient warm timeout and does not advise migrate-opencode", async () => {
+    // Production change that fails this: treating a budget-miss skip as CustodyExhaustionError
+    // and appending `run ck auth migrate-opencode for gone handles` even when no account is gone.
+    const pending = deferred<ServedCredential>();
+    const client = {
+      getCredential: async () => pending.promise,
+      reportAuthFailure: async () => {},
+    };
+    const freshness = new FreshnessController({
+      provider: PROVIDER,
+      shape: "api",
+      accounts: [accounts[0]!],
+      client,
+      setTimeout: (callback) => {
+        queueMicrotask(callback);
+        return {};
+      },
+    });
+    const fetch = createServeFetch({
+      provider: PROVIDER,
+      accounts: [accounts[0]!],
+      client,
+      freshness,
+      readAuthEntry: () => tombstoneFor("api", PROVIDER),
+      upstreamFetch: async () => new Response("must not run"),
+    });
+
+    let error: unknown;
+    try {
+      await fetch("https://upstream.example/v1/chat");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).not.toBeInstanceOf(CustodyExhaustionError);
+    expect(error).toMatchObject({
+      name: "CustodyWarmTimeoutError",
+      reason: "warm_timeout",
+      accountStates: [{ label: "main", state: "available", warmTimedOut: true }],
+    });
+    expect((error as Error).message).not.toContain("migrate-opencode");
+    expect((error as Error).message).toContain("warm timed out");
+  });
+
+  test("a gone account still advises migrate-opencode on structured exhaustion", async () => {
+    // Production change that fails this: dropping the migrate clause for a genuinely-gone
+    // handle, or leaving adviseMigrate unset so callers have to parse the message.
+    const fetch = serve({
+      accounts: [accounts[0]!],
+      client: clientWith(new ClaustrumCredentialError("not_found", "permanent", "gone")),
+    });
+
+    let error: unknown;
+    try {
+      await fetch("https://upstream.example/v1/chat");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(CustodyExhaustionError);
+    expect(error).toMatchObject({
+      reason: "exhausted",
+      adviseMigrate: true,
+      accountStates: [{ label: "main", state: "gone", warmTimedOut: false }],
+    });
+    expect((error as Error).message).toContain("migrate-opencode");
+  });
+
+  test("a warm timeout does not gate the next request's warm", async () => {
+    // Production change that fails this: assigning slot.state=transient with TRANSIENT_BACKOFF_MS
+    // on timeout, which would skip the next warm for a minute. Timeout is a budget miss, not a
+    // vault failure; the next resolve must be allowed to warm immediately.
+    const pending = deferred<ServedCredential>();
+    let calls = 0;
+    let allowTimeout = true;
+    const client = {
+      getCredential: async () => {
+        calls += 1;
+        return calls === 1 ? pending.promise : credential("material-main", 7);
+      },
+      reportAuthFailure: async () => {},
+    };
+    const freshness = new FreshnessController({
+      provider: PROVIDER,
+      shape: "api",
+      accounts: [accounts[0]!],
+      client,
+      setTimeout: (callback) => {
+        if (allowTimeout) queueMicrotask(callback);
+        return {};
+      },
+    });
+    const fetch = createServeFetch({
+      provider: PROVIDER,
+      accounts: [accounts[0]!],
+      client,
+      freshness,
+      readAuthEntry: () => tombstoneFor("api", PROVIDER),
+      upstreamFetch: async () => new Response("upstream", { status: 200 }),
+    });
+
+    await expect(fetch("https://upstream.example/v1/chat")).rejects.toThrow();
+    expect(freshness.state(accounts[0]!)).toBe("available");
+    allowTimeout = false;
+
+    const second = await fetch("https://upstream.example/v1/chat", {
+      headers: { Authorization: `Bearer ${SENTINEL}` },
+    });
+    expect(second.status).toBe(200);
+    expect(calls).toBe(2);
   });
 });

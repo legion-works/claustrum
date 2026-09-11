@@ -23,6 +23,9 @@ type Slot = {
   inFlight?: Promise<ServedCredential | undefined>;
   generation: number;
   staleCacheWarningEmitted?: boolean;
+  // Reporting-only: a warm budget miss. Must not feed #canWarm — a cooldown here
+  // would skip the next request for TRANSIENT_BACKOFF_MS after a one-request blip.
+  warmTimedOut?: boolean;
 };
 
 type IntervalHandle = { unref?: () => unknown };
@@ -106,9 +109,14 @@ export class FreshnessController {
     return "available";
   }
 
+  warmTimedOut(account: FreshnessAccount): boolean {
+    return this.#slot(account).warmTimedOut === true;
+  }
+
   async resolve(account: FreshnessAccount): Promise<ServedCredential | undefined> {
     await this.#refreshHandleVersion();
     const slot = this.#slot(account);
+    slot.warmTimedOut = false;
     if (slot.state === "transient" && this.#isFresh(slot)) {
       if (!slot.staleCacheWarningEmitted) {
         slot.staleCacheWarningEmitted = true;
@@ -248,7 +256,13 @@ export class FreshnessController {
         slot.inFlight = undefined;
         slot.generation += 1;
       }
-      this.#log?.warn({ provider: this.#provider, state: "transient", errorClass: "credential_warm", errorCode: "timeout" });
+      slot.warmTimedOut = true;
+      this.#log?.warn({
+        provider: this.#provider,
+        state: this.state(account),
+        errorClass: "credential_warm",
+        errorCode: "timeout",
+      });
     }
     return result.kind === "completed" ? result.served : undefined;
   }

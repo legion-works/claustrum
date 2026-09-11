@@ -87,10 +87,59 @@ async function discard(response: Response): Promise<void> {
   }
 }
 
-function exhaustion(provider: string, accounts: AccountRuntime[], freshness: FreshnessController): CustodyExhaustionError {
-  const states = accounts.map(({ account }) => `${account.label}:${freshness.state(account)}`).join(", ");
-  return new CustodyExhaustionError(
-    `custody accounts exhausted: provider=${provider} accounts=${states}; run ck auth migrate-opencode for gone handles`,
+export type CustodyAccountSnapshot = {
+  label: string;
+  state: string;
+  warmTimedOut: boolean;
+};
+
+export class CustodyWarmTimeoutError extends Error {
+  override name = "CustodyWarmTimeoutError";
+  readonly reason = "warm_timeout" as const;
+  readonly accountStates: readonly CustodyAccountSnapshot[];
+
+  constructor(message: string, accountStates: readonly CustodyAccountSnapshot[]) {
+    super(message);
+    this.accountStates = accountStates;
+  }
+}
+
+class ReportedCustodyExhaustionError extends CustodyExhaustionError {
+  readonly reason = "exhausted" as const;
+  readonly adviseMigrate: boolean;
+  readonly accountStates: readonly CustodyAccountSnapshot[];
+
+  constructor(message: string, accountStates: readonly CustodyAccountSnapshot[], adviseMigrate: boolean) {
+    super(message);
+    this.adviseMigrate = adviseMigrate;
+    this.accountStates = accountStates;
+  }
+}
+
+function exhaustion(
+  provider: string,
+  accounts: AccountRuntime[],
+  freshness: FreshnessController,
+): CustodyExhaustionError | CustodyWarmTimeoutError {
+  const accountStates: CustodyAccountSnapshot[] = accounts.map(({ account }) => ({
+    label: account.label,
+    state: freshness.state(account),
+    warmTimedOut: freshness.warmTimedOut(account),
+  }));
+  const states = accountStates.map((snapshot) => `${snapshot.label}:${snapshot.state}`).join(", ");
+  const anyGone = accountStates.some((snapshot) => snapshot.state === "gone");
+  // migrate-opencode is remediation for gone handles, not for a budget miss or a cooldown.
+  const migrate = anyGone ? "; run ck auth migrate-opencode for gone handles" : "";
+  if (accountStates.length > 0 && accountStates.every((snapshot) => snapshot.warmTimedOut)) {
+    return new CustodyWarmTimeoutError(
+      `custody credential warm timed out: provider=${provider} accounts=${states}`,
+      accountStates,
+    );
+  }
+  return new ReportedCustodyExhaustionError(
+    `custody accounts exhausted: provider=${provider} accounts=${states}${migrate}`,
+    accountStates,
+    anyGone,
   );
 }
 
@@ -288,7 +337,8 @@ export function createServeFetch(options: CreateServeFetchOptions) {
     }
 
     const refusal = exhaustion(options.provider, accounts, freshness);
-    options.log?.error({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
+    const log = refusal instanceof CustodyWarmTimeoutError ? options.log?.warn : options.log?.error;
+    log?.({ provider: options.provider, errorClass: refusal.name, errorMessage: refusal.message });
     throw refusal;
   };
 }
