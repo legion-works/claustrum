@@ -74,6 +74,7 @@ function serve(input: {
   now?: () => number;
   readAuthEntry?: () => Promise<unknown> | unknown;
   accounts?: Account[];
+  onServed?: (account: Account, recordVersion: number) => void;
 }) {
   return createServeFetch({
     provider: PROVIDER,
@@ -82,6 +83,7 @@ function serve(input: {
     readAuthEntry: input.readAuthEntry ?? (() => tombstoneFor("api", PROVIDER)),
     upstreamFetch: input.upstream ?? (async () => new Response("upstream", { status: 200 })),
     now: input.now,
+    onServed: input.onServed,
   });
 }
 
@@ -103,6 +105,19 @@ afterEach(async () => {
 });
 
 describe("OpenCode custody serve fetch", () => {
+  test("reports a successful serve through the bounded callback", async () => {
+    const served: Array<{ label: string; recordVersion: number }> = [];
+    const fetch = serve({ onServed: (account, recordVersion) => served.push({ label: account.label, recordVersion }) });
+
+    await fetch("https://upstream.example/v1/chat");
+    await fetch("https://upstream.example/v1/chat");
+
+    expect(served).toEqual([
+      { label: "main", recordVersion: 7 },
+      { label: "main", recordVersion: 7 },
+    ]);
+  });
+
   test("substitutes every sentinel occurrence in every header value", async () => {
     const requests: Request[] = [];
     const fetch = serve({ upstream: createUpstream([200], requests) });

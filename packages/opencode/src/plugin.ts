@@ -204,6 +204,7 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
   const handleReader = dependencies.handleReader ?? readHandleFile;
   const authReader = dependencies.authReader ?? readAuthFile;
   const log = createLogger(dependencies.logSink ?? (dependencies.log ? serializedLogSink(dependencies.log) : undefined));
+  const announcedProviders = new Set<string>();
   if (process.env.CLAUSTRUM_CUSTODY_DISABLE === "1") {
     return async () => ({
       config: async () => {
@@ -244,7 +245,15 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
     const pending = (async () => {
       const result = await detection();
       if (result.status !== "available") throw new Error(`Claustrum connection ${result.status}`);
-      return clientFactory();
+      // The client's default unknown-class logger is `console.warn`, which is the OpenCode
+      // TUI's screen. Routing it into our file sink keeps the whole plugin -- including the
+      // vendored client bundled with it -- off the operator's terminal. Without this the
+      // console ban in log.ts is only two thirds enforced: our own levels are silenced and
+      // a wire response carrying an unrecognised error class still prints.
+      return clientFactory({
+        logger: (errorClass: string) =>
+          log.warn({ errorClass: typeof errorClass === "string" ? errorClass : "invalid_shape" }),
+      });
     })();
     connected = pending;
     try {
@@ -359,6 +368,7 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
           // breaks the contract documented in docs/opencode-custody-design.md.
           if (owner !== undefined && owner !== OUR_PLUGIN_ID) {
             log.debug({ provider, errorClass: "other_owner", errorCode: owner });
+            log.info({ provider, state: "other_owner" });
             continue;
           }
 
@@ -369,18 +379,21 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
             if (consumesTombstone) {
               const refusal = new CustodyOrphanError(`${sentinelShapeDrift(entry, provider)}; refusing before OpenCode can load it`);
               logError(log, refusal, provider);
+              log.info({ provider, state: "orphan" });
               configureRefusal(provider, refusal);
               continue;
             }
             if (owner === OUR_PLUGIN_ID) {
               if (entry === undefined) {
                 logError(log, new CustodyOrphanError("handle entry has no auth.json counterpart; run ck auth migrate-opencode"), provider);
+                log.info({ provider, state: "orphan" });
                 continue;
               }
               const error = new CustodySplitError(
                 `local credential is real while custody handles remain; run ck auth migrate-opencode --provider ${provider} to re-tombstone, or ck auth migrate-opencode --restore ${provider} to use the local credential`,
               );
               logError(log, error, provider);
+              log.info({ provider, state: "split" });
               const configured = materializeProvider(provider);
               if (!configured) continue;
               configured.options = {
@@ -388,17 +401,20 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
                 fetch: async () => { throw error; },
               };
             }
+            log.info({ provider, state: "unmanaged" });
             continue;
           }
           if (owner === undefined) {
             const refusal = new CustodyOrphanError("tombstone has no serving handle; run ck auth migrate-opencode");
             logError(log, refusal, provider);
+            log.info({ provider, state: "orphan" });
             configureRefusal(provider, refusal);
             continue;
           }
           if (handle!.shape !== (entry as { type?: unknown }).type) {
             const refusal = new CustodySplitError("custody handle shape disagrees with auth entry; run ck auth migrate-opencode");
             logError(log, refusal, provider);
+            log.info({ provider, state: "split" });
             configureRefusal(provider, refusal);
             continue;
           }
@@ -411,12 +427,14 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
               `OpenCode native LLM mode bypasses the custody fetch seam; OPENCODE_EXPERIMENTAL_NATIVE_LLM=${observed} must be unset or disabled`,
             );
             logError(log, refusal, provider);
+            log.info({ provider, state: "refusing" });
             configureRefusal(provider, refusal);
             continue;
           }
 
           const configured = materializeProvider(provider);
           if (!configured) continue;
+          log.info({ provider, state: "serving" });
           const freshness = new FreshnessController({
             provider,
             shape: handle!.shape,
@@ -457,6 +475,11 @@ export function createOpencodeClaustrumPlugin(dependencies: ConfigHookDependenci
               },
               readAuthEntry: async () => (await readAuth(defaultAuthPath(), authReader))[provider],
               upstreamFetch,
+              onServed: (account, recordVersion) => {
+                if (announcedProviders.has(provider)) return;
+                announcedProviders.add(provider);
+                log.info({ provider, label: account.label, credentialId: account.credential_id, recordVersion, state: "served" });
+              },
               log,
             }),
           };

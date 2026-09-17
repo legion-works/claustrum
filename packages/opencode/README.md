@@ -70,7 +70,7 @@ grep -cE '^\s*(catch|} catch)|^\s*return[; ]|^\s*continue;' packages/opencode/sr
 | closing-wave worktree | 27 | 18 | 13 | 9 |
 | custody review triage | 27 | 18 | 13 | 9 |
 | `a3b3a6c` | 27 | 21 | 13 | 10 |
-| current (this commit) | 32 | 41 | 13 | 14 |
+| current (this commit) | 33 | 41 | 13 | 15 |
 
 A changed count without a matching sweep row is a review failure, not harmless churn.
 

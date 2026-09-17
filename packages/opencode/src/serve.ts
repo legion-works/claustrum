@@ -37,6 +37,7 @@ export type CreateServeFetchOptions = {
   freshness?: FreshnessController;
   verifyOwnership?: () => Promise<void>;
   log?: CustodyLogger;
+  onServed?: (account: ServeAccount, recordVersion: number) => void;
   // Test seam: replace the production snapshot when the test wants to drive
   // the substitution-failure catch arm with a controlled error (e.g. a
   // canary-message `withMaterial` throw) without a live daemon or a hand-
@@ -247,10 +248,14 @@ export function createServeFetch(options: CreateServeFetchOptions) {
             await discard(response);
             break;
           }
+          options.onServed?.(account, attempt.recordVersion);
           return response;
         }
         const location = response.headers.get("Location");
-        if (!location) return response;
+        if (!location) {
+          options.onServed?.(account, attempt.recordVersion);
+          return response;
+        }
         let fromOrigin: string;
         let next: URL;
         try {

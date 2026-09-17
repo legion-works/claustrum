@@ -37,6 +37,7 @@ export {
   HandleFileValidationError,
   defaultHandleFilePath,
   handleFileRevision,
+  identifierIsValid,
   parseHandleFile,
   readHandleFile,
   type HandleAccount,

@@ -7,6 +7,8 @@ import { dirname, join } from 'node:path'
 export const HANDLE_FILE_CONTRACT = {
   maxBytes: 256 * 1024,
   mode: 0o600,
+  // Shape only: identifier validity also rejects FORBIDDEN_IDENTIFIERS; use
+  // identifierIsValid for validation so callers do not accept parser-rejected labels.
   labelRe: /^[a-z0-9][a-z0-9._-]{0,63}$/,
   handleRe: /^ckh_[A-Za-z0-9_-]{43}$/,
 } as const
@@ -44,7 +46,7 @@ function handleIsValid(handle: unknown): handle is string {
   return typeof handle === 'string' && HANDLE_FILE_CONTRACT.handleRe.test(handle)
 }
 
-function identifierIsValid(value: unknown): value is string {
+export function identifierIsValid(value: unknown): value is string {
   return typeof value === 'string' && HANDLE_FILE_CONTRACT.labelRe.test(value) && !FORBIDDEN_IDENTIFIERS.has(value)
 }
 
